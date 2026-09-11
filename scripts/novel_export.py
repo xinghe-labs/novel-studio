@@ -1332,7 +1332,7 @@ def write_docx(path: Path, snapshot: ProjectSnapshot, generated_at: str) -> None
     core = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties xmlns:cp="{CP_NS}" xmlns:dc="{DC_NS}" xmlns:dcterms="{DCTERMS_NS}" xmlns:xsi="{XSI_NS}">
   <dc:title>{title_xml} - 审阅稿</dc:title>
-  <dc:creator>Chinese Novel Studio</dc:creator>
+  <dc:creator>Novel Studio</dc:creator>
   <dc:language>{html.escape(snapshot.language, quote=True)}</dc:language>
   <dcterms:created xsi:type="dcterms:W3CDTF">{timestamp}</dcterms:created>
   <dcterms:modified xsi:type="dcterms:W3CDTF">{timestamp}</dcterms:modified>
@@ -1340,7 +1340,7 @@ def write_docx(path: Path, snapshot: ProjectSnapshot, generated_at: str) -> None
 """.encode("utf-8")
     app = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
-  <Application>Chinese Novel Studio</Application>
+  <Application>Novel Studio</Application>
 </Properties>
 """.encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
