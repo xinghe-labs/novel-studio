@@ -1,0 +1,4 @@
+interface:
+  display_name: "中文小说与短故事工作室"
+  short_description: "以长期记忆、连续性硬门禁和独立双审核创作长篇小说或短故事"
+  default_prompt: "使用 $chinese-novel-studio 互动确认小说框架，以 Markdown 正典和长期记忆持续创作，并用独立的连续性与质量审核门禁校验后续章节和交付物。"

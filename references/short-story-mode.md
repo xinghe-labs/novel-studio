@@ -1,0 +1,218 @@
+# 短故事模式
+
+在用户要创作、续改、审核、导出或向番茄短故事入口交付一篇完整短故事时读取本文件。共享的互动确认、研究、原创性、隔离、租约和授权规则仍按主 Skill 执行；本文件只说明短故事与连载长篇不同的决策。
+
+## 模式边界
+
+`short_story` 指一篇可独立阅读、具有完整结尾的小说，不是“长篇第一章写短一点”。它的常见篇幅是 6000-80000 字，通常追求紧凑节奏、跌宕且持续升级的剧情、较强的感情张力和浓烈沉浸感。现实生活、现代言情、古代言情、宫斗宅斗、脑洞、悬疑、衍生、历史玄幻等题材都可以进入该模式，题材清单不是封闭分类。
+
+6000-80000 字用于需求判断、目标字数和场景篇幅规划，不作为脚本硬门槛，也不能冒充番茄或其他平台的当前字数规则。作者明确要求更短或更长、作品仍坚持单篇完结时，先确认它是否继续按短故事交付；平台发布则以提交前核验的最新规则为准。用户明确表达“写短故事”、创作完整短篇或继续已有短故事，就触发该分支。新故事触发后先执行 `work-ensure`，建立或复用未绑定工作目录；触发意图本身不创建正式项目。
+
+出现以下任一需求时采用可持久化的短故事工作流，但仍须通过后述建项目闸门：
+
+- 需要跨会话继续、保存正典或长期记忆。
+- 需要完整策划、原创性审计、系统改稿或完稿审核。
+- 需要导出 TXT、DOCX、EPUB 或番茄短故事交付文件。
+- 用户明确要求创建、管理或发布一篇短故事。
+
+继续已有 `work_type: short_story` 项目时从项目断点恢复，不重新创建项目，也不机械重做仍然有效的研究和确认。旧项目缺少 `work_type` 时按 `serial_novel` 处理，不能自动改成短故事；已经提交多章的长篇也不能只改字段伪装成短故事。
+
+## 启动顺序与建项目闸门
+
+新短故事严格按以下顺序推进：
+
+1. 创建或复用未绑定工作目录，把用户原始需求和后续决定保存在工作目录。
+2. 完成需求层 95% 闸门，确认平台、受众、篇幅、来源边界、内容尺度、决策权限和交付目标。
+3. 默认研究最近 3-6 个月合法公开市场信号，建立 6-9 个参考候选；作者批准候选前不做深度拆解。
+4. 对获批候选只拆高层机制并执行原创性隔离，再提出 3 个实质不同的原创方向，明确推荐一个，由作者选择或修改。
+5. 围绕所选方向完成故事层互动，确认主角、关键人物、核心冲突、失败代价、必要规则、叙事声音、完整场景图、高潮选择和结尾兑现。
+6. 展示完整确认单；最终标题、人物、冲突、场景图、高潮、结尾、尺度和交付目标全部明确，两级信心均至少为 95，并取得作者“按这个写”或同等确认。
+7. Agent 根据最终标题选择 1-3 个简短、表意明确的英文小写语义词作为 slug，创建正式短故事项目并绑定原工作目录。
+8. 把已确认策划和获批研究同步到新项目，验证后才生成完整全篇初稿；初稿仍先写工作目录，不直接写正典。
+
+第 7 步之前不允许因为已有暂定书名、用户说“写短故事”、研究已经开始或需要跨会话保存而提前建项目。未建项目时至少维护：
+
+```text
+<work-root>/
+|-- research/
+|   |-- short-story-session.md
+|   |-- sources/
+|   |-- source-manifest.jsonl
+|   |-- source-index.md
+|   |-- market-scan.md
+|   |-- comparable-works.md
+|   |-- originality-map.md
+|   `-- originality-plan.json
+|-- drafts/
+`-- reports/
+```
+
+初始化时显式指定作品类型和语义 slug。`target_words` 是作者目标，不等于平台限制；平台限制必须在发布前重新核验：
+
+```powershell
+python -X utf8 .\scripts\novel_workspace.py project-create "<workspace-root>" --title "<故事名>" --genre "<题材>" --work-type short_story --target-words 12000 --short-story-slug "<semantic-slug>"
+python -X utf8 .\scripts\novel_workspace.py work-bind "<workspace-root>" "<work-id>" --project-id "<返回的-project-id>"
+```
+
+正常新建 ID 为 `shortstory-<slug>-YYYYMMDD`。slug 只含 ASCII 小写字母、数字和连字符，共 1-3 个语义词；例如《请替死者签收》可使用 `receipt`。同日同 slug 已存在时脚本追加 `-2`、`-3`，并同时检查注册表和项目目录以支持并发工作。ID 创建后保持不变，不随标题修改。`--project-id` 只用于恢复、接管或确有稳定外部 ID 的场景，普通新短故事使用自动分配路径。
+
+项目创建成功但绑定或后续同步失败时停止并报告准确状态，不开始正文、不自动删除新项目，也不用另一个工作上下文继续写入。
+
+## 互动确认
+
+需求层除通用项目外，优先确认会改变全篇结构的事项：
+
+- 交付用途：练笔、参赛、商业平台、审阅稿或发布包。
+- 目标读者、题材入口和期望阅读时长；精确平台字数规则未知时不猜。
+- 核心情绪或阅读体验、内容尺度、必须保留和明确避免。
+- 结局类型：闭合、余味、反转、和解、失败或开放；选择类型不等于预先泄露答案。
+
+用户没有指定字数时，Agent 根据题材、冲突规模、目标阅读体验和发布入口，在 6000-80000 字常见区间内提出目标篇幅并说明取舍，不能把命令示例中的 `12000` 自动当成所有短故事的默认值。目标字数确定后再拆分场景预算；不为凑字数增加重复冲突，也不以“节奏紧凑”为由删掉高潮成立所需的铺垫、关系变化和余波。
+
+故事层达到 95% 前，至少明确：主角即时欲望、阻力、失败代价、关键关系、必要世界规则、叙事声音、高潮选择与结尾兑现。短故事不需要提前填满长篇式百科设定，但任何影响结局理解的规则都必须在正文中公平建立。
+
+框架确认后，把 `outlines/master-outline.md` 写成可执行的全篇场景图。每个场景记录进入状态、即时目标、阻力、关键变化、退出状态和预计篇幅；场景数量由故事需要决定，不套固定三幕、五幕或反转次数。
+
+## 单篇主稿与索引
+
+为了复用经过验证的事务提交、原创审计、长期记忆和导出器，短故事仍使用现有章节容器，但语义上只有一个完整正文单元：
+
+```text
+manuscript/
+|-- index.md
+`-- chapters/
+    `-- 0001-故事名.md          唯一正文主稿
+
+memory/
+|-- book-summary.md            全篇压缩记忆
+|-- decisions.md
+`-- chapters/
+    `-- 0001.md                全篇记忆卡
+```
+
+- `manuscript/chapters/0001-故事名.md` 是整篇唯一正文真源，可以用二级标题或 `---` 标出场景边界。
+- `manuscript/index.md` 只允许一条 `0001` 正文链接；禁止把第二个文件追加为“第 2 章”。
+- `outlines/master-outline.md` 是场景级导航；正文完成后把实际场景顺序、变化和回收状态同步回该文件或全篇记忆卡。
+- 修订已经提交的短故事走重大改稿与快照流程，不能用 `commit-chapter` 再提交 `0002`。
+
+技术路径保留 `chapters/` 和 `commit-chapter` 是为了向后兼容现有稳定工具，不表示成品必须显示“第一章”。短故事 TXT、DOCX 与番茄交付文件不会添加“第 1 章”标题。
+
+## 写作合同
+
+动笔前建立全篇合同，并给当前场景建立最小合同：
+
+```text
+全篇承诺：读者读完得到什么核心体验
+开篇状态：谁在什么压力下做什么
+驱动问题：什么未知、欲望或关系使读者继续
+升级链：每次选择如何让代价、认知或关系发生变化
+关键转折：哪些信息或行动重新定义此前内容
+高潮选择：主角最终必须承担什么代价
+结尾兑现：解决什么、留下什么、最后意象为何成立
+内容边界：作者红线、平台边界与必须避免的表达
+```
+
+开篇应尽快建立人物、异常或压力，但不强制用事故、死亡、猎奇或一句话爆点。中段优先删除重复功能的场景：若一个场景既不改变信息、关系、目标、风险、策略，也不积累结尾所需的情绪或意象，就应合并、压缩或删除。结尾必须回应开篇承诺；反转只有在前文证据公平、改变意义且服务人物选择时才保留。
+
+剧情跌宕不等于机械增加反转或让每个场景都高声冲突。起伏应来自目标受阻、信息重估、关系变化、策略升级和代价兑现；安静场景只要改变人物选择、关系或读者认知，就可以保留。感情张力与沉浸感依靠具体行动、可感知场景、稳定视角和逐步累积的后果，不靠密集感叹、抽象煽情或重复解释制造。
+
+衍生题材仍执行来源授权、原创性和平台边界：确认可使用范围，区分评论性或转化性创作与对受保护角色、设定、独特场面和原文措辞的直接复制；无法确认权利或平台允许范围时，只在本地策划并先向作者说明风险。
+
+## 强制自然化末轮
+
+完整初稿写入工作目录后，先完成结构、人物、连续性和双层原创性检查。上述检查存在 `blocker` 或 `important` 时先处理内容问题，不用语言润色掩盖结构缺陷。检查通过后，每篇短故事必须执行两层自然化末轮：
+
+1. 内置检查聊天式开场、元话语、填充词、机械排比、句长齐整、同义词轮换、宣传腔、解释过度、抽象套话和无意的段落节奏重复。
+2. 必须实际调用 `$humanizer-zh` 做专项复核，同时提供本故事的 POV、人物口吻、时代语言、意象系统、叙述距离和有意例外；不可用或调用未完成时记录原因并停止正式提交流程，不能用内置检查替代。
+3. 始终保留调用前原稿，生成审阅结论和独立结果稿，不在原文件上原地改写。建议使用以下路径，并在报告中记录原稿 SHA-256、结果稿 SHA-256、专项 Skill 状态与采用授权：
+
+```text
+<work-root>/reports/naturalization/<source-sha256>-review.md
+<work-root>/drafts/naturalization/<source-sha256>-candidate.md
+```
+
+自然化不得抹平人物口吻、时代措辞、诗性意象、有意重复、叙述者偏见、不可靠叙述或原有 POV，也不得把小说统一改成新闻稿或通用网文腔。它的目标是提高自然度和完成度，不承诺规避、欺骗或通过任何 AI 检测器。
+
+作者已经把逐章自然化设为项目常规要求时，可直接采用不改变语义的结果稿；若建议改变事实、剧情、人物动机、关系、世界规则或 POV，仍需同时提供原稿、问题摘要和结果稿并单独确认。结果稿改变正文时，重新执行连续性和双层原创性检查，并确保最终报告覆盖采用后的全文哈希。
+
+## 受控提交与完稿审核
+
+短故事正文仍先进入工作目录。完成强制自然化、确定最终版本并批准正式提交后，才使用一个暂存包：
+
+```text
+staging/chapters/0001-complete-story/
+|-- commit.json
+|-- chapter-before-humanizer.md
+|-- chapter.md
+|-- humanization-review.json
+|-- memory.md
+|-- continuity-state.json
+|-- continuity-context.json
+|-- state-delta.json
+|-- continuity-audit.json
+`-- 可选的时间线、线索和全篇记忆替换稿
+```
+
+先完成写前上下文与初稿检查，实际调用 `$humanizer-zh` 并建立 [controlled-automation.md](controlled-automation.md) 规定的哈希绑定自然化记录，再对最终全文完成状态增量、九维连续性审计和原创性审计，最后事务提交：
+
+```powershell
+python -X utf8 .\scripts\novel_continuity.py prepare-context "<project-root>" --chapter 1 --output "<project-root>\staging\chapters\0001-complete-story\continuity-context.json"
+python -X utf8 .\scripts\novel_originality.py audit "<project-root>" --candidate "<project-root>\staging\chapters\0001-complete-story\chapter.md"
+python -X utf8 .\scripts\novel_continuity.py prepare-audit "<project-root>" "staging\chapters\0001-complete-story"
+python -X utf8 .\scripts\novel_continuity.py bind-audit "<project-root>" "staging\chapters\0001-complete-story"
+python -X utf8 .\scripts\novel_continuity.py check-package "<project-root>" "staging\chapters\0001-complete-story"
+python -X utf8 .\scripts\novel_project.py commit-chapter "<project-root>" "staging/chapters/0001-complete-story"
+```
+
+命令之间要按 [continuity.md](continuity.md) 填完并绑定相应文件；这里只列执行顺序，不表示模板可以空着提交。缺少真实的 `$humanizer-zh` 调用或完整 `humanization-review.json` 时只能保留草稿。自然化后的最终全文若发生任何变化，必须重新生成状态增量、重新绑定连续性审计并重跑原创性审计。
+
+`short_story` 的全篇连续性间隔和质量审核间隔都为 1。唯一正文提交后，先由独立只读审稿 Agent 完成全篇连续性基线：
+
+```powershell
+python -X utf8 .\scripts\novel_continuity.py prepare-baseline "<project-root>" --output "<work-root>\reviews\continuity\baseline-packet.json"
+python -X utf8 .\scripts\novel_continuity.py record-baseline "<project-root>" --packet "<packet>" --report "<completed-report>" --authorization-reference "作者确认记录短故事全篇连续性基线"
+```
+
+再完成独立质量完稿审核。`novel_review.py status` 应返回 `review_mode: completion` 与 `review_due: true`：
+
+```powershell
+python -X utf8 .\scripts\novel_review.py prepare "<project-root>" --output "<work-root>\reviews\completion\review-packet.json"
+python -X utf8 .\scripts\novel_review.py record "<project-root>" --packet "<packet>" --report "<completed-report>" --authorization-reference "作者确认记录短故事全篇审核"
+```
+
+连续性基线必须精读完整正文，覆盖因果、时间、地点、人物状态、知识边界、关系与称谓、物品与资源、世界规则和铺垫回收。质量完稿报告不重复裁决这些事实，重点检查：
+
+- 开篇承诺是否在结尾得到兑现或有意转化。
+- 场景是否重复功能，高潮是否由前文选择推动。
+- 反转是否公平，结尾是否依赖临时增加的新规则或新信息。
+- 篇幅是否失衡：开篇过长、高潮过短、余波缺失或解释性尾声拖沓。
+
+任一报告存在阻断项，都必须先经作者裁决或修订，再重新生成绑定新正文哈希的对应审核包；审核报告不自动授权改稿。只有 `novel_continuity.py status` 为 `current` 且质量 `review_due` 为 `false` 才能导出。
+
+## 导出与番茄边界
+
+从通过验证、全篇连续性基线和质量完稿审核都通过的唯一 Markdown 主稿导出。任一报告缺失、未通过或绑定的正文、索引、记忆与连续性快照已经变化时，导出器必须停止并要求重新审核：
+
+```text
+exports/
+|-- 《故事名》-短故事定稿.txt
+|-- 《故事名》-短故事审阅稿.docx
+|-- 《故事名》.epub
+`-- fanqie-short-story/
+    `-- 《故事名》.txt
+```
+
+番茄短故事 TXT 只含清理后的正文，不含 Markdown 标记、文件名标题或“第 1 章”。`export-manifest.json` 必须记录 `work_type: short_story`、源快照、正文哈希和 `fanqie_publication_profile: fanqie_short_story`。
+
+短故事与小说在番茄后台是不同作品入口。截图或当前后台可用于识别入口，但不能据此推断字数、分类、签约、审核或收益规则。正式创建、上传或发布前重新读取当前页面与官方规则，逐项核对标题、简介、分类、标签、封面、是否使用 AI、字数限制和内容要求；任何最终创建、覆盖、提交或发布动作都必须取得当次明确授权。
+
+## 完成标准
+
+- 项目 `work_type` 为 `short_story`；目标篇幅通常落在 6000-80000 字，超出时有作者确认；创作目标与平台硬限制没有混写。
+- 正文只有一个已索引 Markdown 主稿，场景边界和全篇场景图可定位。
+- 全篇记忆、作者决策、连续性状态和唯一记忆卡与正文同步。
+- 原创性报告覆盖当前完整正文哈希且结论为 `pass`。
+- 暂存包保留 `chapter-before-humanizer.md`、最终 `chapter.md` 和状态为 `complete` 的 `humanization-review.json`；记录绑定原稿与结果稿哈希、`humanizer-zh` 声明和采用授权，自然化变化后的最终全文已重新通过连续性与原创性检查。
+- 全篇连续性状态为 `current`，质量完稿审核 `review_mode` 为 `completion` 且覆盖当前源快照；任一重要问题未解决时不宣称定稿。
+- 导出状态为 `fresh`，番茄短故事包只有一个正文 TXT，且没有反向成为正典。
+- 平台要求使用最新官方页面核验，未授权时只准备交付文件，不创建或发布作品。

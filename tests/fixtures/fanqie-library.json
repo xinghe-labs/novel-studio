@@ -1,0 +1,31 @@
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "book_list": [
+      {
+        "book_id": "1001",
+        "book_name": "雾港来信",
+        "author": "测试作者",
+        "abstract": "一封迟到十年的信改变了旧港口的权力关系。",
+        "read_count": "120万在读",
+        "word_count": "35万字",
+        "creation_status": 1,
+        "last_chapter_time": "1787997624"
+      },
+      {
+        "book_id": "1002",
+        "book_name": "\ue123\ue124\ue125",
+        "author": "\ue126\ue127",
+        "abstract": "站点自定义字体编码示例",
+        "read_count": "\ue128万在读",
+        "word_count": "20万字",
+        "creation_status": 0,
+        "last_chapter_time": "1787000000"
+      }
+    ],
+    "has_more": true,
+    "total_count": 10000
+  },
+  "log_id": "offline-fixture"
+}
