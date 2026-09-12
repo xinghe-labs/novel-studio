@@ -16,6 +16,7 @@ sys.path.insert(0, str(SKILL_ROOT / "tests"))
 import novel_project  # noqa: E402
 import novel_review  # noqa: E402
 import novel_continuity  # noqa: E402
+import novel_workspace  # noqa: E402
 from continuity_test_utils import seal_full_baseline  # noqa: E402
 
 
@@ -33,18 +34,41 @@ class PeriodicReviewTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.base = Path(self.temp_dir.name)
         self.packet_counter = 0
+        self.workspace = self.base / "workspace"
+        novel_workspace.initialize_workspace(self.workspace)
+        self.work_ids: dict[Path, str] = {}
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
     def init_project(self, name: str = "project") -> Path:
-        root = self.base / name
+        root = self.workspace / "projects" / name
         novel_project.init_project(
             SimpleNamespace(
                 root=str(root), title="周期审核测试", language="zh-CN", genre="悬疑"
             )
         )
+        novel_workspace.register_project(self.workspace, root, project_id=name)
         return root
+
+    def commit_args(self, root: Path, package: Path) -> SimpleNamespace:
+        work_id = self.work_ids.get(root.resolve())
+        if work_id is None:
+            work = novel_workspace.create_work(
+                self.workspace, project_id=root.name, purpose="周期审核测试提交"
+            )
+            work_id = work["work_id"]
+            self.work_ids[root.resolve()] = work_id
+            novel_workspace.acquire_lock(self.workspace, work_id)
+        novel_workspace.refresh_base(
+            self.workspace, work_id, "测试已完成提交前项目复核"
+        )
+        return SimpleNamespace(
+            root=str(root),
+            package=str(package),
+            workspace=str(self.workspace),
+            work_id=work_id,
+        )
 
     def seed_chapters(self, root: Path, through: int) -> None:
         chapter_dir = root / "manuscript/chapters"
@@ -268,11 +292,10 @@ class PeriodicReviewTests(unittest.TestCase):
             )
             + "\n",
         )
+        commit_args = self.commit_args(root, package)
 
         with self.assertRaisesRegex(novel_project.ProjectError, "Periodic review is overdue"):
-            novel_project.commit_chapter(
-                SimpleNamespace(root=str(root), package=str(package))
-            )
+            novel_project.commit_chapter(commit_args)
         self.assertFalse((root / "manuscript/chapters/0006-测试章.md").exists())
         self.assertEqual(read_json(root / "novel.json")["current_chapter"], 5)
 

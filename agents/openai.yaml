@@ -1,4 +1,4 @@
 interface:
   display_name: "小说工作室"
-  short_description: "以长期记忆、连续性硬门禁和独立双审核创作长篇小说或短故事"
-  default_prompt: "使用 $novel-studio 互动确认小说框架，以 Markdown 正典和长期记忆持续创作，并用独立的连续性与质量审核门禁校验后续章节和交付物。"
+  short_description: "逐章自然化并用连续性与质量门禁创作长篇或短故事"
+  default_prompt: "使用 $novel-studio 互动确认框架；创作长篇时每章、创作短故事时全文实际调用 $humanizer-zh，再经连续性、原创性与质量门禁提交和导出。"

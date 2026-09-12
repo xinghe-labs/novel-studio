@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -19,22 +21,108 @@ from types import SimpleNamespace
 from typing import Any
 
 import novel_project
+import novel_cli
 
 
 SCHEMA_VERSION = 1
 WORKSPACE_KIND = "chinese-novel-workspace"
 DEFAULT_LEASE_SECONDS = 1800
 MAX_LEASE_SECONDS = 86400
+# A live holder must refresh its heartbeat at least every five minutes (or
+# within its shorter lease).  This makes heartbeat_at an active recovery signal
+# instead of a field that is merely copied into status output.
+HEARTBEAT_GRACE_SECONDS = 300
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 SHORT_STORY_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+){0,2}$")
 PROJECT_DATE = re.compile(r"^\d{8}$")
 WORK_SUBDIRECTORIES = ("drafts", "research", "reports", "temp")
 HASH_EXCLUDED_PARTS = frozenset({".git", ".novel-cache", "__pycache__"})
-HASH_EXCLUDED_ROOTS = frozenset({"exports"})
+HASH_EXCLUDED_ROOTS = frozenset({"exports", "staging"})
+LEGACY_HASH_EXCLUDED_ROOTS = frozenset({"exports"})
+STATE_HASH_VERSION = 2
+LEGACY_STATE_HASH_VERSION = 1
+REGISTRY_LEGACY_SCHEMA_VERSIONS = frozenset({0})
+REQUIRED_REGISTRY_COLUMNS = {
+    "metadata": frozenset({"key", "value"}),
+    "projects": frozenset(
+        {"project_id", "title", "project_root", "status", "created_at", "updated_at"}
+    ),
+    "works": frozenset(
+        {
+            "work_id",
+            "work_root",
+            "project_id",
+            "purpose",
+            "client",
+            "status",
+            "base_state_hash",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "leases": frozenset(
+        {
+            "project_id",
+            "work_id",
+            "acquired_at",
+            "heartbeat_at",
+            "expires_at",
+            "lease_seconds",
+            "heartbeat_enforced",
+        }
+    ),
+    "lease_events": frozenset(
+        {
+            "event_id",
+            "project_id",
+            "previous_work_id",
+            "event",
+            "reason",
+            "actor_work_id",
+            "occurred_at",
+            "previous_expires_at",
+            "current_state_hash",
+            "state_hash_error",
+        }
+    ),
+}
 
 
 class WorkspaceError(RuntimeError):
     pass
+
+
+class WriteGuard:
+    """A live project-write authorization held for one SQLite transaction."""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        work_id: str,
+        project_id: str,
+        project_root: str,
+        state_hash: str,
+        hash_version: int,
+    ) -> None:
+        self.connection = connection
+        self.work_id = work_id
+        self.project_id = project_id
+        self.project_root = project_root
+        self.state_hash = state_hash
+        self.hash_version = hash_version
+
+    def assert_live(self) -> sqlite3.Row:
+        """Recheck ownership while the guard's write transaction is held."""
+
+        work = work_row(self.connection, self.work_id)
+        if work["project_id"] != self.project_id:
+            raise WorkspaceError("The guarded work changed project ownership")
+        owner = require_live_owned_lease(self.connection, work)
+        project = project_row(self.connection, self.project_id)
+        if Path(project["project_root"]).resolve() != Path(self.project_root).resolve():
+            raise WorkspaceError("The guarded project root changed")
+        return owner
 
 
 def utc_datetime() -> datetime:
@@ -272,7 +360,67 @@ def require_workspace(raw_root: str | Path, *, auto_initialize: bool = False) ->
     return root
 
 
+def _parse_registry_schema_value(raw: Any) -> int:
+    try:
+        version = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise WorkspaceError(
+            f"Registry schema_version is not an integer: {raw!r}"
+        ) from exc
+    if version != SCHEMA_VERSION and version not in REGISTRY_LEGACY_SCHEMA_VERSIONS:
+        raise WorkspaceError(
+            f"Registry schema_version {version} is unsupported "
+            f"(expected {SCHEMA_VERSION})"
+        )
+    return version
+
+
+def _registry_schema_version(connection: sqlite3.Connection) -> int | None:
+    """Read the registry schema marker without changing the database."""
+
+    if "metadata" not in _registry_table_names(connection):
+        return None
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'schema_version'"
+    ).fetchone()
+    if row is None:
+        return None
+    return _parse_registry_schema_value(row[0])
+
+
+def _registry_table_names(connection: sqlite3.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
 def create_schema(connection: sqlite3.Connection) -> None:
+    # Check the marker before any CREATE/ALTER/metadata write.  A future
+    # registry must fail closed instead of being silently rewritten by an old
+    # tool.
+    prior_tables = _registry_table_names(connection)
+    prior_schema_version = _registry_schema_version(connection)
+    if prior_schema_version is None and prior_tables - {"sqlite_sequence"}:
+        # A non-empty registry without a marker is not distinguishable from a
+        # partially upgraded or foreign database.  Do not silently adopt it.
+        raise WorkspaceError("Registry metadata is missing schema_version")
+    prior_lease_columns = _table_columns(connection, "leases")
+    # A registry that has only part of the additive lease migration cannot
+    # prove that existing rows were created under the heartbeat contract.
+    # Keep those rows on the old expires_at-only semantics until an explicit
+    # acquire/renew operation writes the new marker.
+    legacy_lease_layout = bool(prior_lease_columns) and not {
+        "lease_seconds",
+        "heartbeat_enforced",
+    }.issubset(prior_lease_columns)
+    legacy_schema = prior_schema_version in REGISTRY_LEGACY_SCHEMA_VERSIONS
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS metadata (
@@ -303,14 +451,57 @@ def create_schema(connection: sqlite3.Connection) -> None:
             work_id TEXT NOT NULL REFERENCES works(work_id),
             acquired_at TEXT NOT NULL,
             heartbeat_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
+            expires_at TEXT NOT NULL,
+            lease_seconds INTEGER NOT NULL DEFAULT 1800,
+            heartbeat_enforced INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS lease_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            previous_work_id TEXT,
+            event TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            actor_work_id TEXT,
+            occurred_at TEXT NOT NULL,
+            previous_expires_at TEXT,
+            current_state_hash TEXT,
+            state_hash_error TEXT
         );
         """
     )
-    connection.execute(
-        "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
-        (str(SCHEMA_VERSION),),
-    )
+    # Additive migration for registries created by schema revision 1.  The
+    # workspace JSON schema intentionally remains compatible: no canonical
+    # project files are rewritten by opening a registry.
+    lease_columns = _table_columns(connection, "leases")
+    if "lease_seconds" not in lease_columns:
+        connection.execute(
+            "ALTER TABLE leases ADD COLUMN lease_seconds INTEGER NOT NULL DEFAULT 1800"
+        )
+    if "heartbeat_enforced" not in lease_columns:
+        connection.execute(
+            "ALTER TABLE leases ADD COLUMN heartbeat_enforced INTEGER NOT NULL DEFAULT 1"
+        )
+    event_columns = _table_columns(connection, "lease_events")
+    if "state_hash_error" not in event_columns:
+        connection.execute(
+            "ALTER TABLE lease_events ADD COLUMN state_hash_error TEXT"
+        )
+    if legacy_lease_layout or legacy_schema:
+        # Older implementations had no verified heartbeat contract.  Keep
+        # their original expires_at-only semantics until each lease is renewed
+        # or reacquired by the new implementation.  This is intentionally
+        # conservative for partially migrated/intermediate registries too.
+        connection.execute("UPDATE leases SET heartbeat_enforced = 0")
+    if prior_schema_version is None:
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+    elif prior_schema_version != SCHEMA_VERSION:
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
     connection.commit()
 
 
@@ -396,25 +587,48 @@ def sync_registry(connection: sqlite3.Connection, root: Path) -> None:
 
 def open_registry(root: Path, *, synchronize: bool = True) -> sqlite3.Connection:
     connection = sqlite3.connect(root / "registry.sqlite3", timeout=5.0)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 5000")
-    connection.execute("PRAGMA journal_mode = WAL")
-    create_schema(connection)
-    if synchronize:
-        sync_registry(connection, root)
-    return connection
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        # Validate before enabling WAL or running additive migrations so an
+        # unknown future registry marker is never silently rewritten.
+        _registry_schema_version(connection)
+        connection.execute("PRAGMA journal_mode = WAL")
+        create_schema(connection)
+        if synchronize:
+            sync_registry(connection, root)
+        return connection
+    except Exception:
+        # ``sqlite3.Connection`` keeps a Windows file handle until close().
+        # In particular, a future/invalid schema must not leave the registry
+        # undeletable after this function fails closed.
+        connection.close()
+        raise
 
 
-def project_state_hash(project_root: str | Path) -> str:
+def project_state_hash(
+    project_root: str | Path, *, include_staging: bool = False
+) -> str:
+    """Hash canonical project files.
+
+    New work excludes ``staging/`` because it contains derived commit input.
+    ``include_staging=True`` preserves the pre-2.1.0 algorithm for a
+    compatibility comparison while an old work context is explicitly
+    refreshed.
+    """
+
     root = Path(project_root).resolve()
     if not (root / "novel.json").is_file():
         raise WorkspaceError(f"Not an initialized novel project: {root}")
+    excluded_roots = (
+        LEGACY_HASH_EXCLUDED_ROOTS if include_staging else HASH_EXCLUDED_ROOTS
+    )
     digest = hashlib.sha256()
     files: list[Path] = []
     for path in root.rglob("*"):
         relative = path.relative_to(root)
-        if relative.parts and relative.parts[0] in HASH_EXCLUDED_ROOTS:
+        if relative.parts and relative.parts[0] in excluded_roots:
             continue
         if any(part in HASH_EXCLUDED_PARTS for part in relative.parts):
             continue
@@ -433,6 +647,51 @@ def project_state_hash(project_root: str | Path) -> str:
         digest.update(file_digest.hexdigest().encode("ascii"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def match_project_state_hash(
+    project_root: str | Path, expected_hash: str
+) -> tuple[str, int | None]:
+    """Return the current hash and the algorithm that matched the baseline.
+
+    A baseline from the previous release may still include unchanged staging
+    files.  Accepting it once keeps an in-progress task recoverable; callers
+    should run ``base-refresh`` afterwards to persist the current algorithm.
+    """
+
+    current_hash = project_state_hash(project_root)
+    if current_hash == expected_hash:
+        return current_hash, STATE_HASH_VERSION
+    legacy_hash = project_state_hash(project_root, include_staging=True)
+    if legacy_hash == expected_hash:
+        return current_hash, LEGACY_STATE_HASH_VERSION
+    return current_hash, None
+
+
+def safe_project_state_hash(
+    project_root: str | Path,
+) -> tuple[str | None, str | None]:
+    """Capture a hash for audit output without blocking lease recovery."""
+
+    try:
+        return project_state_hash(project_root), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def safe_match_project_state_hash(
+    project_root: str | Path, expected_hash: str | None
+) -> tuple[str | None, int | None, str | None]:
+    """Best-effort hash comparison used by lease acquisition/audit paths."""
+
+    if not expected_hash:
+        current_hash, error = safe_project_state_hash(project_root)
+        return current_hash, None, error
+    try:
+        current_hash, version = match_project_state_hash(project_root, expected_hash)
+        return current_hash, version, None
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
 
 
 def project_row(connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
@@ -909,6 +1168,100 @@ def lease_owner(
     ).fetchone()
 
 
+def lease_seconds_from_row(owner: sqlite3.Row) -> int:
+    """Read the additive lease duration column with old-registry fallback."""
+
+    keys = owner.keys()
+    try:
+        value = int(owner["lease_seconds"]) if "lease_seconds" in keys else DEFAULT_LEASE_SECONDS
+    except (TypeError, ValueError):
+        value = DEFAULT_LEASE_SECONDS
+    return max(30, min(MAX_LEASE_SECONDS, value))
+
+
+def lease_heartbeat_enforced(owner: sqlite3.Row) -> bool:
+    """Whether this row was created/renewed under the heartbeat contract."""
+
+    keys = owner.keys()
+    if "heartbeat_enforced" not in keys:
+        return False
+    value = owner["heartbeat_enforced"]
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        # A malformed marker must not make an old lease look more permissive
+        # than its original expires_at-only behavior.
+        return False
+
+
+def lease_live_until(owner: sqlite3.Row) -> datetime:
+    expires = parse_timestamp(owner["expires_at"])
+    if not lease_heartbeat_enforced(owner):
+        return expires
+    heartbeat = parse_timestamp(owner["heartbeat_at"])
+    heartbeat_deadline = heartbeat + timedelta(
+        seconds=min(HEARTBEAT_GRACE_SECONDS, lease_seconds_from_row(owner))
+    )
+    return min(expires, heartbeat_deadline)
+
+
+def lease_is_live(owner: sqlite3.Row, *, now: datetime | None = None) -> bool:
+    current = now or utc_datetime()
+    return lease_live_until(owner) > current
+
+
+def lease_status(owner: sqlite3.Row, *, now: datetime | None = None) -> dict[str, Any]:
+    current = now or utc_datetime()
+    heartbeat = parse_timestamp(owner["heartbeat_at"])
+    expires = parse_timestamp(owner["expires_at"])
+    live_until = lease_live_until(owner)
+    return {
+        "work_id": owner["work_id"],
+        "acquired_at": owner["acquired_at"],
+        "heartbeat_at": owner["heartbeat_at"],
+        "expires_at": owner["expires_at"],
+        "lease_seconds": lease_seconds_from_row(owner),
+        "heartbeat_enforced": lease_heartbeat_enforced(owner),
+        "heartbeat_age_seconds": max(0, int((current - heartbeat).total_seconds())),
+        "expires_in_seconds": int((expires - current).total_seconds()),
+        "live_until": live_until.replace(microsecond=0).isoformat(),
+        "live": live_until > current,
+    }
+
+
+def record_lease_event(
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    event: str,
+    reason: str,
+    actor_work_id: str | None,
+    previous_work_id: str | None,
+    previous_expires_at: str | None,
+    current_state_hash: str | None,
+    state_hash_error: str | None = None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO lease_events(
+            project_id, previous_work_id, event, reason, actor_work_id,
+            occurred_at, previous_expires_at, current_state_hash, state_hash_error
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            project_id,
+            previous_work_id,
+            event,
+            reason,
+            actor_work_id,
+            utc_now(),
+            previous_expires_at,
+            current_state_hash,
+            state_hash_error,
+        ),
+    )
+
+
 def acquire_lock(
     raw_workspace: str | Path,
     work_id: str,
@@ -933,42 +1286,74 @@ def acquire_lock(
             raise WorkspaceError(f"Cannot lock from a {work['status']} work context")
         if work["project_id"] is None:
             raise WorkspaceError("Work must be bound to a project before locking")
+        project = project_row(connection, work["project_id"])
         owner = lease_owner(connection, work["project_id"])
         status = "acquired"
         if owner is not None:
             if owner["work_id"] == work["work_id"]:
                 status = "renewed"
-            elif parse_timestamp(owner["expires_at"]) > now_dt:
+            elif lease_is_live(owner, now=now_dt):
                 raise WorkspaceError(
                     f"Project is locked by {owner['work_id']} until "
-                    f"{owner['expires_at']}"
+                    f"{lease_live_until(owner).replace(microsecond=0).isoformat()}"
                 )
             else:
                 status = "reclaimed"
+        current_hash, hash_version, hash_error = safe_match_project_state_hash(
+            project["project_root"], work["base_state_hash"]
+        )
         connection.execute(
             """
             INSERT INTO leases(
-                project_id, work_id, acquired_at, heartbeat_at, expires_at
-            ) VALUES(?, ?, ?, ?, ?)
+                project_id, work_id, acquired_at, heartbeat_at, expires_at,
+                lease_seconds, heartbeat_enforced
+            ) VALUES(?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(project_id) DO UPDATE SET
                 work_id=excluded.work_id,
                 acquired_at=excluded.acquired_at,
                 heartbeat_at=excluded.heartbeat_at,
-                expires_at=excluded.expires_at
+                expires_at=excluded.expires_at,
+                lease_seconds=excluded.lease_seconds,
+                heartbeat_enforced=excluded.heartbeat_enforced
             """,
-            (work["project_id"], work["work_id"], now, now, expires),
+            (
+                work["project_id"],
+                work["work_id"],
+                now,
+                now,
+                expires,
+                lease_seconds,
+            ),
         )
+        if owner is not None and status in {"renewed", "reclaimed"}:
+            record_lease_event(
+                connection,
+                project_id=work["project_id"],
+                previous_work_id=owner["work_id"],
+                event=status,
+                reason=(
+                    "expired_or_stale_heartbeat"
+                    if status == "reclaimed"
+                    else "lock_acquire_renewal"
+                ),
+                actor_work_id=work["work_id"],
+                previous_expires_at=owner["expires_at"],
+                current_state_hash=current_hash,
+                state_hash_error=hash_error,
+            )
         connection.commit()
-        project = project_row(connection, work["project_id"])
-        current_hash = project_state_hash(project["project_root"])
         return {
             "status": status,
             "project_id": work["project_id"],
             "work_id": work["work_id"],
             "expires_at": expires,
+            "heartbeat_at": now,
+            "lease_seconds": lease_seconds,
             "base_state_hash": work["base_state_hash"],
             "current_state_hash": current_hash,
-            "state_matches": current_hash == work["base_state_hash"],
+            "state_matches": hash_version is not None,
+            "state_hash_version": hash_version,
+            "state_hash_error": hash_error,
         }
     except Exception:
         if connection.in_transaction:
@@ -986,9 +1371,95 @@ def require_live_owned_lease(
     owner = lease_owner(connection, work["project_id"])
     if owner is None or owner["work_id"] != work["work_id"]:
         raise WorkspaceError("This work context does not own the project write lock")
-    if parse_timestamp(owner["expires_at"]) <= utc_datetime():
-        raise WorkspaceError("The project write lock has expired")
+    if not lease_is_live(owner):
+        if parse_timestamp(owner["expires_at"]) <= utc_datetime():
+            raise WorkspaceError("The project write lock has expired")
+        raise WorkspaceError(
+            "The project write lock heartbeat is stale; renew it before writing"
+        )
     return owner
+
+
+def renew_lock(
+    raw_workspace: str | Path,
+    work_id: str,
+    *,
+    lease_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Refresh an existing lease and heartbeat owned by ``work_id``."""
+
+    if lease_seconds is not None and (
+        lease_seconds < 30 or lease_seconds > MAX_LEASE_SECONDS
+    ):
+        raise WorkspaceError(
+            f"lease_seconds must be between 30 and {MAX_LEASE_SECONDS}"
+        )
+    root = require_workspace(raw_workspace)
+    connection = open_registry(root)
+    try:
+        now_dt = utc_datetime()
+        now = now_dt.replace(microsecond=0).isoformat()
+        connection.execute("BEGIN IMMEDIATE")
+        work = work_row(connection, work_id)
+        if work["status"] != "active":
+            raise WorkspaceError(f"Cannot renew from a {work['status']} work context")
+        if work["project_id"] is None:
+            raise WorkspaceError("Work must be bound to a project before renewing")
+        owner = lease_owner(connection, work["project_id"])
+        if owner is None or owner["work_id"] != work["work_id"]:
+            raise WorkspaceError("This work context does not own the project write lock")
+        if not lease_is_live(owner, now=now_dt):
+            raise WorkspaceError(
+                "The project write lock is expired or has a stale heartbeat; acquire it again"
+            )
+        duration = lease_seconds or lease_seconds_from_row(owner)
+        expires = (now_dt + timedelta(seconds=duration)).replace(
+            microsecond=0
+        ).isoformat()
+        project = project_row(connection, work["project_id"])
+        current_hash, hash_version, hash_error = safe_match_project_state_hash(
+            project["project_root"], work["base_state_hash"]
+        )
+        connection.execute(
+            """
+            UPDATE leases
+            SET heartbeat_at = ?, expires_at = ?, lease_seconds = ?,
+                heartbeat_enforced = 1
+            WHERE project_id = ? AND work_id = ?
+            """,
+            (now, expires, duration, work["project_id"], work["work_id"]),
+        )
+        record_lease_event(
+            connection,
+            project_id=work["project_id"],
+            previous_work_id=work["work_id"],
+            event="renewed",
+            reason="explicit_lock_renew",
+            actor_work_id=work["work_id"],
+            previous_expires_at=owner["expires_at"],
+            current_state_hash=current_hash,
+            state_hash_error=hash_error,
+        )
+        connection.commit()
+        return {
+            "status": "renewed",
+            "project_id": work["project_id"],
+            "work_id": work["work_id"],
+            "heartbeat_at": now,
+            "expires_at": expires,
+            "lease_seconds": duration,
+            "base_state_hash": work["base_state_hash"],
+            "current_state_hash": current_hash,
+            "state_matches": hash_version is not None,
+            "state_hash_version": hash_version,
+            "state_hash_error": hash_error,
+        }
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def write_check(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
@@ -996,12 +1467,17 @@ def write_check(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
     connection = open_registry(root)
     try:
         work = work_row(connection, work_id)
-        require_live_owned_lease(connection, work)
+        owner = require_live_owned_lease(connection, work)
         project = project_row(connection, work["project_id"])
-        current_hash = project_state_hash(project["project_root"])
         if not work["base_state_hash"]:
             raise WorkspaceError("Work context has no base_state_hash")
-        if current_hash != work["base_state_hash"]:
+        try:
+            current_hash, hash_version = match_project_state_hash(
+                project["project_root"], work["base_state_hash"]
+            )
+        except Exception as exc:
+            raise WorkspaceError(f"Unable to verify project state hash: {exc}") from exc
+        if hash_version is None:
             raise WorkspaceError(
                 "Project changed after this work context was bound. Re-read the "
                 "project, resolve differences, then refresh the base hash before writing."
@@ -1012,7 +1488,74 @@ def write_check(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
             "project_id": work["project_id"],
             "project_root": project["project_root"],
             "state_hash": current_hash,
+            "state_hash_version": hash_version,
+            "legacy_hash_accepted": hash_version == LEGACY_STATE_HASH_VERSION,
+            "lease": lease_status(owner),
         }
+    finally:
+        connection.close()
+
+
+@contextlib.contextmanager
+def write_guard(
+    raw_workspace: str | Path,
+    work_id: str,
+    *,
+    expected_project_root: str | Path | None = None,
+):
+    """Hold the project write transaction across a canonical file commit.
+
+    ``write_check`` is a point-in-time assertion.  This guard upgrades it to a
+    reservation: ``BEGIN IMMEDIATE`` prevents another official writer from
+    reclaiming the lease between the final check and the atomic file replace.
+    The caller should invoke ``guard.assert_live()`` from its post-write
+    validator so an expired lease rolls the file transaction back.
+    """
+
+    root = require_workspace(raw_workspace)
+    connection = open_registry(root)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        work = work_row(connection, work_id)
+        owner = require_live_owned_lease(connection, work)
+        project = project_row(connection, work["project_id"])
+        project_root = Path(project["project_root"]).resolve()
+        if expected_project_root is not None:
+            expected = Path(expected_project_root).expanduser().resolve()
+            if expected != project_root:
+                raise WorkspaceError(
+                    "The work lease belongs to a different project; refusing to write"
+                )
+        if not work["base_state_hash"]:
+            raise WorkspaceError("Work context has no base_state_hash")
+        try:
+            current_hash, hash_version = match_project_state_hash(
+                project_root, work["base_state_hash"]
+            )
+        except Exception as exc:
+            raise WorkspaceError(f"Unable to verify project state hash: {exc}") from exc
+        if hash_version is None:
+            raise WorkspaceError(
+                "Project changed after this work context was bound. Re-read the "
+                "project, resolve differences, then refresh the base hash before writing."
+            )
+        guard = WriteGuard(
+            connection,
+            work_id=work["work_id"],
+            project_id=work["project_id"],
+            project_root=str(project_root),
+            state_hash=current_hash,
+            hash_version=hash_version,
+        )
+        # Keep the local owner assertion explicit: it also documents that the
+        # lease was live at the exact point the SQLite write reservation began.
+        _ = owner
+        yield guard
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -1076,14 +1619,103 @@ def release_lock(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
             raise WorkspaceError(
                 f"Project lock belongs to {owner['work_id']}, not {work['work_id']}"
             )
+        project = project_row(connection, work["project_id"])
+        current_hash, hash_error = safe_project_state_hash(project["project_root"])
         connection.execute(
             "DELETE FROM leases WHERE project_id = ?", (work["project_id"],)
+        )
+        record_lease_event(
+            connection,
+            project_id=work["project_id"],
+            previous_work_id=owner["work_id"],
+            event="released",
+            reason="owner_release",
+            actor_work_id=work["work_id"],
+            previous_expires_at=owner["expires_at"],
+            current_state_hash=current_hash,
+            state_hash_error=hash_error,
         )
         connection.commit()
         return {
             "status": "released",
             "work_id": work["work_id"],
             "project_id": work["project_id"],
+            "current_state_hash": current_hash,
+            "state_hash_error": hash_error,
+        }
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def break_lock(
+    raw_workspace: str | Path,
+    project_id: str,
+    *,
+    expected_owner: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Recover an abandoned lease with an explicit owner and audit reason.
+
+    A valid live lease can never be broken.  This prevents a convenience
+    command from becoming an unreviewed override of another writer.
+    """
+
+    normalized_owner = validate_identifier(expected_owner, "expected_owner")
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        raise WorkspaceError("lock-break requires a non-empty reason")
+    root = require_workspace(raw_workspace)
+    connection = open_registry(root)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        project = project_row(connection, project_id)
+        owner = lease_owner(connection, project["project_id"])
+        if owner is None:
+            connection.commit()
+            return {
+                "status": "already_released",
+                "project_id": project["project_id"],
+                "expected_owner": normalized_owner,
+                "reason": normalized_reason,
+            }
+        if owner["work_id"] != normalized_owner:
+            raise WorkspaceError(
+                f"Expected lock owner {normalized_owner}, but current owner is {owner['work_id']}"
+            )
+        now_dt = utc_datetime()
+        if lease_is_live(owner, now=now_dt):
+            raise WorkspaceError(
+                "Refusing to break a live project lock; wait for expiry or ask its owner to release it"
+            )
+        current_hash, hash_error = safe_project_state_hash(project["project_root"])
+        connection.execute(
+            "DELETE FROM leases WHERE project_id = ?", (project["project_id"],)
+        )
+        record_lease_event(
+            connection,
+            project_id=project["project_id"],
+            previous_work_id=owner["work_id"],
+            event="broken",
+            reason=normalized_reason,
+            actor_work_id=None,
+            previous_expires_at=owner["expires_at"],
+            current_state_hash=current_hash,
+            state_hash_error=hash_error,
+        )
+        connection.commit()
+        return {
+            "status": "broken",
+            "project_id": project["project_id"],
+            "previous_owner": owner["work_id"],
+            "previous_expires_at": owner["expires_at"],
+            "previous_heartbeat_at": owner["heartbeat_at"],
+            "reason": normalized_reason,
+            "current_state_hash": current_hash,
+            "state_hash_error": hash_error,
         }
     except Exception:
         if connection.in_transaction:
@@ -1133,7 +1765,11 @@ def workspace_status(raw_workspace: str | Path) -> dict[str, Any]:
         closed_works = connection.execute(
             "SELECT COUNT(*) FROM works WHERE status = 'closed'"
         ).fetchone()[0]
-        leases = [dict(row) for row in connection.execute("SELECT * FROM leases")]
+        leases = []
+        for row in connection.execute("SELECT * FROM leases"):
+            item = dict(row)
+            item["lease_status"] = lease_status(row)
+            leases.append(item)
         return {
             "status": "ok",
             "workspace_root": str(root),
@@ -1147,14 +1783,386 @@ def workspace_status(raw_workspace: str | Path) -> dict[str, Any]:
         connection.close()
 
 
+DOCTOR_MODULES = (
+    "novel_cli",
+    "novel_project",
+    "novel_workspace",
+    "novel_continuity",
+    "novel_export",
+    "novel_memory",
+    "novel_originality",
+    "novel_research",
+    "novel_review",
+)
+
+
+def _doctor_check(
+    checks: list[dict[str, Any]], name: str, status: str, detail: str, **extra: Any
+) -> None:
+    checks.append({"name": name, "status": status, "detail": detail, **extra})
+
+
+def open_read_only_registry(registry: Path) -> sqlite3.Connection:
+    """Open a registry without writes while still honoring an active WAL.
+
+    SQLite's ``immutable=1`` mode intentionally ignores ``-wal`` files.  It is
+    safe for a fully checkpointed database, but would make a live workspace
+    look incomplete.  Use it only when no WAL sidecar is present; otherwise a
+    normal ``mode=ro`` connection with ``query_only`` reads the current WAL
+    without permitting SQL writes.
+    """
+
+    registry = Path(registry).expanduser().resolve()
+    wal_path = Path(f"{registry}-wal")
+    shm_path = Path(f"{registry}-shm")
+    query = "mode=ro"
+    if not wal_path.exists() and not shm_path.exists():
+        query += "&immutable=1"
+    # ``as_uri`` percent-encodes spaces, ``#`` and ``%`` in Windows paths;
+    # embedding ``as_posix()`` directly would make SQLite parse them as URI
+    # syntax instead of filename characters.
+    uri = f"{registry.as_uri()}?{query}"
+    connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def _humanizer_candidates(scripts_root: Path) -> list[Path]:
+    """Return likely installed humanizer skill locations in preference order."""
+
+    configured = os.environ.get("NOVEL_HUMANIZER_PATH")
+    if configured:
+        configured_path = Path(configured).expanduser()
+        try:
+            configured_path = configured_path.resolve()
+        except OSError:
+            # Preserve the path for a useful diagnostic; the candidate check
+            # below will report the actual stat/read failure.
+            configured_path = configured_path.absolute()
+        return [configured_path]
+
+    candidates = [scripts_root.parent.parent / "humanizer-zh"]
+    # Skills can be installed under either supported user skill root.  The
+    # local sibling comes first, then the alternate root for cross-install
+    # portability (for example novel-studio in .codex and humanizer-zh in
+    # .agents).
+    home = Path.home()
+    candidates.extend(
+        [
+            home / ".agents" / "skills" / "humanizer-zh",
+            home / ".codex" / "skills" / "humanizer-zh",
+        ]
+    )
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _check_humanizer_candidate(candidate: Path) -> tuple[Path, bool, str]:
+    """Validate a candidate without executing or modifying the skill."""
+
+    try:
+        candidate_is_dir = candidate.is_dir()
+        candidate_is_file = candidate.is_file()
+    except OSError as exc:
+        return (
+            candidate,
+            False,
+            f"path cannot be inspected ({type(exc).__name__}: {exc})",
+        )
+    if candidate_is_dir:
+        skill_file = candidate / "SKILL.md"
+    elif candidate_is_file:
+        if candidate.name.casefold() != "skill.md":
+            return (
+                candidate,
+                False,
+                "configured path must be a directory containing SKILL.md or a file named SKILL.md",
+            )
+        skill_file = candidate
+    else:
+        return candidate, False, "path does not exist"
+
+    try:
+        skill_file_exists = skill_file.is_file()
+    except OSError as exc:
+        return (
+            skill_file,
+            False,
+            f"SKILL.md cannot be inspected ({type(exc).__name__}: {exc})",
+        )
+    if not skill_file_exists:
+        return skill_file, False, "SKILL.md is missing or is not a regular file"
+    try:
+        content = skill_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return (
+            skill_file,
+            False,
+            f"SKILL.md is not readable ({type(exc).__name__}: {exc})",
+        )
+    frontmatter = re.match(
+        r"\A---\s*\r?\n(?P<body>.*?)\r?\n---(?:\r?\n|\Z)",
+        content,
+        re.DOTALL,
+    )
+    if frontmatter is None or re.search(
+        r"(?m)^\s*name\s*:\s*['\"]?humanizer-zh['\"]?\s*$",
+        frontmatter.group("body"),
+    ) is None:
+        return (
+            skill_file,
+            False,
+            "SKILL.md frontmatter must declare name: humanizer-zh",
+        )
+    return skill_file, True, "readable SKILL.md with name: humanizer-zh"
+
+
+def resolve_humanizer_skill(scripts_root: Path) -> tuple[Path, bool, str]:
+    """Find and validate the configured or installed humanizer skill."""
+
+    candidates = _humanizer_candidates(scripts_root)
+    failures: list[str] = []
+    for candidate in candidates:
+        skill_file, valid, detail = _check_humanizer_candidate(candidate)
+        if valid:
+            return skill_file, True, detail
+        failures.append(f"{skill_file}: {detail}")
+    fallback = candidates[0] if candidates else scripts_root / "humanizer-zh"
+    return fallback, False, "No usable humanizer-zh found; " + "; ".join(failures)
+
+
+def doctor(raw_workspace: str | Path | None = None) -> dict[str, Any]:
+    """Run a read-only environment and workspace health check.
+
+    With no workspace argument this deliberately avoids creating directories or
+    SQLite files and only checks the runtime/tool installation.
+    """
+
+    checks: list[dict[str, Any]] = []
+    python_ok = sys.version_info >= (3, 10)
+    _doctor_check(
+        checks,
+        "python",
+        "pass" if python_ok else "fail",
+        f"Python {sys.version.split()[0]} (requires >= 3.10)",
+        version=sys.version.split()[0],
+    )
+    sqlite_ok = False
+    try:
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute("SELECT 1").fetchone()
+            sqlite_ok = True
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        _doctor_check(checks, "sqlite", "fail", str(exc))
+    if sqlite_ok:
+        _doctor_check(
+            checks,
+            "sqlite",
+            "pass",
+            f"SQLite {sqlite3.sqlite_version} is usable",
+            version=sqlite3.sqlite_version,
+        )
+    encoding = (getattr(sys.stdout, "encoding", None) or "").lower()
+    _doctor_check(
+        checks,
+        "stdout-encoding",
+        "pass" if encoding in {"utf-8", "utf8"} else "warning",
+        f"stdout encoding is {encoding or 'unknown'}; UTF-8 JSON is enforced by the CLI",
+        encoding=encoding or None,
+    )
+
+    scripts_root = Path(__file__).resolve().parent
+    imported: list[str] = []
+    original_path = list(sys.path)
+    if str(scripts_root) not in sys.path:
+        sys.path.insert(0, str(scripts_root))
+    try:
+        importlib.invalidate_caches()
+        for module_name in DOCTOR_MODULES:
+            try:
+                importlib.import_module(module_name)
+                imported.append(module_name)
+            except Exception as exc:  # pragma: no cover - environment-specific
+                _doctor_check(
+                    checks,
+                    f"import:{module_name}",
+                    "fail",
+                    f"{type(exc).__name__}: {exc}",
+                )
+    finally:
+        sys.path[:] = original_path
+    for module_name in imported:
+        _doctor_check(checks, f"import:{module_name}", "pass", "import succeeded")
+
+    humanizer_path, humanizer_ok, humanizer_detail = resolve_humanizer_skill(
+        scripts_root
+    )
+    _doctor_check(
+        checks,
+        "humanizer-zh",
+        "pass" if humanizer_ok else "fail",
+        humanizer_detail,
+        path=str(humanizer_path),
+        formal_work_blocked=not humanizer_ok,
+    )
+
+    workspace_result: dict[str, Any] | None = None
+    if raw_workspace is None:
+        _doctor_check(
+            checks,
+            "workspace",
+            "skipped",
+            "No workspace supplied; no filesystem state was opened or created",
+        )
+    else:
+        try:
+            root = resolve_root(raw_workspace)
+            config_path = workspace_config_path(root)
+            if not config_path.is_file():
+                raise WorkspaceError(f"Missing workspace.json: {config_path}")
+            config = read_json(config_path)
+            if config.get("schema_version") != SCHEMA_VERSION:
+                raise WorkspaceError(
+                    f"workspace.json schema_version {config.get('schema_version')!r} "
+                    f"is unsupported (expected {SCHEMA_VERSION})"
+                )
+            if config.get("kind") != WORKSPACE_KIND:
+                raise WorkspaceError("workspace.json kind is not a Chinese novel workspace")
+            missing_dirs = [
+                relative
+                for relative in ("projects", "workspaces")
+                if not (root / relative).is_dir()
+            ]
+            if missing_dirs:
+                raise WorkspaceError(
+                    "Missing workspace directories: " + ", ".join(missing_dirs)
+                )
+            registry = root / "registry.sqlite3"
+            if not registry.is_file():
+                raise WorkspaceError(f"Missing registry: {registry}")
+            connection = open_read_only_registry(registry)
+            try:
+                integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != "ok":
+                    raise WorkspaceError(f"Registry integrity check failed: {integrity}")
+                schema_row = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'"
+                ).fetchone()
+                if schema_row is None:
+                    raise WorkspaceError("Registry metadata is missing schema_version")
+                _registry_schema_version_value = _parse_registry_schema_value(
+                    schema_row[0]
+                )
+                if _registry_schema_version_value != SCHEMA_VERSION:
+                    if _registry_schema_version_value in REGISTRY_LEGACY_SCHEMA_VERSIONS:
+                        raise WorkspaceError(
+                            f"Registry schema_version {_registry_schema_version_value} "
+                            f"requires a writable migration to {SCHEMA_VERSION}; "
+                            "doctor is read-only"
+                        )
+                    raise WorkspaceError(
+                        f"Registry schema_version {_registry_schema_version_value} "
+                        f"is unsupported (expected {SCHEMA_VERSION})"
+                    )
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                required_tables = set(REQUIRED_REGISTRY_COLUMNS)
+                missing_tables = sorted(required_tables - tables)
+                if missing_tables:
+                    raise WorkspaceError(
+                        "Registry is missing tables: " + ", ".join(missing_tables)
+                    )
+                missing_columns = {
+                    table: sorted(
+                        required - _table_columns(connection, table)
+                    )
+                    for table, required in REQUIRED_REGISTRY_COLUMNS.items()
+                }
+                missing_columns = {
+                    table: columns
+                    for table, columns in missing_columns.items()
+                    if columns
+                }
+                if missing_columns:
+                    details = "; ".join(
+                        f"{table}: {', '.join(columns)}"
+                        for table, columns in sorted(missing_columns.items())
+                    )
+                    raise WorkspaceError(
+                        "Registry is missing columns: " + details
+                    )
+            finally:
+                connection.close()
+            _doctor_check(
+                checks,
+                "workspace",
+                "pass",
+                f"Healthy read-only workspace: {root}",
+                path=str(root),
+                schema_version=config.get("schema_version"),
+            )
+            workspace_result = {"path": str(root), "schema_version": config.get("schema_version")}
+        except Exception as exc:
+            _doctor_check(
+                checks,
+                "workspace",
+                "fail",
+                str(exc),
+                error_type=type(exc).__name__,
+            )
+
+    failures = [check for check in checks if check["status"] == "fail"]
+    warnings = [check for check in checks if check["status"] == "warning"]
+    overall = "blocked" if failures else "warning" if warnings else "pass"
+    return {
+        "status": overall,
+        "read_only": True,
+        "tool_version": novel_cli.TOOL_VERSION,
+        "workspace": workspace_result,
+        "checks": checks,
+        "failure_count": len(failures),
+        "warning_count": len(warnings),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = novel_cli.JsonArgumentParser(
         description=(
             "Create isolated, platform-independent work contexts for stateful "
             "Chinese novel projects."
         )
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    novel_cli.add_common_options(parser)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=novel_cli.JsonArgumentParser
+    )
+
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Read-only runtime and workspace health check."
+    )
+    doctor_parser.add_argument(
+        "workspace",
+        nargs="?",
+        help="Optional workspace root; omitted means environment-only checks.",
+    )
 
     init = subparsers.add_parser("init", help="Initialize a workspace root.")
     init.add_argument("workspace")
@@ -1250,6 +2258,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--lease-seconds", type=int, default=DEFAULT_LEASE_SECONDS
     )
 
+    lock_renew = subparsers.add_parser(
+        "lock-renew", help="Refresh the heartbeat and expiry of an owned lease."
+    )
+    lock_renew.add_argument("workspace")
+    lock_renew.add_argument("work_id")
+    lock_renew.add_argument("--lease-seconds", type=int)
+
     check = subparsers.add_parser(
         "write-check", help="Require a live owned lease and unchanged project hash."
     )
@@ -1268,24 +2283,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lock_release.add_argument("workspace")
     lock_release.add_argument("work_id")
+
+    lock_break = subparsers.add_parser(
+        "lock-break",
+        help="Recover an expired/stale lease with explicit owner and audit reason.",
+    )
+    lock_break.add_argument("workspace")
+    lock_break.add_argument("project_id")
+    lock_break.add_argument("--expected-owner", required=True)
+    lock_break.add_argument("--reason", required=True)
     return parser
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    try:
+    def dispatch(args: argparse.Namespace) -> Any:
+        if args.command == "doctor":
+            result = doctor(args.workspace)
+            return result, 0 if result["status"] == "pass" else 1
         if args.command == "init":
-            result = initialize_workspace(
+            return initialize_workspace(
                 args.workspace, adopt_existing=args.adopt_existing
             )
-        elif args.command == "status":
-            result = workspace_status(args.workspace)
-        elif args.command == "project-register":
-            result = register_project(
+        if args.command == "status":
+            return workspace_status(args.workspace)
+        if args.command == "project-register":
+            return register_project(
                 args.workspace, args.project_root, project_id=args.project_id
             )
-        elif args.command == "project-create":
-            result = create_project(
+        if args.command == "project-create":
+            return create_project(
                 args.workspace,
                 title=args.title,
                 genre=args.genre,
@@ -1295,18 +2321,18 @@ def main() -> int:
                 project_id=args.project_id,
                 short_story_slug=args.short_story_slug,
             )
-        elif args.command == "project-list":
-            result = project_list(args.workspace)
-        elif args.command == "work-start":
-            result = create_work(
+        if args.command == "project-list":
+            return project_list(args.workspace)
+        if args.command == "work-start":
+            return create_work(
                 args.workspace,
                 project_id=args.project_id,
                 purpose=args.purpose,
                 client=args.client,
                 work_id=args.work_id,
             )
-        elif args.command == "work-ensure":
-            result = ensure_work(
+        if args.command == "work-ensure":
+            return ensure_work(
                 args.workspace,
                 context=args.context,
                 work_id=args.work_id,
@@ -1314,35 +2340,43 @@ def main() -> int:
                 purpose=args.purpose,
                 client=args.client,
             )
-        elif args.command == "work-bind":
-            result = bind_work(args.workspace, args.work_id, args.project_id)
-        elif args.command == "work-resume":
-            result = resume_work(args.workspace, args.work_id)
-        elif args.command == "work-list":
-            result = work_list(args.workspace, active_only=args.active_only)
-        elif args.command == "work-close":
-            result = close_work(args.workspace, args.work_id)
-        elif args.command == "lock-acquire":
-            result = acquire_lock(
+        if args.command == "work-bind":
+            return bind_work(args.workspace, args.work_id, args.project_id)
+        if args.command == "work-resume":
+            return resume_work(args.workspace, args.work_id)
+        if args.command == "work-list":
+            return work_list(args.workspace, active_only=args.active_only)
+        if args.command == "work-close":
+            return close_work(args.workspace, args.work_id)
+        if args.command == "lock-acquire":
+            return acquire_lock(
                 args.workspace, args.work_id, lease_seconds=args.lease_seconds
             )
-        elif args.command == "write-check":
-            result = write_check(args.workspace, args.work_id)
-        elif args.command == "base-refresh":
-            result = refresh_base(
+        if args.command == "lock-renew":
+            return renew_lock(
+                args.workspace, args.work_id, lease_seconds=args.lease_seconds
+            )
+        if args.command == "write-check":
+            return write_check(args.workspace, args.work_id)
+        if args.command == "base-refresh":
+            return refresh_base(
                 args.workspace, args.work_id, args.validation_reference
             )
-        else:
-            result = release_lock(args.workspace, args.work_id)
-        code = 0
-    except WorkspaceError as exc:
-        result = {"status": "error", "error": str(exc)}
-        code = 2
-    except sqlite3.Error as exc:
-        result = {"status": "error", "error": f"Workspace database error: {exc}"}
-        code = 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return code
+        if args.command == "lock-break":
+            return break_lock(
+                args.workspace,
+                args.project_id,
+                expected_owner=args.expected_owner,
+                reason=args.reason,
+            )
+        return release_lock(args.workspace, args.work_id)
+
+    return novel_cli.run_cli(
+        build_parser,
+        dispatch,
+        tool_name="novel_workspace",
+        domain_errors=(WorkspaceError, OSError, sqlite3.Error),
+    )
 
 
 if __name__ == "__main__":

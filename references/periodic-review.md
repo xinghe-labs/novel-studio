@@ -76,9 +76,11 @@ python -X utf8 .\scripts\novel_review.py status "<project-root>"
 python -X utf8 .\scripts\novel_review.py prepare "<project-root>" --output "<work-root>\reviews\periodic\review-packet.json"
 ```
 
-必须由独立只读审稿 Agent 按审核包的 `reading_scope` 完成阅读，不能由写稿上下文自称独立。填写同目录生成的 `review-packet-report.json`，保留 `review_domain: quality`、`continuity_review_separate: true`，并填写真实 `reviewer_id`、`mode: independent`、`independent_context: true`。每条发现必须有具体位置、正文证据、问题、影响、最小修法、影响范围和是否需要作者判断。严重度与结论严格映射：
+必须由独立只读审稿 Agent 按审核包的 `reading_scope` 完成阅读，不能由写稿上下文自称独立。填写同目录生成的 `review-packet-report.json`，保留 `review_domain: quality`、`continuity_review_separate: true`，并填写真实 `reviewer_id`、`mode: independent`、`independent_context: true`。每条发现必须有具体位置、正文证据、问题、影响、最小修法、影响范围和是否需要作者判断。
 
 短故事使用相同命令，但建议把工作目录目标设为 `reviews\completion\review-packet.json`；生成的 `packet_kind` 与 `report_kind` 分别为 `short_story_completion_review_packet` 和 `short_story_completion_review`。报告中的 `chapters: [1]` 指唯一完整正文单元，位置字段应进一步注明场景、标题或段落锚点。
+
+严重度与结论严格映射。脚本字段使用英文枚举；中文审核记录中的“阻断/重要/一般/建议”分别对应 `blocker`/`important`/`minor`/`note`：
 
 | 发现严重度 | 含义 | 报告结论 |
 |---|---|---|

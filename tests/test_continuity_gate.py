@@ -17,6 +17,7 @@ import novel_continuity  # noqa: E402
 import novel_export  # noqa: E402
 import novel_originality  # noqa: E402
 import novel_project  # noqa: E402
+import novel_workspace  # noqa: E402
 from continuity_test_utils import (  # noqa: E402
     complete_staged_continuity,
     evidence_quote,
@@ -35,12 +36,15 @@ class ContinuityGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.base = Path(self.temp_dir.name)
+        self.workspace = self.base / "workspace"
+        novel_workspace.initialize_workspace(self.workspace)
+        self.work_contexts: dict[Path, str] = {}
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
     def init_project(self, name: str, *, ready: bool = True) -> Path:
-        root = self.base / name
+        root = self.workspace / "projects" / name
         novel_project.init_project(
             SimpleNamespace(
                 root=str(root),
@@ -75,7 +79,30 @@ class ContinuityGateTests(unittest.TestCase):
                 )
             )
             self.write_originality_plan(root)
+        novel_workspace.register_project(self.workspace, root, project_id=name)
+        work = novel_workspace.create_work(self.workspace, project_id=name, purpose="连续性测试提交")
+        novel_workspace.acquire_lock(self.workspace, work["work_id"])
+        self.work_contexts[root.resolve()] = work["work_id"]
         return root
+
+    def commit_args(self, root: Path, package: Path) -> SimpleNamespace:
+        work_id = self.work_contexts[root.resolve()]
+        novel_workspace.refresh_base(
+            self.workspace, work_id, "测试已完成提交前项目复核"
+        )
+        return SimpleNamespace(
+            root=str(root),
+            package=str(package),
+            workspace=str(self.workspace),
+            work_id=work_id,
+        )
+
+    def commit(self, root: Path, package: Path) -> dict:
+        result = novel_project.commit_chapter(self.commit_args(root, package))
+        novel_workspace.refresh_base(
+            self.workspace, self.work_contexts[root.resolve()], "测试提交后校验通过"
+        )
+        return result
 
     def write_originality_plan(self, root: Path) -> None:
         plan = {
@@ -364,9 +391,7 @@ class ContinuityGateTests(unittest.TestCase):
             SimpleNamespace(root=str(root), package=str(package))
         )
         self.assertEqual(code, 0, result)
-        novel_project.commit_chapter(
-            SimpleNamespace(root=str(root), package=str(package))
-        )
+        self.commit(root, package)
         stored = [
             json.loads(line)
             for line in (root / novel_continuity.FACTS_PATH)
@@ -528,9 +553,7 @@ class ContinuityGateTests(unittest.TestCase):
         root = self.init_project("five-chapter-gate")
         for number in range(1, 6):
             package = self.stage_chapter(root, number)
-            novel_project.commit_chapter(
-                SimpleNamespace(root=str(root), package=str(package))
-            )
+            self.commit(root, package)
         status = novel_continuity.continuity_status(root)
         self.assertEqual(status["status"], "review_due")
         self.assertEqual(status["global_review_due_through"], 5)

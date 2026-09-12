@@ -69,13 +69,7 @@ python -X utf8 .\scripts\novel_export.py export "<project-root>" --format fanqie
 python -X utf8 .\scripts\novel_export.py status "<project-root>"
 ```
 
-返回状态：
-
-- `blocked`：连续性或质量审核未通过、到期或过期；不得导出或上传。
-- `fresh`：源快照一致，全部登记产物存在，哈希、库存、平台配置和实际质量复检均通过。
-- `stale`：Markdown 主稿、索引或 `novel.json` 已变化，需要重新导出。
-- `modified`：登记产物、清单、目录库存、平台配置或质量检查存在异常；不得上传。
-- `missing`：尚未生成导出清单。
+`blocked/fresh/stale/modified/missing` 的唯一状态定义和质量字段语义见 [platform-delivery-quality.md](platform-delivery-quality.md) 的“清单与状态”。本文件不另行维护镜像定义。
 
 ## 写入与覆盖边界
 
@@ -87,12 +81,12 @@ python -X utf8 .\scripts\novel_export.py status "<project-root>"
 
 ## 交付检查
 
-1. 依次运行 `novel_continuity.py status <project-root>`、`novel_review.py status <project-root>` 和 `novel_project.py validate <project-root>`。要求连续性为 `current`、质量审核未到期且项目无错误；任何 `baseline_required`、`review_due`、`stale`、开放失效项或非通过审核都不导出。源文本出现 BOM、替换字符、控制符、双向控制符、私用区、未分配码位或歧义不可见字符时按 [platform-delivery-quality.md](platform-delivery-quality.md) 阻断，不静默删除。
+1. 依次运行 `novel_continuity.py status <project-root>`、`novel_review.py status <project-root>` 和 `novel_project.py validate <project-root>`。要求连续性为 `current`、质量审核未到期且项目无错误；任何 `baseline_required`、`review_due`、`stale`、开放失效项或非通过审核都不导出。源文本质量检查统一按 [platform-delivery-quality.md](platform-delivery-quality.md) 处理。
 2. 运行导出命令并确认连载返回章节数与 `novel.json.current_chapter` 一致；短故事必须返回 `work_type: short_story` 且正文单元数为 1。
-3. 运行 `novel_export.py status <project-root>`，要求同时为 `status: fresh` 和 `delivery_quality: pass`，且 `verified_profiles` 包含本次上传目标。旧清单即使文件哈希匹配，也要重新导出后才能取得新版质量证明。
+3. 运行 `novel_export.py status <project-root>`，按 [platform-delivery-quality.md](platform-delivery-quality.md) 的单一状态定义确认本次目标可交付；旧清单不能沿用新版质量证明。
 4. DOCX 交付前用可用的 Word/LibreOffice 渲染器转成逐页图片，检查全部页面是否有缺字、重叠、裁切、异常分页或页码问题。
 5. EPUB 至少检查 ZIP、mimetype、OPF、导航、NCX 和全部章节 XHTML；有 EPUBCheck 时再运行标准校验。
-6. TXT 与番茄文件由 `status` 按严格 UTF-8、无 BOM、LF、NFC 重新读取，并复查危险字符、异常空白、Markdown/HTML 残留、首末章、章数、标题映射和正典派生字节。短故事还要核对 `fanqie-short-story/` 恰好一个正文文件且不含章号。
+6. TXT、番茄文件和短故事单文件的编码、Unicode、库存、标题映射与正典派生字节复检，统一采用 [platform-delivery-quality.md](platform-delivery-quality.md) 的纯文本包规则。
 
 导出完成不等于授权发布。登录平台、上传作品、填写作者信息、选择签约设置或实际发布仍需用户明确授权。
 

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from typing import Any
 
 import novel_review
 import novel_continuity
+import novel_cli
 
 
 SCHEMA_VERSION = 1
@@ -1453,6 +1455,28 @@ def validate_humanization_review(
 
 def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
     root = resolve_root(args.root)
+    workspace_raw = getattr(args, "workspace", None)
+    work_id = getattr(args, "work_id", None)
+    if not workspace_raw or not work_id:
+        raise ProjectError(
+            "commit-chapter requires --workspace and --work-id so the project "
+            "write lease cannot be bypassed"
+        )
+    # Imported lazily because novel_workspace imports this module while
+    # registering and creating projects.
+    try:
+        import novel_workspace
+    except (ImportError, OSError) as exc:
+        raise ProjectError(f"Project write authorization module unavailable: {exc}") from exc
+    try:
+        write_authority = novel_workspace.write_check(workspace_raw, work_id)
+    except (OSError, sqlite3.Error, novel_workspace.WorkspaceError) as exc:
+        raise ProjectError(f"Project write authorization failed: {exc}") from exc
+    authorized_root = Path(write_authority["project_root"]).resolve()
+    if authorized_root != root:
+        raise ProjectError(
+            "The work lease belongs to a different project; refusing to commit"
+        )
     package = Path(args.package).expanduser()
     if not package.is_absolute():
         package = root / package
@@ -1646,8 +1670,25 @@ def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
         errors, _ = collect_validation(root)
         if errors:
             raise ProjectError("Post-commit validation failed: " + "; ".join(errors))
+        try:
+            guard.assert_live()
+        except (OSError, sqlite3.Error, novel_workspace.WorkspaceError) as exc:
+            raise ProjectError(
+                f"Project write authorization expired during commit: {exc}"
+            ) from exc
 
-    transactional_write(writes, validator=validate_committed_state)
+    # The guard acquires BEGIN IMMEDIATE and remains open for the complete
+    # atomic file transaction.  A second writer therefore cannot reclaim the
+    # lease between the final authorization check and rollback/replace.
+    try:
+        with novel_workspace.write_guard(
+            workspace_raw,
+            work_id,
+            expected_project_root=root,
+        ) as guard:
+            transactional_write(writes, validator=validate_committed_state)
+    except (OSError, sqlite3.Error, novel_workspace.WorkspaceError) as exc:
+        raise ProjectError(f"Project write authorization expired: {exc}") from exc
     cache_result: dict[str, Any] | None = None
     cache_warning: str | None = None
     if (root / ".novel-cache/novel-memory.sqlite3").is_file():
@@ -1777,13 +1818,16 @@ def project_status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = novel_cli.JsonArgumentParser(
         description=(
             "Create, upgrade, validate, transition, and transactionally commit an "
             "interactive, research-backed, stateful Chinese fiction project."
         )
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    novel_cli.add_common_options(parser)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=novel_cli.JsonArgumentParser
+    )
 
     init_parser = subparsers.add_parser("init", help="Initialize a new project.")
     init_parser.add_argument("root", help="Dedicated project directory.")
@@ -1854,37 +1898,41 @@ def build_parser() -> argparse.ArgumentParser:
     commit_parser.add_argument(
         "package", help="Directory under <project>/staging/chapters containing commit.json."
     )
+    commit_parser.add_argument(
+        "--workspace",
+        required=True,
+        help="Workspace root that owns the write lease.",
+    )
+    commit_parser.add_argument(
+        "--work-id",
+        required=True,
+        help="Active work context that owns the write lease.",
+    )
     return parser
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    try:
+    def dispatch(args: argparse.Namespace) -> Any:
         if args.command == "init":
-            result = init_project(args)
-            code = 0
-        elif args.command == "upgrade":
-            result = upgrade_project(args)
-            code = 0
-        elif args.command == "validate":
-            result, code = validate_project(args)
-        elif args.command == "status":
-            result, code = project_status(args)
-        elif args.command == "research-state":
-            result = research_state(args)
-            code = 0
-        elif args.command == "framework-state":
-            result = framework_state(args)
-            code = 0
-        else:
-            result = commit_chapter(args)
-            code = 0
-    except ProjectError as exc:
-        result = {"status": "error", "error": str(exc)}
-        code = 2
+            return init_project(args)
+        if args.command == "upgrade":
+            return upgrade_project(args)
+        if args.command == "validate":
+            return validate_project(args)
+        if args.command == "status":
+            return project_status(args)
+        if args.command == "research-state":
+            return research_state(args)
+        if args.command == "framework-state":
+            return framework_state(args)
+        return commit_chapter(args)
 
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return code
+    return novel_cli.run_cli(
+        build_parser,
+        dispatch,
+        tool_name="novel_project",
+        domain_errors=(ProjectError, OSError),
+    )
 
 
 if __name__ == "__main__":

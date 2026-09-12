@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import novel_cli
+
 
 SCHEMA_VERSION = 1
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
@@ -632,13 +634,16 @@ def verify_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = novel_cli.JsonArgumentParser(
         description=(
             "Collect public novel-platform snapshots and register project-local "
             "sources with provenance and authorization boundaries."
         )
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    novel_cli.add_common_options(parser)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=novel_cli.JsonArgumentParser
+    )
 
     subparsers.add_parser("adapters", help="List implemented platform adapters.")
 
@@ -687,31 +692,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    try:
+    def dispatch(args: argparse.Namespace) -> Any:
         if args.command == "adapters":
-            result: Any = {
+            return {
                 "status": "ok",
                 "adapters": [adapter.capability() for adapter in ADAPTERS.values()],
             }
-            code = 0
-        elif args.command == "collect":
+        if args.command == "collect":
             if args.page_index < 0:
                 raise ResearchError("--page-index must be non-negative")
             if args.timeout <= 0:
                 raise ResearchError("--timeout must be positive")
-            result = collect_platform(args)
-            code = 0
-        elif args.command == "register":
-            result = register_command(args)
-            code = 0
-        else:
-            result, code = verify_command(args)
-    except (ResearchError, OSError) as exc:
-        result = {"status": "error", "error": str(exc)}
-        code = 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return code
+            return collect_platform(args)
+        if args.command == "register":
+            return register_command(args)
+        return verify_command(args)
+
+    return novel_cli.run_cli(
+        build_parser,
+        dispatch,
+        tool_name="novel_research",
+        domain_errors=(ResearchError, OSError),
+    )
 
 
 if __name__ == "__main__":

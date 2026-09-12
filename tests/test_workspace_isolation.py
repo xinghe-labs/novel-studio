@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -309,6 +310,52 @@ class WorkspaceIsolationTests(unittest.TestCase):
         export.write_text("派生内容\n", encoding="utf-8", newline="\n")
         self.assertEqual(novel_workspace.project_state_hash(project_root), before_hash)
 
+    def test_old_state_hash_with_staging_is_accepted_until_base_refresh(self) -> None:
+        project = self.create_project()
+        project_root = Path(project["project_root"])
+        staging = project_root / "staging/chapters/0001/input.md"
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        staging.write_text("暂存章节", encoding="utf-8", newline="\n")
+        legacy_hash = novel_workspace.project_state_hash(
+            project_root, include_staging=True
+        )
+        current_hash = novel_workspace.project_state_hash(project_root)
+        self.assertNotEqual(legacy_hash, current_hash)
+        work = novel_workspace.create_work(
+            self.workspace, project_id=project["project_id"], purpose="旧上下文"
+        )
+        context_path = Path(work["work_root"]) / "work.json"
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+        context["base_state_hash"] = legacy_hash
+        context_path.write_text(
+            json.dumps(context, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        connection = sqlite3.connect(self.workspace / "registry.sqlite3")
+        try:
+            connection.execute(
+                "UPDATE works SET base_state_hash = ? WHERE work_id = ?",
+                (legacy_hash, work["work_id"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        novel_workspace.acquire_lock(self.workspace, work["work_id"])
+        check = novel_workspace.write_check(self.workspace, work["work_id"])
+        self.assertTrue(check["legacy_hash_accepted"])
+        self.assertEqual(check["state_hash_version"], novel_workspace.LEGACY_STATE_HASH_VERSION)
+        refreshed = novel_workspace.refresh_base(
+            self.workspace, work["work_id"], "升级旧状态哈希并核对暂存边界"
+        )
+        self.assertEqual(refreshed["base_state_hash"], current_hash)
+        self.assertFalse(
+            novel_workspace.write_check(self.workspace, work["work_id"])[
+                "legacy_hash_accepted"
+            ]
+        )
+        novel_workspace.release_lock(self.workspace, work["work_id"])
+
     def test_work_json_cannot_overwrite_live_registry_state(self) -> None:
         project = self.create_project()
         work = novel_workspace.create_work(
@@ -325,6 +372,29 @@ class WorkspaceIsolationTests(unittest.TestCase):
         novel_workspace.workspace_status(self.workspace)
         with self.assertRaises(novel_workspace.WorkspaceError):
             novel_workspace.resume_work(self.workspace, work["work_id"])
+
+    def test_close_work_requires_release_and_persists_closed_state(self) -> None:
+        project = self.create_project("novel-close")
+        work = novel_workspace.create_work(
+            self.workspace, project_id=project["project_id"], purpose="关闭测试"
+        )
+        novel_workspace.acquire_lock(self.workspace, work["work_id"])
+        with self.assertRaisesRegex(novel_workspace.WorkspaceError, "Release"):
+            novel_workspace.close_work(self.workspace, work["work_id"])
+
+        novel_workspace.release_lock(self.workspace, work["work_id"])
+        closed = novel_workspace.close_work(self.workspace, work["work_id"])
+        self.assertEqual(closed["status"], "closed")
+        context = json.loads(
+            (Path(work["work_root"]) / "work.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(context["status"], "closed")
+        listed = novel_workspace.work_list(self.workspace)
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(listed["works"][0]["status"], "closed")
+        status = novel_workspace.workspace_status(self.workspace)
+        self.assertEqual(status["active_works"], 0)
+        self.assertEqual(status["closed_works"], 1)
 
 
 if __name__ == "__main__":

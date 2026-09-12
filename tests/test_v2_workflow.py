@@ -19,6 +19,7 @@ import novel_memory  # noqa: E402
 import novel_originality  # noqa: E402
 import novel_project  # noqa: E402
 import novel_research  # noqa: E402
+import novel_workspace  # noqa: E402
 from continuity_test_utils import complete_staged_continuity  # noqa: E402
 
 
@@ -35,19 +36,96 @@ class NovelV2Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.base = Path(self.temp_dir.name)
+        self.workspace = self.base / "workspace"
+        novel_workspace.initialize_workspace(self.workspace)
+        self.work_contexts: dict[Path, str] = {}
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
     def init_project(self, name: str = "project") -> Path:
-        root = self.base / name
+        root = self.workspace / "projects" / name
         result = novel_project.init_project(
             SimpleNamespace(
                 root=str(root), title="测试长篇", language="zh-CN", genre="悬疑"
             )
         )
         self.assertEqual(result["status"], "created")
+        novel_workspace.register_project(self.workspace, root, project_id=name)
+        work = novel_workspace.create_work(self.workspace, project_id=name, purpose="测试提交")
+        novel_workspace.acquire_lock(self.workspace, work["work_id"])
+        self.work_contexts[root.resolve()] = work["work_id"]
         return root
+
+    def test_project_status_covers_valid_invalid_and_short_story_shapes(self) -> None:
+        serial_root = self.workspace / "projects" / "status-serial"
+        created = novel_project.init_project(
+            SimpleNamespace(
+                root=str(serial_root),
+                title="状态长篇",
+                language="zh-CN",
+                genre="悬疑",
+            )
+        )
+        self.assertEqual(created["status"], "created")
+        status, code = novel_project.project_status(
+            SimpleNamespace(root=str(serial_root))
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["current_chapter"], 0)
+        self.assertEqual(status["manuscript_files"], 0)
+        self.assertNotIn("work_type", status)
+
+        manifest_path = serial_root / "novel.json"
+        manifest = read_json(manifest_path)
+        manifest["schema_version"] = 99
+        write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        invalid, invalid_code = novel_project.project_status(
+            SimpleNamespace(root=str(serial_root))
+        )
+        self.assertEqual(invalid_code, 1)
+        self.assertEqual(invalid["status"], "invalid")
+        self.assertTrue(any("schema_version" in item for item in invalid["errors"]))
+
+        short_root = self.workspace / "projects" / "status-short"
+        short_created = novel_project.init_project(
+            SimpleNamespace(
+                root=str(short_root),
+                title="状态短故事",
+                language="zh-CN",
+                genre="悬疑",
+                work_type="short_story",
+            )
+        )
+        self.assertEqual(short_created["status"], "created")
+        short_status, short_code = novel_project.project_status(
+            SimpleNamespace(root=str(short_root))
+        )
+        self.assertEqual(short_code, 0)
+        self.assertEqual(short_status["status"], "ok")
+        self.assertEqual(short_status["work_type"], "short_story")
+
+    def commit_args(self, root: Path, package: Path) -> SimpleNamespace:
+        work_id = self.work_contexts[root.resolve()]
+        # Test setup writes approved project metadata after the work is created;
+        # record that validated setup before exercising the commit contract.
+        novel_workspace.refresh_base(
+            self.workspace, work_id, "测试已完成提交前项目复核"
+        )
+        return SimpleNamespace(
+            root=str(root),
+            package=str(package),
+            workspace=str(self.workspace),
+            work_id=work_id,
+        )
+
+    def commit(self, root: Path, package: Path) -> dict:
+        result = novel_project.commit_chapter(self.commit_args(root, package))
+        novel_workspace.refresh_base(
+            self.workspace, self.work_contexts[root.resolve()], "测试提交后校验通过"
+        )
+        return result
 
     def complete_originality_plan(self, root: Path) -> None:
         plan = {
@@ -404,9 +482,7 @@ class NovelV2Tests(unittest.TestCase):
         report_path = self.create_passing_audit(root, package)
         self.write_commit_manifest(package, report_path)
         complete_staged_continuity(root, package)
-        result = novel_project.commit_chapter(
-            SimpleNamespace(root=str(root), package=str(package))
-        )
+        result = self.commit(root, package)
         self.assertEqual(result["status"], "committed")
         self.assertEqual(result["humanization_outcome"], "unchanged")
         self.assertEqual(result["humanization_review"], "humanization-review.json")
@@ -434,9 +510,7 @@ class NovelV2Tests(unittest.TestCase):
         with mock.patch.object(novel_project.os, "replace", side_effect=fail_once):
             with self.assertRaises(novel_project.ProjectError):
                 novel_project.commit_chapter(
-                    SimpleNamespace(
-                        root=str(rollback_root), package=str(rollback_package)
-                    )
+                    self.commit_args(rollback_root, rollback_package)
                 )
         self.assertFalse(
             (rollback_root / "manuscript/chapters/0001-坏表.md").exists()
@@ -464,9 +538,7 @@ class NovelV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(
             novel_project.ProjectError, "humanization_review_file"
         ):
-            novel_project.commit_chapter(
-                SimpleNamespace(root=str(root), package=str(package))
-            )
+            novel_project.commit_chapter(self.commit_args(root, package))
         self.assertFalse((root / "manuscript/chapters/0001-坏表.md").exists())
 
     def test_chapter_commit_rejects_stale_humanization_result_hash(self) -> None:
@@ -487,9 +559,7 @@ class NovelV2Tests(unittest.TestCase):
             novel_project.ProjectError,
             "Humanization review result hash does not match",
         ):
-            novel_project.commit_chapter(
-                SimpleNamespace(root=str(root), package=str(package))
-            )
+            novel_project.commit_chapter(self.commit_args(root, package))
         self.assertFalse((root / "manuscript/chapters/0001-坏表.md").exists())
 
     def test_upgrade_is_add_only_and_idempotent(self) -> None:

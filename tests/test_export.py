@@ -215,6 +215,84 @@ class NovelExportTests(unittest.TestCase):
         with self.assertRaises(novel_export.ExportError):
             self.export()
 
+    def test_epub_rejects_broken_manifest_targets(self) -> None:
+        self.export(["epub"])
+        epub = self.root / "exports/《长夜余烬》.epub"
+        broken = self.root / "broken.epub"
+        with zipfile.ZipFile(epub) as source, zipfile.ZipFile(
+            broken, "w", compression=zipfile.ZIP_DEFLATED
+        ) as target:
+            for info in source.infolist():
+                data = source.read(info.filename)
+                if info.filename == "EPUB/package.opf":
+                    data = data.replace(
+                        b'href="text/chapter-0001.xhtml"',
+                        b'href="text/missing.xhtml"',
+                    )
+                target.writestr(
+                    info.filename,
+                    data,
+                    compress_type=(
+                        zipfile.ZIP_STORED
+                        if info.filename == "mimetype"
+                        else zipfile.ZIP_DEFLATED
+                    ),
+                )
+        with self.assertRaisesRegex(novel_export.ExportError, "manifest target"):
+            novel_export.validate_epub(broken, 2)
+
+    def test_epub_rejects_broken_navigation_targets(self) -> None:
+        self.export(["epub"])
+        epub = self.root / "exports/《长夜余烬》.epub"
+        broken = self.root / "broken-navigation.epub"
+        with zipfile.ZipFile(epub) as source, zipfile.ZipFile(
+            broken, "w", compression=zipfile.ZIP_DEFLATED
+        ) as target:
+            for info in source.infolist():
+                data = source.read(info.filename)
+                if info.filename == "EPUB/nav.xhtml":
+                    data = data.replace(
+                        b'href="text/chapter-0001.xhtml"',
+                        b'href="text/missing.xhtml"',
+                    )
+                target.writestr(
+                    info.filename,
+                    data,
+                    compress_type=(
+                        zipfile.ZIP_STORED
+                        if info.filename == "mimetype"
+                        else zipfile.ZIP_DEFLATED
+                    ),
+                )
+        with self.assertRaisesRegex(novel_export.ExportError, "navigation target"):
+            novel_export.validate_epub(broken, 2)
+
+    def test_epub_rejects_references_that_escape_epub_root(self) -> None:
+        self.export(["epub"])
+        epub = self.root / "exports/《长夜余烬》.epub"
+        broken = self.root / "escape.epub"
+        with zipfile.ZipFile(epub) as source, zipfile.ZipFile(
+            broken, "w", compression=zipfile.ZIP_DEFLATED
+        ) as target:
+            for info in source.infolist():
+                data = source.read(info.filename)
+                if info.filename == "EPUB/nav.xhtml":
+                    data = data.replace(
+                        b'href="text/chapter-0001.xhtml"',
+                        b'href="../../outside.xhtml"',
+                    )
+                target.writestr(
+                    info.filename,
+                    data,
+                    compress_type=(
+                        zipfile.ZIP_STORED
+                        if info.filename == "mimetype"
+                        else zipfile.ZIP_DEFLATED
+                    ),
+                )
+        with self.assertRaisesRegex(novel_export.ExportError, "escapes EPUB"):
+            novel_export.validate_epub(broken, 2)
+
     def test_delivery_text_is_strict_utf8_lf_nfc_and_preserves_valid_unicode(self) -> None:
         chapter = self.root / "manuscript/chapters/0001-雾港来信.md"
         content = (

@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import novel_cli
+
 
 SCHEMA_VERSION = 1
 DEFAULT_INTERVAL = 5
@@ -856,13 +858,16 @@ def collect_review_validation(root: str | Path) -> tuple[list[str], list[str]]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = novel_cli.JsonArgumentParser(
         description=(
             "Plan, record, and enforce periodic novel reviews or a short-story "
             "full-manuscript completion review."
         )
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    novel_cli.add_common_options(parser)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=novel_cli.JsonArgumentParser
+    )
 
     status_parser = subparsers.add_parser("status", help="Show project review state.")
     status_parser.add_argument("root", help="Project directory.")
@@ -900,22 +905,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    try:
+    def dispatch(args: argparse.Namespace) -> Any:
         if args.command == "status":
-            result = review_status(args.root)
-        elif args.command == "prepare":
-            result = prepare_review(args)
-        elif args.command == "record":
-            result = record_review(args)
-        else:
-            result = configure_policy(args)
-        code = 0
-    except ReviewError as exc:
-        result = {"status": "error", "error": str(exc)}
-        code = 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return code
+            return review_status(args.root)
+        if args.command == "prepare":
+            return prepare_review(args)
+        if args.command == "record":
+            return record_review(args)
+        return configure_policy(args)
+
+    return novel_cli.run_cli(
+        build_parser,
+        dispatch,
+        tool_name="novel_review",
+        domain_errors=(ReviewError, OSError),
+    )
 
 
 if __name__ == "__main__":

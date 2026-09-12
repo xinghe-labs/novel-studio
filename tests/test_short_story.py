@@ -50,9 +50,38 @@ class ShortStoryWorkflowTests(unittest.TestCase):
             project_date="20260830",
         )
         self.root = Path(created["project_root"])
+        self.project_id = created["project_id"]
+        self.work_id: str | None = None
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def commit_args(self, package: Path) -> SimpleNamespace:
+        if self.work_id is None:
+            work = novel_workspace.create_work(
+                self.workspace,
+                project_id=self.project_id,
+                purpose="短故事测试提交",
+            )
+            self.work_id = work["work_id"]
+            novel_workspace.acquire_lock(self.workspace, self.work_id)
+        novel_workspace.refresh_base(
+            self.workspace, self.work_id, "测试已完成提交前项目复核"
+        )
+        return SimpleNamespace(
+            root=str(self.root),
+            package=str(package),
+            workspace=str(self.workspace),
+            work_id=self.work_id,
+        )
+
+    def commit(self, package: Path) -> dict:
+        result = novel_project.commit_chapter(self.commit_args(package))
+        assert self.work_id is not None
+        novel_workspace.refresh_base(
+            self.workspace, self.work_id, "测试提交后校验通过"
+        )
+        return result
 
     def confirm_framework(self) -> None:
         replacements = {
@@ -223,9 +252,7 @@ class ShortStoryWorkflowTests(unittest.TestCase):
 
         self.confirm_framework()
         package = self.stage_story()
-        committed = novel_project.commit_chapter(
-            SimpleNamespace(root=str(self.root), package=str(package))
-        )
+        committed = self.commit(package)
         self.assertEqual(committed["work_type"], "short_story")
         self.assertTrue(committed["review_required_before_next_commit"])
 
@@ -344,9 +371,7 @@ class ShortStoryWorkflowTests(unittest.TestCase):
     def test_short_story_rejects_a_second_canonical_unit(self) -> None:
         self.confirm_framework()
         package = self.stage_story()
-        novel_project.commit_chapter(
-            SimpleNamespace(root=str(self.root), package=str(package))
-        )
+        self.commit(package)
         second = self.root / "staging/chapters/0002-not-allowed"
         second.mkdir(parents=True)
         write_text(
@@ -362,9 +387,7 @@ class ShortStoryWorkflowTests(unittest.TestCase):
             + "\n",
         )
         with self.assertRaisesRegex(novel_project.ProjectError, "one complete"):
-            novel_project.commit_chapter(
-                SimpleNamespace(root=str(self.root), package=str(second))
-            )
+            novel_project.commit_chapter(self.commit_args(second))
 
 
 if __name__ == "__main__":

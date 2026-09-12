@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import novel_review
+import novel_cli
 
 
 SCHEMA_VERSION = 1
@@ -2043,8 +2044,11 @@ def check_package_command(args: argparse.Namespace) -> tuple[dict[str, Any], int
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Prepare and enforce hash-bound fiction continuity gates.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = novel_cli.JsonArgumentParser(description="Prepare and enforce hash-bound fiction continuity gates.")
+    novel_cli.add_common_options(parser)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=novel_cli.JsonArgumentParser
+    )
     install = subparsers.add_parser("install", help="Add continuity hard-gate scaffolding without changing prose.")
     install.add_argument("root")
     status = subparsers.add_parser("status", help="Check the current continuity seal and invalidations.")
@@ -2085,42 +2089,35 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    try:
+    def dispatch(args: argparse.Namespace) -> Any:
         if args.command == "install":
-            result = install_project(args.root)
-            code = 0
-        elif args.command == "status":
+            return install_project(args.root)
+        if args.command == "status":
             result = continuity_status(args.root)
-            code = 0 if result["status"] == "current" else 1
-        elif args.command == "prepare-context":
-            result = prepare_context(args)
-            code = 0
-        elif args.command == "prepare-audit":
-            result = prepare_audit(args)
-            code = 0
-        elif args.command == "bind-audit":
-            result = bind_audit(args)
-            code = 0
-        elif args.command == "check-package":
-            result, code = check_package_command(args)
-        elif args.command == "prepare-baseline":
-            result = prepare_baseline(args)
-            code = 0
-        elif args.command == "record-baseline":
+            return result, 0 if result["status"] == "current" else 1
+        if args.command == "prepare-context":
+            return prepare_context(args)
+        if args.command == "prepare-audit":
+            return prepare_audit(args)
+        if args.command == "bind-audit":
+            return bind_audit(args)
+        if args.command == "check-package":
+            return check_package_command(args)
+        if args.command == "prepare-baseline":
+            return prepare_baseline(args)
+        if args.command == "record-baseline":
             result = record_baseline(args)
-            code = 0 if result["status"] == "sealed" else 1
-        elif args.command == "impact":
-            result = impact_command(args)
-            code = 0
-        else:
-            result = invalidate_command(args)
-            code = 0
-    except ContinuityError as exc:
-        result = {"status": "error", "error": str(exc)}
-        code = 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return code
+            return result, 0 if result["status"] == "sealed" else 1
+        if args.command == "impact":
+            return impact_command(args)
+        return invalidate_command(args)
+
+    return novel_cli.run_cli(
+        build_parser,
+        dispatch,
+        tool_name="novel_continuity",
+        domain_errors=(ContinuityError, OSError),
+    )
 
 
 if __name__ == "__main__":

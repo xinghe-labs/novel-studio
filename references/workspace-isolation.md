@@ -4,7 +4,7 @@
 
 ## 两层目录
 
-默认工作区由用户指定；本机约定为 `<workspace-root>`：
+默认工作区由用户指定；以下命令统一使用 `<workspace-root>` 占位符，实际路径以当前项目配置为准：
 
 ```text
 <workspace-root>/
@@ -91,9 +91,29 @@ python -X utf8 .\scripts\novel_workspace.py write-check "<workspace-root>" "<wor
 1. 当前工作持有尚未过期的项目写入租约。
 2. 项目文件哈希仍与绑定时的 `base_state_hash` 一致。
 
+项目哈希排除可重建的 `exports/` 和工作输入用的 `staging/`，也排除 `.novel-cache/`、`.git/` 与 Python 缓存；这些目录的变化不会把当前工作自己的暂存包误判为并发正典修改。其他项目文件仍全部参与哈希。2.1.0 之前的工作上下文可能保存了包含 `staging/` 的旧哈希，工具只在 `write-check` 中临时识别并标记 `legacy_hash_accepted`，完成回读后必须用 `base-refresh` 写入当前算法的基准，不能把兼容状态当成永久通过。
+
 任一条件不满足就停止写入。项目已经被其他工作修改时，先重新读取变化、处理冲突并重新验证；不能静默覆盖，也不能只修改 `work.json` 绕过检查。
 
 `exports/` 是唯一例外：`novel_export.py` 只读通过验证的正典，先在临时目录构建派生包，并在发布前复查源快照，因此生成或刷新导出文件不要求取得正典写入租约。导出文件不计入 `base_state_hash`，多个导出任务不能据此修改正文；发现源快照变化或人工改过的派生文件时导出器必须停止。
+
+长时间写入任务必须在租约的心跳窗口内续租。默认租约为 1800 秒，心跳超过 300 秒（或更短租约的全部时长）未刷新即视为失效：
+
+```powershell
+python -X utf8 .\scripts\novel_workspace.py lock-renew "<workspace-root>" "<work-id>"
+```
+
+同一工作重新运行 `lock-acquire` 仍可兼容地续租，但新流程应优先使用语义明确的 `lock-renew`。崩溃恢复只能使用带预期 owner 和非空原因的受控回收：
+
+```powershell
+python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<project-id>" --expected-owner "<work-id>" --reason "原进程已退出，已核对没有活动写入者"
+```
+
+有效租约不能被 `lock-break` 回收；回收、续租和释放都会在 `lease_events` 中留下时间、owner、原因和项目哈希。若项目哈希读取失败，事件仍会写入但 `state_hash_error` 记录异常，租约仍会按明确 owner 删除。`novel_workspace.py status` 会同时报告心跳年龄、过期倒计时和实际 `live_until`。
+
+旧注册表的迁移只增不删。只要 `leases` 缺少 `lease_seconds` 或 `heartbeat_enforced` 任一新增列，已有租约就按旧的 `expires_at`-only 语义保守迁移；明确标记为 legacy schema 的注册表也一样。只有该租约被新的 `lock-acquire` 或 `lock-renew` 成功写回后，才启用五分钟心跳门禁。只读 `doctor` 不执行迁移，因此对 legacy schema 会报告需要迁移的阻断；用可写工具打开并完成迁移后再重新运行 doctor。
+
+正式提交的文件替换期间，提交器通过 `write_guard` 持有 `BEGIN IMMEDIATE` 注册表事务，并在最终验证中再次检查 owner 和心跳；这使租约检查与原子文件事务处于同一受保护窗口。
 
 完成一次已授权写入后，先运行项目级验证，再更新基准并释放租约：
 
@@ -111,7 +131,7 @@ python -X utf8 .\scripts\novel_workspace.py lock-release "<workspace-root>" "<wo
 已有项目迁入工作区后，保持其内部相对路径不变，再登记：
 
 ```powershell
-python -X utf8 .\scripts\novel_workspace.py project-register "<workspace-root>" "<projects-root>\<project-id>" --project-id "<project-id>"
+python -X utf8 .\scripts\novel_workspace.py project-register "<workspace-root>" "<workspace-root>\projects\<project-id>" --project-id "<project-id>"
 ```
 
 项目必须是 `projects/` 的直接子目录并包含有效 `novel.json`。工作目录必须是 `workspaces/` 的直接子目录。脚本拒绝磁盘根、用户主目录、路径穿越、重复 ID 和同一路径的冲突登记。

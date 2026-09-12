@@ -1,17 +1,17 @@
 # 受控自动化与章节提交
 
-在候选审批、框架确认、批量研究、正式写章、短故事完稿提交或重大改稿时读取本文件。工作隔离和单写者协议见 [workspace-isolation.md](workspace-isolation.md)，项目目录和真源优先级见 [project-contract.md](project-contract.md)，原创性闸门见 [originality-audit.md](originality-audit.md)；短故事另读 [short-story-mode.md](short-story-mode.md)。
+在候选审批、框架确认、批量研究、正式写章、短故事完稿提交或重大改稿时读取本文件。正典写入顺序、租约和收尾语义以 [commit-protocol.md](commit-protocol.md) 为规范真源；本文件只补充自然化记录、暂存包和人工确认边界。工作隔离和单写者协议见 [workspace-isolation.md](workspace-isolation.md)，项目目录和真源优先级见 [project-contract.md](project-contract.md)，原创性闸门见 [originality-audit.md](originality-audit.md)；短故事另读 [short-story-mode.md](short-story-mode.md)。
 
 ## 写入租约
 
-不同工作可以并行读取项目并在各自 `workspaces/<work-id>/` 中生成草稿。任何会改变项目文件的受控命令之前，当前工作必须取得租约并确认基准状态未变化：
+不同工作可以并行读取项目并在各自 `workspaces/<work-id>/` 中生成草稿。租约取得、心跳续租、双重 `write-check`、受控回收和收尾顺序统一遵循 [commit-protocol.md](commit-protocol.md)；本节只保留最短调用提示：
 
 ```powershell
 python -X utf8 .\scripts\novel_workspace.py lock-acquire "<workspace-root>" "<work-id>"
 python -X utf8 .\scripts\novel_workspace.py write-check "<workspace-root>" "<work-id>"
 ```
 
-租约只提供单写者资格，状态哈希才防止过期租约或并行任务造成静默覆盖，两项都不能跳过。`write-check` 失败时停止写入并回读项目变化。执行完已授权写入和项目验证后：
+长任务每五分钟内运行 `lock-renew`；`write-check` 失败时停止写入并回读项目变化。执行完已授权写入和项目验证后：
 
 ```powershell
 python -X utf8 .\scripts\novel_workspace.py base-refresh "<workspace-root>" "<work-id>" --validation-reference "项目与长期记忆验证通过"
@@ -169,16 +169,12 @@ python -X utf8 .\scripts\novel_originality.py audit "<project-root>" --candidate
 python -X utf8 .\scripts\novel_continuity.py prepare-audit "<project-root>" "staging\chapters\0001-broken-watch"
 python -X utf8 .\scripts\novel_continuity.py bind-audit "<project-root>" "staging\chapters\0001-broken-watch"
 python -X utf8 .\scripts\novel_continuity.py check-package "<project-root>" "staging\chapters\0001-broken-watch"
-python -X utf8 .\scripts\novel_project.py commit-chapter "<project-root>" "staging/chapters/0001-broken-watch"
+python -X utf8 .\scripts\novel_project.py commit-chapter "<project-root>" "staging/chapters/0001-broken-watch" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 命令之间必须完成相应人工/Agent 填写：`prepare-context` 后真实回读必读文件并把上下文设为 `complete`；自然化记录必须来自真实 Skill 调用；`prepare-audit` 后完成状态增量并设为 `complete`；`bind-audit` 后才由指定审稿者填写九维审计。正文、上下文或状态增量变化后，旧审计立即失效，必须重做，不能只改哈希。
 
-提交器预检：框架已确认且双信心达到 95、章号连续、当前状态同步、连续性 `head` 当前且无开放失效项、上一轮全局连续性审核和质量审核没有逾期、正文和记忆卡完整、`humanization_review_file` 存在且声明实际使用 `humanizer-zh`、调用前原稿与最终结果是两个哈希绑定文件、结果与最终章节一致、写前上下文/状态增量/九维审计全部绑定最终哈希且为 `pass`、高风险章使用独立审稿、关键章有作者确认引用、原创报告为 `pass` 且覆盖当前正文哈希、原创性计划未在报告后变化、索引字段齐全。默认第 5 章允许提交；提交后第 6 章的写前上下文、正式提交和交付都会被全局连续性与周期质量双门禁阻断，直到两份独立报告分别通过。
-
-通过后在同一事务中写入正文、记忆卡、索引、连续性审计、稳定事实库、有意例外、章节依赖、时间线/线索/全书记忆、连续性状态、项目进度和新的正典 `head`。任一写入或最终验证失败时恢复全部原字节，不推进章号。成功后如果 SQLite 缓存存在则增量更新；缓存失败只报告重建提示，不能反向撤销或修改正典。
-
-提交结果同时返回自然化记录路径与 `outcome`、连续性审计路径、结论、审稿模式和新正典哈希。`serial_novel` 每 5 章分别执行全局连续性审核和周期质量审核；`short_story` 唯一正文提交后分别执行全篇连续性基线和质量完稿审核。到期只产生警告，不回滚刚提交的检查点正文，但下一章、正式导出和平台交付全部停止，直到两类报告均通过。
+提交器的完整预检清单、事务覆盖范围和失败回滚语义以 [commit-protocol.md](commit-protocol.md) 为准；本模式额外要求自然化记录来自真实 `$humanizer-zh` 调用，且默认第 5 章/短故事唯一正文后的两类审核未逾期。任一审核到期或未通过时，下一章、正式导出和平台交付继续阻断。
 
 暂存包成功后保留，作为提交输入与审计追溯记录；不要自动删除。需要清理时先确认范围和恢复需求。
 

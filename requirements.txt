@@ -1,0 +1,3 @@
+# novel-studio uses Python 3.10+ standard-library modules only.
+# This file is intentionally dependency-free; it documents that no pip
+# installation is required for the workflow scripts.

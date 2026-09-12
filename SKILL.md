@@ -1,17 +1,23 @@
 ---
 name: novel-studio
-description: 通过持续互动问答、可追溯的公开数据研究、隔离工作目录、本地长期记忆和哈希绑定连续性硬门禁，规划、创作、续写、审核、系统改稿并导出中文连载小说或通常 6000-80000 字的完整短故事；支持多 Agent 或脚本并行暂存、风险触发独立审稿、每五章全局连续性与质量双审核、番茄小说与短故事交付、番茄线上上传和已上传章节的受控格式修订、来源登记、双层原创性审计、Markdown 正文与索引，以及 TXT、DOCX、EPUB 和平台包。用户要从灵感确定框架、根据近期热门数据选题、建立项目、写或续写长篇章节、完成单篇短故事、跨上下文保持一致、周期或完稿查错、分层修订、上传番茄或生成阅读与发布交付物时使用；纯非虚构写作不使用。
+description: 规划、创作、续写、审核、修订并导出有长期记忆和连续性门禁的中文长篇小说或完整短故事。用户要互动确定框架、根据近期公开数据选题、跨上下文续写、做周期或完稿审核、生成番茄交付物或受控修订线上副本时使用；长篇每章和短故事全文都必须实际调用 humanizer-zh，纯非虚构写作不使用。
 metadata:
   short-description: 以互动框架、长期记忆和审核创作长篇小说或短故事
 ---
 
 # 小说工作室
 
+当前工具版本：`2.1.0`。脚本要求 Python 3.10+，只依赖标准库；命令行统一返回 JSON，参数错误退出码为 2，未预期异常退出码为 3。开始工作前可运行只读诊断：
+
+```powershell
+python -X utf8 .\scripts\novel_workspace.py doctor
+```
+
 把中文虚构创作当作有状态的工程：创意判断由作者掌舵，正文、设定、时间线、正文索引、长期记忆和改稿影响必须持久化。长期记忆依靠项目文件，不依赖当前聊天还能记住什么。不要把固定套路、评分表、“每章必有悬念”或“短篇必须反转”当成质量本身。
 
 ## 先建立隔离上下文
 
-每次使用本 Skill 都必须先读取 [workspace-isolation.md](references/workspace-isolation.md)，在任何提问、搜索、策划、审稿或写作前执行 `scripts/novel_workspace.py work-ensure`。本机默认工作区是 `<workspace-root>`，除非用户明确指定其他位置。
+每次使用本 Skill 都必须先读取 [workspace-isolation.md](references/workspace-isolation.md)，在任何提问、搜索、策划、审稿或写作前执行 `scripts/novel_workspace.py work-ensure`。工作区路径由当前项目配置或用户指定，不把某个机器上的绝对路径当成固定前提。
 
 当前目录或调用方提供的 `work_id` 能定位有效 `work.json` 时复用；否则先创建 `workspaces/work-*` 隔离目录。新工作可以暂时不绑定小说。只有用户明确要求新建一本小说时才创建 `projects/<project-id>`；继续旧书时绑定并复用已有项目，不能把一次新工作误当作一本新书。
 
@@ -38,8 +44,10 @@ metadata:
 | 审稿与查错 | 评价章节、查矛盾、找节奏或人物问题 | [revision.md](references/revision.md)、[continuity.md](references/continuity.md)；节奏、文风、吸引力和自然度另读 [periodic-review.md](references/periodic-review.md) |
 | 周期审核 | 每若干章自动检查现有章节、处理审核到期或下一章被阻断 | [periodic-review.md](references/periodic-review.md)、[revision.md](references/revision.md)、[continuity.md](references/continuity.md)、[controlled-automation.md](references/controlled-automation.md) |
 | 系统改稿 | 改人物弧、重排情节、全文润色 | [revision.md](references/revision.md)、[project-contract.md](references/project-contract.md)、[controlled-automation.md](references/controlled-automation.md) |
+| 全本机械改稿 | 跨章统一符号、频率或口癖并保留可回滚证据 | [batch-revision.md](references/batch-revision.md)、[revision.md](references/revision.md)、[continuity.md](references/continuity.md) |
 | 出版与阅读导出 | 合并 TXT、审阅 DOCX、EPUB、番茄逐章 TXT、检查导出是否过期或是否含异常字符 | [publishing-exports.md](references/publishing-exports.md)、[platform-delivery-quality.md](references/platform-delivery-quality.md)、[project-contract.md](references/project-contract.md) |
 | 番茄上传与线上修订 | 上传章节、设置定时发布、修复已上传正文中的分场符或格式问题 | [fanqie-live-publishing.md](references/fanqie-live-publishing.md)、[publishing-exports.md](references/publishing-exports.md)、[platform-delivery-quality.md](references/platform-delivery-quality.md)、[controlled-automation.md](references/controlled-automation.md) |
+| 发布后复盘 | 登记平台数据并把可复核信号回流下一轮研究/审核 | [publication-feedback.md](references/publication-feedback.md)、[market-research.md](references/market-research.md)、[periodic-review.md](references/periodic-review.md) |
 
 一次性片段润色或聊天内构思也先创建或复用工作目录，但在用户决定建立正式作品前保持未绑定，不强迫创建项目。跨章节续写、长篇连载、跨会话短故事、完稿审核、平台交付或任何需要写入正典的任务使用项目合同；短故事先读 [short-story-mode.md](references/short-story-mode.md)。
 
@@ -54,8 +62,8 @@ metadata:
 7. **续写必须通过写前连续性上下文。** `continuity-context.json` 绑定当前正典哈希，强制读取全书摘要、作者决策、索引、故事圣经、总纲、状态、时间线、线索、稳定事实、例外、依赖图和最近正文；被触及事实必须回读来源原文。不能只读上一章、聊天记忆或数据库摘要就宣称与全书一致。
 8. **最少但充分地澄清。** 复用用户已经给出的信息。只追问会实质改变结果的缺口；其余可以采用可逆假设，并在交付中列出。
 9. **先结构，后文字。** 重大剧情、人物动机或世界规则未成立时，不靠华丽句子遮盖。审稿和改稿按概念、结构、场景、文风、校对的顺序由外向内处理。
-10. **写后受控原子提交。** 正文先进入工作目录，获准写回后才建立项目暂存包；用 `state-delta.json` 精确重放状态变化，状态增量完成后运行 `bind-audit`，再完成九维连续性审计和双层原创性审计。正文、上下文或增量变化会让旧报告立即过期。事务同时写正文、记忆、事实、例外、依赖、审计和新正典 `head`；任一步失败恢复原字节且不推进状态。
-11. **连续性与质量分开审核。** 确定连续性矛盾阻断，疑似伏笔/误导可警告；普通小错只在暂存区自动修，核心设定、人物命运、重要关系、世界规则和重大伏笔必须问作者。复杂时间线、跨十章回调、秘密、核心规则、重要物品等风险章强制独立只读审稿。长篇每 5 章分别做全局连续性与质量审核；短故事提交全文后分别做全篇连续性与质量完稿审核。任一到期或未通过时禁止下一章、导出和上传。
+10. **写后受控原子提交。** 正文先留在工作目录；正式写回统一遵循 [commit-protocol.md](references/commit-protocol.md)，要求有效租约、匹配状态哈希、精确状态增量、绑定最终全文的自然化/连续性/原创性报告和单次原子事务。任一检查失败均恢复原字节且不推进正典 `head`。
+11. **连续性与质量分开审核。** 确定矛盾阻断，核心设定和重大伏笔变更由作者裁决，风险章使用独立只读审稿。长篇每 5 章分别做全局连续性与质量审核；短故事提交全文后做全篇双审核。任一到期或未通过时禁止下一章、导出和上传；细则见 [continuity.md](references/continuity.md) 与 [periodic-review.md](references/periodic-review.md)。
 12. **评审默认只报告。** 用户只要求审稿、分析或找问题时，不覆盖原文；只有明确要求修改时才落盘改稿。重大改稿前保留可恢复快照。
 13. **不机械套公式。** “展示而非讲述”、冲突、钩子、短句等都是工具。叙述压缩、安静章节、开放结尾和有意重复都可以成立，判断标准是它们是否服务本书的叙事目的。
 14. **不复制参考作品。** 可以从多部作品分别提炼高层机制并围绕新的主题、代价和因果重新组合，但不复制独特措辞、角色、设定组合、标志场面、反转答案或连续情节链。原创审计同时检查原句/近似措辞及一句话故事、人物关系、世界规则、前三节点和核心反转；高风险必须重构，不能只改名字。具体作者风格转为中性可描述特征。
@@ -95,7 +103,7 @@ metadata:
 - 对有意的不可靠叙述、误导、时间跳跃或角色撒谎标记为“有意例外”，不要自动修掉。
 - 正式章节先在 `staging/chapters/<package>/` 放入调用前原稿 `chapter-before-humanizer.md`、最终结果 `chapter.md`、哈希绑定的 `humanization-review.json`、记忆卡、新连续性状态和提交清单；生成精确状态增量，重新绑定并完成连续性审计，再运行 `scripts/novel_originality.py audit`。自然化、连续性或原创性任一门禁未完成时不得正式提交。
 - 作者把逐章自然化设为项目常规要求时，可据此采用不改变语义的结果稿，无需每章重复询问。建议若改变事实、剧情、人物动机、关系、世界规则或 POV，仍必须单独确认；结果稿改变正文时重新执行连续性与原创性检查，确保两份报告覆盖最终全文哈希。
-- 使用 `scripts/novel_project.py commit-chapter` 原子写入分章正文、索引、记忆卡、状态、事实库、例外、依赖、审计和正典 `head`；不要手工追加巨型文件，也不要先改 `current_chapter`。
+- 使用 `scripts/novel_project.py commit-chapter` 原子写入分章正文、索引、记忆卡、状态、事实库、例外、依赖、审计和正典 `head`；命令必须带同一工作区的 `--workspace` 与 `--work-id`，提交器会在写入前再次验证租约和哈希；不要手工追加巨型文件，也不要先改 `current_chapter`。
 - 提交结果显示检查点到期时立即处理两条线：连载做全局连续性基线和周期质量审核，短故事做全篇连续性基线和质量完稿审核。未通过时可以在工作目录保留修订稿，但不能继续下一章、宣称定稿、导出或上传。
 - 写入后运行 `scripts/novel_continuity.py status <project-root>`、`scripts/novel_review.py status <project-root>`、`scripts/novel_project.py validate <project-root>` 和 `scripts/novel_memory.py status <project-root>`；结构或绑定错误必须修复，到期审核必须完成，缓存过期则从文件更新或重建。
 - 用户要求阅读或发布交付物时，按 [publishing-exports.md](references/publishing-exports.md) 和 [platform-delivery-quality.md](references/platform-delivery-quality.md) 从通过验证的分章 Markdown 生成派生文件，再运行 `scripts/novel_export.py status <project-root>`；只有 `status: fresh`、`delivery_quality: pass` 且目标配置出现在 `verified_profiles` 中才可交付对应上传包。不得把导出稿中的修改当作正文修改。

@@ -137,6 +137,8 @@ memory/
 
 ## 受控提交与完稿审核
 
+租约、原子写入和收尾顺序遵循 [commit-protocol.md](commit-protocol.md)；本节只描述短故事的唯一 `0001` 单元和完稿审核差异。
+
 短故事正文仍先进入工作目录。完成强制自然化、确定最终版本并批准正式提交后，才使用一个暂存包：
 
 ```text
@@ -161,7 +163,7 @@ python -X utf8 .\scripts\novel_originality.py audit "<project-root>" --candidate
 python -X utf8 .\scripts\novel_continuity.py prepare-audit "<project-root>" "staging\chapters\0001-complete-story"
 python -X utf8 .\scripts\novel_continuity.py bind-audit "<project-root>" "staging\chapters\0001-complete-story"
 python -X utf8 .\scripts\novel_continuity.py check-package "<project-root>" "staging\chapters\0001-complete-story"
-python -X utf8 .\scripts\novel_project.py commit-chapter "<project-root>" "staging/chapters/0001-complete-story"
+python -X utf8 .\scripts\novel_project.py commit-chapter "<project-root>" "staging/chapters/0001-complete-story" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 命令之间要按 [continuity.md](continuity.md) 填完并绑定相应文件；这里只列执行顺序，不表示模板可以空着提交。缺少真实的 `$humanizer-zh` 调用或完整 `humanization-review.json` 时只能保留草稿。自然化后的最终全文若发生任何变化，必须重新生成状态增量、重新绑定连续性审计并重跑原创性审计。

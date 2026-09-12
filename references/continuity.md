@@ -1,5 +1,13 @@
 # 连续性硬门禁
 
+已有旧项目首次接入连续性账本时，先运行一次只增式安装命令；它只补齐缺失目录和模板，不改写既有正文：
+
+```powershell
+python -X utf8 .\scripts\novel_continuity.py install "<project-root>"
+```
+
+安装后先运行 `status`。若返回 `baseline_required`，必须完成全书基线和独立审核，才能继续续写或导出。
+
 在续写、写后提交、跨章查错、旧章修订、导出或平台交付前读取本文件，并与 [long-term-memory.md](long-term-memory.md)、[controlled-automation.md](controlled-automation.md) 配合使用。此协议同时适用于连载长篇和短故事，但两类项目仍使用各自独立的正文、审核和导出流程。
 
 脚本负责封存正典、绑定哈希、校验证据、阻断过期报告和传播修订影响；语义判断必须由 Agent 精读原文完成。不能把“脚本运行通过”冒充“内容没有矛盾”。

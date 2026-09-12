@@ -8,9 +8,11 @@ import hashlib
 import html
 import json
 import os
+import posixpath
 import re
 import sys
 import tempfile
+import urllib.parse
 import unicodedata
 import uuid
 import zipfile
@@ -23,6 +25,7 @@ from typing import Any, Iterable
 import novel_project
 import novel_review
 import novel_continuity
+import novel_cli
 
 
 EXPORT_SCHEMA_VERSION = 1
@@ -1691,6 +1694,26 @@ def validate_epub(
     expected_chapters: int,
     snapshot: ProjectSnapshot | None = None,
 ) -> dict[str, Any]:
+    def resolve_epub_reference(href: str, *, label: str) -> str:
+        """Resolve a package reference while keeping it inside ``EPUB/``."""
+
+        raw_path = href.split("#", 1)[0].split("?", 1)[0]
+        parsed = urllib.parse.urlsplit(raw_path)
+        if parsed.scheme or parsed.netloc:
+            raise ExportError(f"EPUB {label} uses an external URI: {href}")
+        href_path = urllib.parse.unquote(parsed.path)
+        if (
+            not href_path
+            or href_path.startswith(("/", "\\"))
+            or "\\" in href_path
+            or re.match(r"^[A-Za-z]:", href_path)
+        ):
+            raise ExportError(f"EPUB {label} has an invalid target: {href}")
+        target = posixpath.normpath(posixpath.join("EPUB", href_path))
+        if target == "EPUB" or not target.startswith("EPUB/"):
+            raise ExportError(f"EPUB {label} escapes EPUB/: {href}")
+        return target
+
     try:
         with zipfile.ZipFile(path) as archive:
             infos = archive.infolist()
@@ -1723,6 +1746,58 @@ def validate_epub(
                     tree = ET.fromstring(archive.read(name))
                     validate_xml_tree_unicode(tree, context=f"EPUB member {name}")
                     trees[name] = tree
+            names = set(archive.namelist())
+            container = trees["META-INF/container.xml"]
+            container_rootfiles = container.findall(
+                ".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile"
+            )
+            package_paths = {
+                str(item.get("full-path", "")).lstrip("/")
+                for item in container_rootfiles
+            }
+            if package_paths != {"EPUB/package.opf"}:
+                raise ExportError(
+                    "EPUB container.xml must point to EPUB/package.opf exactly"
+                )
+
+            opf = trees["EPUB/package.opf"]
+            opf_namespace = "http://www.idpf.org/2007/opf"
+            manifest_items: dict[str, str] = {}
+            for item in opf.findall(f".//{{{opf_namespace}}}manifest/{{{opf_namespace}}}item"):
+                item_id = str(item.get("id", ""))
+                href = str(item.get("href", ""))
+                if not item_id or not href or item_id in manifest_items:
+                    raise ExportError("EPUB OPF manifest contains an invalid or duplicate item")
+                target = resolve_epub_reference(href, label="manifest target")
+                if target not in names:
+                    raise ExportError(f"EPUB OPF manifest target is missing: {href}")
+                manifest_items[item_id] = target
+            spine = opf.find(f".//{{{opf_namespace}}}spine")
+            if spine is None:
+                raise ExportError("EPUB OPF is missing a spine")
+            spine_ids = [
+                str(itemref.get("idref", ""))
+                for itemref in spine.findall(f"{{{opf_namespace}}}itemref")
+            ]
+            if not spine_ids or any(item_id not in manifest_items for item_id in spine_ids):
+                raise ExportError("EPUB OPF spine references a missing manifest item")
+            nav_tree = trees["EPUB/nav.xhtml"]
+            for link in nav_tree.findall(".//{http://www.w3.org/1999/xhtml}a"):
+                href = str(link.get("href", ""))
+                if not href or href.startswith("#"):
+                    continue
+                target = resolve_epub_reference(href, label="navigation target")
+                if target not in names:
+                    raise ExportError(f"EPUB navigation target is missing: {href}")
+            ncx_tree = trees["EPUB/toc.ncx"]
+            ncx_targets = ncx_tree.findall(
+                ".//{http://www.daisy.org/z3986/2005/ncx/}content"
+            )
+            for content in ncx_targets:
+                src = str(content.get("src", ""))
+                target = resolve_epub_reference(src, label="NCX target")
+                if target not in names:
+                    raise ExportError(f"EPUB NCX target is missing: {src}")
             chapter_names = [
                 name
                 for name in archive.namelist()
@@ -2715,13 +2790,16 @@ def export_status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = novel_cli.JsonArgumentParser(
         description=(
             "Export validated novel chapters or a complete short-story Markdown "
             "manuscript into rebuildable TXT, DOCX, EPUB, and Fanqie files."
         )
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    novel_cli.add_common_options(parser)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=novel_cli.JsonArgumentParser
+    )
     export = subparsers.add_parser("export", help="Build selected derived formats.")
     export.add_argument("root", help="Initialized novel project directory.")
     export.add_argument(
@@ -2743,18 +2821,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    try:
+    def dispatch(args: argparse.Namespace) -> Any:
         if args.command == "export":
-            result = export_project(args)
-            code = 0
-        else:
-            result, code = export_status(args)
-    except (ExportError, novel_project.ProjectError, novel_continuity.ContinuityError) as exc:
-        result = {"status": "error", "error": str(exc)}
-        code = 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return code
+            return export_project(args)
+        return export_status(args)
+
+    return novel_cli.run_cli(
+        build_parser,
+        dispatch,
+        tool_name="novel_export",
+        domain_errors=(
+            ExportError,
+            novel_project.ProjectError,
+            novel_continuity.ContinuityError,
+            OSError,
+        ),
+    )
 
 
 if __name__ == "__main__":

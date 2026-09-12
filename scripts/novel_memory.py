@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import novel_cli
+
 
 SCHEMA_VERSION = 1
 DB_RELATIVE = Path(".novel-cache/novel-memory.sqlite3")
@@ -247,7 +249,7 @@ def markdown_chunks(text: str) -> list[tuple[str, int, int, str]]:
     buffer: list[str] = []
 
     def flush(end_line: int) -> None:
-        nonlocal buffer, start
+        nonlocal buffer
         if buffer:
             chunks.append((heading, start, max(start, end_line), "\n".join(buffer)))
         buffer = []
@@ -690,13 +692,16 @@ def search_index(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = novel_cli.JsonArgumentParser(
         description=(
             "Build, update, inspect, and query a rebuildable local SQLite index. "
             "Markdown, JSON, and chapter files remain the only canonical truth."
         )
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    novel_cli.add_common_options(parser)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=novel_cli.JsonArgumentParser
+    )
     for command, help_text in (
         ("rebuild", "Rebuild the SQLite cache from canonical project files."),
         ("update", "Incrementally update changed and deleted canonical files."),
@@ -719,27 +724,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    try:
+    def dispatch(args: argparse.Namespace) -> Any:
         root = resolve_project(args.root)
         if args.command == "rebuild":
-            result: Any = rebuild_index(root)
-            code = 0
-        elif args.command == "update":
-            result = update_index(root)
-            code = 0
-        elif args.command == "status":
-            result = database_status(root)
-            code = 0
-        else:
-            if args.limit < 1 or args.limit > 200:
-                raise MemoryIndexError("--limit must be from 1 to 200")
-            result, code = search_index(args)
-    except (MemoryIndexError, OSError, sqlite3.DatabaseError) as exc:
-        result = {"status": "error", "error": str(exc)}
-        code = 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return code
+            return rebuild_index(root)
+        if args.command == "update":
+            return update_index(root)
+        if args.command == "status":
+            return database_status(root)
+        if args.limit < 1 or args.limit > 200:
+            raise MemoryIndexError("--limit must be from 1 to 200")
+        return search_index(args)
+
+    return novel_cli.run_cli(
+        build_parser,
+        dispatch,
+        tool_name="novel_memory",
+        domain_errors=(MemoryIndexError, OSError, sqlite3.DatabaseError),
+    )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 
+import novel_cli
+
 
 SCHEMA_VERSION = 1
 MANIFEST_RELATIVE = Path("research/source-manifest.jsonl")
@@ -826,13 +828,16 @@ def audit_project(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = novel_cli.JsonArgumentParser(
         description=(
             "Audit exact/near wording overlap and single-source structural dominance "
             "without inventing a unified originality score."
         )
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    novel_cli.add_common_options(parser)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=novel_cli.JsonArgumentParser
+    )
     audit = subparsers.add_parser("audit", help="Run both originality audit layers.")
     audit.add_argument("root", help="Initialized novel project directory.")
     audit.add_argument(
@@ -856,20 +861,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    try:
+    def dispatch(args: argparse.Namespace) -> Any:
         if args.exact_minimum < 12 or args.exact_minimum > 80:
             raise OriginalityError("--exact-minimum must be from 12 to 80")
         if args.near_threshold < 0.5 or args.near_threshold > 1.0:
             raise OriginalityError("--near-threshold must be from 0.5 to 1.0")
         if args.max_findings < 1 or args.max_findings > 200:
             raise OriginalityError("--max-findings must be from 1 to 200")
-        result, code = audit_project(args)
-    except (OriginalityError, OSError) as exc:
-        result = {"status": "error", "error": str(exc)}
-        code = 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return code
+        return audit_project(args)
+
+    return novel_cli.run_cli(
+        build_parser,
+        dispatch,
+        tool_name="novel_originality",
+        domain_errors=(OriginalityError, OSError),
+    )
 
 
 if __name__ == "__main__":
