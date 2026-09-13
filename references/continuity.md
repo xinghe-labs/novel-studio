@@ -3,7 +3,7 @@
 已有旧项目首次接入连续性账本时，先运行一次只增式安装命令；它只补齐缺失目录和模板，不改写既有正文：
 
 ```powershell
-python -X utf8 .\scripts\novel_continuity.py install "<project-root>"
+python -X utf8 .\scripts\novel_continuity.py install "<project-root>" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 安装后先运行 `status`。若返回 `baseline_required`，必须完成全书基线和独立审核，才能继续续写或导出。
@@ -45,7 +45,7 @@ python -X utf8 .\scripts\novel_continuity.py install "<project-root>"
 8. `world_rules`：能力成本、制度后果、地理、技术、社会规则、例外和公开程度。
 9. `threads_and_payoffs`：伏笔、承诺、线索的埋设、延期、回收、废弃和重复。
 
-节奏、钩子、文风、吸引力、去 AI 化和语言格式不写入连续性结论，另走 [periodic-review.md](periodic-review.md) 的质量审稿，避免一个模糊总分掩盖正典错误。
+节奏、钩子、文风、吸引力、叙述自然度、声音一致性和语言格式不写入连续性结论，另走 [periodic-review.md](periodic-review.md) 的质量审稿，避免一个模糊总分掩盖正典错误。
 
 ## 项目文件
 
@@ -81,7 +81,7 @@ reviews/
 旧项目有正文时，升级只添加结构，不会自动宣称已有章节没有问题：
 
 ```powershell
-python -X utf8 .\scripts\novel_project.py upgrade "<project-root>"
+python -X utf8 .\scripts\novel_project.py upgrade "<project-root>" --workspace "<workspace-root>" --work-id "<work-id>"
 python -X utf8 .\scripts\novel_continuity.py prepare-baseline "<project-root>" --output "<work-root>\reviews\continuity\baseline-packet.json"
 ```
 
@@ -96,7 +96,7 @@ python -X utf8 .\scripts\novel_continuity.py prepare-baseline "<project-root>" -
 只有报告为 `pass` 才在取得项目写入租约、通过 `write-check` 后封存：
 
 ```powershell
-python -X utf8 .\scripts\novel_continuity.py record-baseline "<project-root>" --packet "<packet>" --report "<completed-report>" --authorization-reference "作者确认记录本次连续性基线"
+python -X utf8 .\scripts\novel_continuity.py record-baseline "<project-root>" --packet "<packet>" --report "<completed-report>" --authorization-reference "作者确认记录本次连续性基线" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 未通过报告可以保存，但不建立可用 `head`，也不允许继续写、导出或上传。
@@ -106,8 +106,10 @@ python -X utf8 .\scripts\novel_continuity.py record-baseline "<project-root>" --
 正式写作前生成本章上下文：
 
 ```powershell
-python -X utf8 .\scripts\novel_continuity.py prepare-context "<project-root>" --chapter 56 --output "<project-root>\staging\chapters\0056-title\continuity-context.json"
+python -X utf8 .\scripts\novel_continuity.py prepare-context "<project-root>" --chapter 56 --output "<work-root>\drafts\continuity-context.json"
 ```
+
+`prepare-context` 只读取项目，输出必须位于项目外的工作目录。Agent 回读并补全上下文后，取得项目租约并通过 `write-check`，再把它复制到 `staging/chapters/0056-title/continuity-context.json`；项目 staging 没有写前豁免。
 
 Agent 必须真实读取并填入 `required_reading`：全书摘要、作者决策、章节索引、故事圣经、总纲、当前状态、时间线、线索账本、稳定事实库、有意例外、依赖图、失效记录和最近 3 章正文/记忆卡。空 JSONL 账本用文件哈希证明读取，不伪造引文。任何 `touched_fact_ids` 的原始证据也必须回读。
 
@@ -118,27 +120,25 @@ Agent 必须真实读取并填入 `required_reading`：全书摘要、作者决�
 - 允许改变与禁止改变的状态，以及不能静默违反的 invariants。
 - 风险分类、回调跨度和作者确认引用。
 
-以下任一项强制独立审稿：复杂时间线、跨 10 章以上回调、秘密知情边界、核心世界规则、重要关系、关键物品、数值账、疑似冲突、卷首卷末、重大揭示、人物命运和锁定大纲。卷首卷末、重大反转、人物命运、核心真相、核心规则和锁定大纲还必须先取得作者确认。普通章可以由当前 Agent 审核。
+以下任一项强制独立审稿：复杂时间线、`callback_span >= 10` 的回调、秘密知情边界、核心世界规则、重要关系、关键物品、数值账、疑似冲突、卷首卷末、重大揭示、人物命运和锁定大纲。卷首卷末、重大反转、人物命运、核心真相、核心规则和锁定大纲还必须先取得作者确认。普通章可以由当前 Agent 审核。
 
 ## 写后状态增量与审计
 
-暂存包至少包含：
+完整暂存包清单只在 [commit-protocol.md](commit-protocol.md) 维护。连续性子集固定为：
 
 ```text
-staging/chapters/0056-title/
-|-- commit.json
-|-- chapter.md
-|-- memory.md
-|-- continuity-state.json
-|-- continuity-context.json
-|-- state-delta.json
-`-- continuity-audit.json
+continuity-context.json
+continuity-state.json
+state-delta.json
+continuity-audit.json
 ```
+
+各 JSON 字段见 [schemas-and-cli.md](schemas-and-cli.md)。
 
 先生成模板：
 
 ```powershell
-python -X utf8 .\scripts\novel_continuity.py prepare-audit "<project-root>" "staging\chapters\0056-title"
+python -X utf8 .\scripts\novel_continuity.py prepare-audit "<project-root>" "staging\chapters\0056-title" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 填写 `state-delta.json` 后把 `status` 设为 `complete`。每项状态变化必须写原因和正文逐字证据；变化列表必须能从旧 `state.json` 精确重放为暂存的新状态。事实变更和例外变更同样需要来源证据，不能把大纲预期写成已经发生。
@@ -146,7 +146,7 @@ python -X utf8 .\scripts\novel_continuity.py prepare-audit "<project-root>" "sta
 状态增量定稿后必须重新绑定审计模板：
 
 ```powershell
-python -X utf8 .\scripts\novel_continuity.py bind-audit "<project-root>" "staging\chapters\0056-title"
+python -X utf8 .\scripts\novel_continuity.py bind-audit "<project-root>" "staging\chapters\0056-title" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 然后才填写 `continuity-audit.json`。九维检查都要有理由和证据；确定矛盾不能给 `pass`。普通小错误可以在隔离暂存区自动修正，然后重新生成状态增量、重新绑定并复审。涉及核心设定、人物命运、重要关系、世界规则或重大伏笔时立即停止，向作者询问，不能替作者决定。
@@ -188,7 +188,7 @@ python -X utf8 .\scripts\novel_continuity.py impact "<project-root>" --changed-p
 局部事实按事实 ID 和章节依赖闭包传播；核心世界规则、人物命运、核心关系、核心真相或无法确定边界的变化，从最早受影响章开始重审全部后续章节。作者批准本地修订后，取得租约、建立恢复快照并登记失效：
 
 ```powershell
-python -X utf8 .\scripts\novel_continuity.py invalidate "<project-root>" --changed-path "manuscript/chapters/0012-title.md" --change-type timeline --reason "修正第12章日期" --authorization-reference "作者本轮确认本地修订"
+python -X utf8 .\scripts\novel_continuity.py invalidate "<project-root>" --changed-path "manuscript/chapters/0012-title.md" --change-type timeline --reason "修正第12章日期" --authorization-reference "作者本轮确认本地修订" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 同步修改正文、索引、记忆卡、状态、时间线、事实库、例外库、线索和大纲，再做覆盖受影响范围的新全局基线。开放失效项由新基线解决前，不能续写、导出或上传。

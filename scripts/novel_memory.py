@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 import tempfile
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +26,11 @@ import novel_cli
 
 SCHEMA_VERSION = 1
 DB_RELATIVE = Path(".novel-cache/novel-memory.sqlite3")
+CACHE_LOCK_NAME = ".novel-memory.lock"
+CACHE_LOCK_STALE_SECONDS = 3600.0
+_CACHE_LOCKS: dict[Path, threading.RLock] = {}
+_CACHE_LOCKS_GUARD = threading.Lock()
+_REAL_OS_REPLACE = os.replace
 CHAPTER_NAME = re.compile(r"^(?P<number>\d{4})(?:-[^/\\]+)?\.md$", re.IGNORECASE)
 HEADING = re.compile(r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$")
 ENTITY_TAG = re.compile(
@@ -53,17 +63,105 @@ class SourceDocument:
     sha256: str
     size_bytes: int
     mtime_ns: int
+    content: bytes
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _link_like(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        checker = getattr(path, "is_junction", None)
+        if checker and checker():
+            return True
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _path_chain_has_link(path: Path) -> bool:
+    current = Path(path).expanduser()
+    if not current.is_absolute():
+        current = Path.cwd() / current
+    while True:
+        if _link_like(current):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _assert_no_links(root: Path, *, skip_cache: bool = False) -> None:
+    if _link_like(root):
+        raise MemoryIndexError(f"Project path cannot be a link or reparse point: {root}")
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError as exc:
+            raise MemoryIndexError(f"Unable to inspect project path: {exc}") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            if skip_cache and directory == root and entry.name == DB_RELATIVE.parts[0]:
+                continue
+            if _link_like(path):
+                raise MemoryIndexError(f"Project path contains a link or reparse point: {path}")
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise MemoryIndexError(f"Unable to stat project path: {path}: {exc}") from exc
+            if stat.S_ISDIR(entry_stat.st_mode):
+                pending.append(path)
+
+
+def _assert_cache_layout(root: Path) -> tuple[Path, Path]:
+    cache_dir = root / DB_RELATIVE.parent
+    database = root / DB_RELATIVE
+    if _link_like(cache_dir) or (cache_dir.exists() and not cache_dir.is_dir()):
+        raise MemoryIndexError(f"Cache directory is not a regular directory: {cache_dir}")
+    if _link_like(database):
+        raise MemoryIndexError(f"Cache database cannot be a link or reparse point: {database}")
+    return cache_dir, database
+
+
 def resolve_project(raw_root: str) -> Path:
-    root = Path(raw_root).expanduser().resolve()
+    raw = Path(raw_root).expanduser()
+    if _path_chain_has_link(raw):
+        raise MemoryIndexError(
+            f"Project path cannot traverse a link or reparse point: {raw}"
+        )
+    root = raw.resolve()
     if not (root / "novel.json").is_file():
         raise MemoryIndexError(f"Not an initialized novel project: {root}")
+    _assert_no_links(root, skip_cache=True)
+    _assert_cache_layout(root)
     return root
+
+
+def _read_document(path: Path) -> tuple[bytes, os.stat_result]:
+    try:
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            content = handle.read()
+            after = os.fstat(handle.fileno())
+    except OSError as exc:
+        raise MemoryIndexError(f"Unable to read canonical file {path}: {exc}") from exc
+    if (
+        before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or getattr(before, "st_ino", None) != getattr(after, "st_ino", None)
+    ):
+        raise MemoryIndexError(f"Canonical file changed while being indexed: {path}")
+    return content, after
 
 
 def sha256_file(path: Path) -> str:
@@ -108,6 +206,7 @@ def document_kind(root: Path, path: Path) -> tuple[str, int | None]:
 
 
 def canonical_paths(root: Path) -> list[Path]:
+    _assert_no_links(root, skip_cache=True)
     candidates: set[Path] = set()
     fixed = (
         "planning/framework-session.md",
@@ -152,16 +251,17 @@ def scan_documents(root: Path) -> list[SourceDocument]:
     documents: list[SourceDocument] = []
     for path in canonical_paths(root):
         kind, chapter_number = document_kind(root, path)
-        stat = path.stat()
+        content, file_stat = _read_document(path)
         documents.append(
             SourceDocument(
                 path=path,
                 relative=path.relative_to(root).as_posix(),
                 kind=kind,
                 chapter_number=chapter_number,
-                sha256=sha256_file(path),
-                size_bytes=stat.st_size,
-                mtime_ns=stat.st_mtime_ns,
+                sha256=hashlib.sha256(content).hexdigest(),
+                size_bytes=len(content),
+                mtime_ns=file_stat.st_mtime_ns,
+                content=content,
             )
         )
     return documents
@@ -178,6 +278,8 @@ def source_state_hash(documents: Iterable[SourceDocument]) -> str:
 
 
 def connect_database(path: Path) -> sqlite3.Connection:
+    if _link_like(path):
+        raise MemoryIndexError(f"Cache database cannot be a link or reparse point: {path}")
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -382,7 +484,10 @@ def structured_entities(
 
 
 def index_document(connection: sqlite3.Connection, document: SourceDocument) -> None:
-    text = document.path.read_text(encoding="utf-8")
+    try:
+        text = document.content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MemoryIndexError(f"Canonical file is not valid UTF-8: {document.path}") from exc
     indexed_at = utc_now()
     connection.execute(
         "INSERT INTO documents(path, kind, chapter_number, sha256, size_bytes, "
@@ -433,9 +538,99 @@ def finalize_metadata(
     set_metadata(connection, "build_complete", "true")
 
 
-def rebuild_index(root: Path) -> dict[str, Any]:
+def _cache_lock_for(root: Path) -> threading.RLock:
+    with _CACHE_LOCKS_GUARD:
+        return _CACHE_LOCKS.setdefault(root, threading.RLock())
+
+
+def _parse_cache_lock(raw: str) -> tuple[int, float, str]:
+    fields: dict[str, str] = {}
+    for line in raw.splitlines():
+        if "=" not in line:
+            raise MemoryIndexError("Malformed memory-cache lock")
+        key, value = line.split("=", 1)
+        if key in fields:
+            raise MemoryIndexError("Malformed memory-cache lock")
+        fields[key] = value
+    try:
+        pid = int(fields["pid"])
+        created = float(fields["created_at_epoch"])
+    except (KeyError, ValueError) as exc:
+        raise MemoryIndexError("Malformed memory-cache lock") from exc
+    token = fields.get("token", "")
+    if pid <= 0 or created <= 0 or not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise MemoryIndexError("Malformed memory-cache lock")
+    return pid, created, token
+
+
+def _cache_pid_alive(pid: int) -> bool | None:
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+@contextlib.contextmanager
+def cache_lock(root: Path):
+    cache_dir, _ = _assert_cache_layout(root)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local = _cache_lock_for(root)
+    local.acquire()
+    path = cache_dir / CACHE_LOCK_NAME
+    token = uuid.uuid4().hex
+    payload = f"pid={os.getpid()}\ncreated_at_epoch={time.time():.6f}\ntoken={token}\n"
+    descriptor = None
+    try:
+        deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                descriptor = path.open("x", encoding="ascii", newline="\n")
+                descriptor.write(payload)
+                descriptor.flush()
+                os.fsync(descriptor.fileno())
+                break
+            except FileExistsError:
+                try:
+                    raw = path.read_text(encoding="ascii")
+                    pid, created, _ = _parse_cache_lock(raw)
+                except FileNotFoundError:
+                    continue
+                except (OSError, UnicodeError, MemoryIndexError) as exc:
+                    raise MemoryIndexError(f"Cannot inspect memory-cache lock: {exc}") from exc
+                if (
+                    time.time() - created >= CACHE_LOCK_STALE_SECONDS
+                    and _cache_pid_alive(pid) is False
+                    and path.read_text(encoding="ascii") == raw
+                ):
+                    path.unlink(missing_ok=True)
+                    continue
+                if time.monotonic() >= deadline:
+                    raise MemoryIndexError(f"Timed out waiting for memory-cache lock: {path}")
+                time.sleep(0.05)
+        yield
+    finally:
+        if descriptor is not None:
+            descriptor.close()
+            try:
+                raw = path.read_text(encoding="ascii")
+                pid, _, current_token = _parse_cache_lock(raw)
+                if pid == os.getpid() and current_token == token:
+                    path.unlink(missing_ok=True)
+            except (FileNotFoundError, OSError, UnicodeError, MemoryIndexError):
+                pass
+        local.release()
+
+
+def _rebuild_index_locked(root: Path) -> dict[str, Any]:
     documents = scan_documents(root)
-    database = root / DB_RELATIVE
+    _, database = _assert_cache_layout(root)
     database.parent.mkdir(parents=True, exist_ok=True)
     temp_handle = tempfile.NamedTemporaryFile(
         delete=False, dir=database.parent, prefix="novel-memory-", suffix=".sqlite3.tmp"
@@ -457,6 +652,9 @@ def rebuild_index(root: Path) -> dict[str, Any]:
             }
         finally:
             connection.close()
+        latest_documents = scan_documents(root)
+        if source_state_hash(latest_documents) != source_state_hash(documents):
+            raise MemoryIndexError("Canonical files changed while rebuilding the memory index")
         os.replace(temp_path, database)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -469,8 +667,15 @@ def rebuild_index(root: Path) -> dict[str, Any]:
     }
 
 
+def rebuild_index(root: Path) -> dict[str, Any]:
+    root = resolve_project(root)
+    with cache_lock(root):
+        return _rebuild_index_locked(root)
+
+
 def database_status(root: Path) -> dict[str, Any]:
-    database = root / DB_RELATIVE
+    root = resolve_project(root)
+    _, database = _assert_cache_layout(root)
     documents = scan_documents(root)
     current = {document.relative: document for document in documents}
     if not database.is_file():
@@ -533,10 +738,10 @@ def database_status(root: Path) -> dict[str, Any]:
     }
 
 
-def update_index(root: Path) -> dict[str, Any]:
-    database = root / DB_RELATIVE
+def _update_index_locked(root: Path) -> dict[str, Any]:
+    _, database = _assert_cache_layout(root)
     if not database.is_file():
-        result = rebuild_index(root)
+        result = _rebuild_index_locked(root)
         result["status"] = "created"
         return result
     documents = scan_documents(root)
@@ -565,6 +770,9 @@ def update_index(root: Path) -> dict[str, Any]:
             for relative in changed:
                 connection.execute("DELETE FROM documents WHERE path = ?", (relative,))
                 index_document(connection, current[relative])
+            latest_documents = scan_documents(root)
+            if source_state_hash(latest_documents) != source_state_hash(documents):
+                raise MemoryIndexError("Canonical files changed while updating the memory index")
             finalize_metadata(connection, documents)
         counts = {
             "documents": connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
@@ -581,6 +789,12 @@ def update_index(root: Path) -> dict[str, Any]:
         **counts,
         "source_state_hash": source_state_hash(documents),
     }
+
+
+def update_index(root: Path) -> dict[str, Any]:
+    root = resolve_project(root)
+    with cache_lock(root):
+        return _update_index_locked(root)
 
 
 def query_matches(text: str, terms: list[str], mode: str) -> tuple[bool, int, int]:
@@ -732,9 +946,11 @@ def main() -> int:
             return update_index(root)
         if args.command == "status":
             return database_status(root)
-        if args.limit < 1 or args.limit > 200:
-            raise MemoryIndexError("--limit must be from 1 to 200")
-        return search_index(args)
+        if args.command == "search":
+            if args.limit < 1 or args.limit > 200:
+                raise MemoryIndexError("--limit must be from 1 to 200")
+            return search_index(args)
+        raise MemoryIndexError(f"Unsupported command: {args.command}")
 
     return novel_cli.run_cli(
         build_parser,

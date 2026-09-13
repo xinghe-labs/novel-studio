@@ -22,8 +22,8 @@ v2.0 完整实现 `fanqie`；起点、晋江等平台仍可把合法公开资料
 
 ```powershell
 python -X utf8 .\scripts\novel_research.py adapters
-python -X utf8 .\scripts\novel_research.py collect "<project-root>" --platform fanqie --channel all --sort hot --page-count 18
-python -X utf8 .\scripts\novel_research.py collect "<project-root>" --platform fanqie --channel male --sort hot --input "<saved-response.json>" --observed-at "2026-08-29T12:00:00+00:00"
+python -X utf8 .\scripts\novel_research.py collect "<project-root>" --platform fanqie --channel all --sort hot --page-count 18 --workspace "<workspace-root>" --work-id "<work-id>"
+python -X utf8 .\scripts\novel_research.py collect "<project-root>" --platform fanqie --channel male --sort hot --input "<saved-response.json>" --observed-at "2026-08-29T12:00:00+00:00" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 番茄适配器只使用官方公开书库接口，支持 `all`、`male`、`female` 和已核验的 `hot` 排序。网络请求失败时只报告失败，不自动更换代理、伪装登录、绕过验证码或重试轰炸。
@@ -47,6 +47,8 @@ python -X utf8 .\scripts\novel_research.py collect "<project-root>" --platform f
 两者都登记到 `research/source-manifest.jsonl`。Skill 自己采集并保存在项目 `sources/` 的文件可以在后续会话直接重读；重读前验证文件哈希，不能因为文件名相同就忽略内容变化。
 
 `research/platform.json` 记录主平台、已启用适配器、最近观察时间和发布配置。`author_draft` 与平台发布配置不同：作者允许出现的素材不等于平台当前允许公开发布的内容。长篇沿用 `fanqie_public`；只有显式 `short_story` 项目新增 `fanqie_short_story_public`，旧长篇配置不迁移也不写回。
+
+仓库内部名称映射如下：`fanqie_public` 是长篇项目配置，`fanqie_short_story_public` 是短故事项目配置；`fanqie-serial` 和 `fanqie-short-story` 是导出/上传质量 profile，不是项目类型字段。它们只描述本仓库的配置关系，不推断平台最新规则。
 
 ## 时效性
 

@@ -49,13 +49,13 @@
 项目内已有公开资料：
 
 ```powershell
-python -X utf8 .\scripts\novel_research.py register "<project-root>" "<project-root>\sources\snapshot.html" --origin project_existing --source-kind public_page --rights-status public_web --external-use local_only --source-url "https://example.com/page" --observed-at "2026-08-29T12:00:00+00:00"
+python -X utf8 .\scripts\novel_research.py register "<project-root>" "<project-root>\sources\snapshot.html" --origin project_existing --source-kind public_page --rights-status public_web --external-use local_only --source-url "https://example.com/page" --observed-at "2026-08-29T12:00:00+00:00" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 用户明确授权的本地文本：
 
 ```powershell
-python -X utf8 .\scripts\novel_research.py register "<project-root>" "<authorized-dir>\reference.txt" --origin user_local --source-kind authorized_full_text --rights-status user_authorized --authorization-scope project_research_and_originality_audit --authorization-reference "作者于 2026-08-29 明确授权本项目本机分析" --external-use local_only --originality-compare
+python -X utf8 .\scripts\novel_research.py register "<project-root>" "<authorized-reference-path>" --origin user_local --source-kind authorized_full_text --rights-status user_authorized --authorization-scope project_research_and_originality_audit --authorization-reference "作者于 2026-08-29 明确授权本项目本机分析" --external-use local_only --originality-compare --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 外部本地文件会以哈希前缀复制到项目 `sources/local/`，不会覆盖同名不同内容的文件。没有项目级授权、rights 为 unknown 或试图把 `local_only` 声称为外部处理许可时，脚本必须拒绝。

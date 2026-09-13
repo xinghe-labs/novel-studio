@@ -41,6 +41,11 @@ class LongNovelCompatibilityTests(unittest.TestCase):
             project_id="novel-legacy",
         )
         self.root = Path(created["project_root"])
+        work = novel_workspace.create_work(
+            self.workspace, project_id="novel-legacy", purpose="兼容性测试"
+        )
+        self.work_id = work["work_id"]
+        novel_workspace.acquire_lock(self.workspace, self.work_id)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -82,7 +87,11 @@ class LongNovelCompatibilityTests(unittest.TestCase):
             self.root / "continuity/state.json",
             json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         )
-        seal_full_baseline(self.root)
+        seal_full_baseline(
+            self.root,
+            workspace=self.workspace,
+            work_id=self.work_id,
+        )
 
     def test_default_long_project_keeps_legacy_metadata_and_templates(self) -> None:
         manifest_path = self.root / "novel.json"
@@ -154,6 +163,8 @@ class LongNovelCompatibilityTests(unittest.TestCase):
                 report_output=None,
                 through=None,
                 force=False,
+                workspace=str(self.workspace),
+                work_id=self.work_id,
             )
         )
         packet = read_json(packet_path)
@@ -185,6 +196,8 @@ class LongNovelCompatibilityTests(unittest.TestCase):
                 packet=str(packet_path),
                 report=str(report_path),
                 authorization_reference="测试旧长篇周期审核结构保持兼容",
+                workspace=str(self.workspace),
+                work_id=self.work_id,
             )
         )
         self.assertNotIn("review_mode", recorded)

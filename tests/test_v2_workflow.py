@@ -20,7 +20,10 @@ import novel_originality  # noqa: E402
 import novel_project  # noqa: E402
 import novel_research  # noqa: E402
 import novel_workspace  # noqa: E402
-from continuity_test_utils import complete_staged_continuity  # noqa: E402
+from continuity_test_utils import (  # noqa: E402
+    complete_staged_continuity,
+    refresh_fixture_base,
+)
 
 
 def write_text(path: Path, text: str) -> None:
@@ -169,6 +172,12 @@ class NovelV2Tests(unittest.TestCase):
             root / "research/originality-plan.json",
             json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
         )
+        refresh_fixture_base(
+            root,
+            self.workspace,
+            self.work_contexts[root.resolve()],
+            reference="测试夹具已回读并确认原创性计划",
+        )
 
     def confirm_framework(self, root: Path) -> None:
         replacements = {
@@ -180,6 +189,12 @@ class NovelV2Tests(unittest.TestCase):
         }
         for relative, content in replacements.items():
             write_text(root / relative, content)
+        refresh_fixture_base(
+            root,
+            self.workspace,
+            self.work_contexts[root.resolve()],
+            reference="测试夹具已回读并确认框架字段",
+        )
         novel_project.framework_state(
             SimpleNamespace(
                 root=str(root),
@@ -188,6 +203,8 @@ class NovelV2Tests(unittest.TestCase):
                 requirements_confidence=96,
                 story_confidence=96,
                 authorization_reference="测试中模拟作者明确确认框架",
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
 
@@ -232,10 +249,15 @@ class NovelV2Tests(unittest.TestCase):
                 near_threshold=0.72,
                 max_findings=30,
                 no_report=False,
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
         self.assertEqual(code, 0)
         self.assertEqual(report["decision"], "pass")
+        self.assertEqual(
+            read_json(root / report["report_path"])["report_path"], report["report_path"]
+        )
         return report["report_path"]
 
     def write_commit_manifest(self, package: Path, report_path: str) -> None:
@@ -276,6 +298,8 @@ class NovelV2Tests(unittest.TestCase):
                 input=str(fixture),
                 observed_at="2026-08-29T12:00:00+00:00",
                 timeout=5.0,
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
         self.assertEqual(result["books"], 2)
@@ -316,6 +340,8 @@ class NovelV2Tests(unittest.TestCase):
             **common,
             authorization_reference="作者在本项目中明确授权本机研究",
             copy_external=True,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
         )
         self.assertTrue(added)
         self.assertEqual(record["external_use"], "local_only")
@@ -391,6 +417,14 @@ class NovelV2Tests(unittest.TestCase):
         self.assertIn("manuscript/chapters/0001-雾港来信.md", updated["changed"])
         self.assertEqual(novel_memory.database_status(root)["status"], "fresh")
 
+    def test_memory_index_rejects_link_like_project_parent_chain(self) -> None:
+        root = self.init_project()
+        with mock.patch.object(
+            novel_memory, "_path_chain_has_link", return_value=True
+        ):
+            with self.assertRaisesRegex(novel_memory.MemoryIndexError, "cannot traverse"):
+                novel_memory.database_status(root)
+
     def test_wording_and_structural_originality_layers_block_independently(self) -> None:
         root = self.init_project()
         self.complete_originality_plan(root)
@@ -411,6 +445,8 @@ class NovelV2Tests(unittest.TestCase):
             platform="",
             originality_compare=True,
             provenance_note="unit test",
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
         )
         candidate = root / "staging/chapters/0001/chapter.md"
         write_text(candidate, "# 第一章\n\n" + copied_sentence + "\n")
@@ -423,6 +459,8 @@ class NovelV2Tests(unittest.TestCase):
                 near_threshold=0.72,
                 max_findings=30,
                 no_report=True,
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
         self.assertEqual(code, 1)
@@ -481,7 +519,12 @@ class NovelV2Tests(unittest.TestCase):
         package = self.prepare_staged_chapter(root)
         report_path = self.create_passing_audit(root, package)
         self.write_commit_manifest(package, report_path)
-        complete_staged_continuity(root, package)
+        complete_staged_continuity(
+            root,
+            package,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
         result = self.commit(root, package)
         self.assertEqual(result["status"], "committed")
         self.assertEqual(result["humanization_outcome"], "unchanged")
@@ -496,7 +539,12 @@ class NovelV2Tests(unittest.TestCase):
         rollback_package = self.prepare_staged_chapter(rollback_root)
         rollback_report = self.create_passing_audit(rollback_root, rollback_package)
         self.write_commit_manifest(rollback_package, rollback_report)
-        complete_staged_continuity(rollback_root, rollback_package)
+        complete_staged_continuity(
+            rollback_root,
+            rollback_package,
+            workspace=self.workspace,
+            work_id=self.work_contexts[rollback_root.resolve()],
+        )
         original_index = (rollback_root / "manuscript/index.md").read_bytes()
         real_replace = os.replace
         calls = {"count": 0}
@@ -521,13 +569,112 @@ class NovelV2Tests(unittest.TestCase):
             (rollback_root / "manuscript/index.md").read_bytes(), original_index
         )
 
+    def test_chapter_commit_rejects_target_created_after_preflight(self) -> None:
+        root = self.init_project("chapter-target-race")
+        self.confirm_framework(root)
+        package = self.prepare_staged_chapter(root)
+        report_path = self.create_passing_audit(root, package)
+        self.write_commit_manifest(package, report_path)
+        complete_staged_continuity(
+            root,
+            package,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
+        chapter_target = root / "manuscript/chapters/0001-坏表.md"
+        memory_target = root / "memory/chapters/0001.md"
+        index_before = (root / "manuscript/index.md").read_bytes()
+        novel_before = read_json(root / "novel.json")
+        sentinel = b"external writer owns this target\n"
+        real_transactional_write = novel_project.transactional_write
+
+        def create_target_then_commit(*args, **kwargs):
+            chapter_target.parent.mkdir(parents=True, exist_ok=True)
+            chapter_target.write_bytes(sentinel)
+            return real_transactional_write(*args, **kwargs)
+
+        with mock.patch.object(
+            novel_project,
+            "transactional_write",
+            side_effect=create_target_then_commit,
+        ):
+            with self.assertRaisesRegex(
+                novel_project.ProjectError, "compare-and-swap"
+            ):
+                novel_project.commit_chapter(self.commit_args(root, package))
+
+        self.assertEqual(chapter_target.read_bytes(), sentinel)
+        self.assertFalse(memory_target.exists())
+        self.assertEqual((root / "manuscript/index.md").read_bytes(), index_before)
+        self.assertEqual(read_json(root / "novel.json"), novel_before)
+
+    def test_staged_originality_report_does_not_stale_base_and_is_archived(self) -> None:
+        root = self.init_project("staged-originality")
+        self.confirm_framework(root)
+        package = self.prepare_staged_chapter(root)
+        self.complete_originality_plan(root)
+        work_id = self.work_contexts[root.resolve()]
+        refresh_fixture_base(
+            root,
+            self.workspace,
+            work_id,
+            reference="测试在原创性审计前完成项目复核",
+        )
+
+        staged_report = package / "originality-audit.json"
+        report, code = novel_originality.audit_project(
+            SimpleNamespace(
+                root=str(root),
+                candidate=[str(package / "chapter.md")],
+                reference=None,
+                exact_minimum=18,
+                near_threshold=0.72,
+                max_findings=30,
+                output=str(staged_report),
+                no_report=False,
+                workspace=str(self.workspace),
+                work_id=work_id,
+            )
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            novel_workspace.write_check(self.workspace, work_id)["status"], "pass"
+        )
+        self.write_commit_manifest(package, report["report_path"])
+        complete_staged_continuity(
+            root,
+            package,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
+
+        result = novel_project.commit_chapter(
+            SimpleNamespace(
+                root=str(root),
+                package=str(package),
+                workspace=str(self.workspace),
+                work_id=work_id,
+            )
+        )
+        archived_report = root / result["originality_report"]
+        self.assertTrue(archived_report.is_file())
+        self.assertTrue(
+            archived_report.resolve().is_relative_to((root / "reviews").resolve())
+        )
+        self.assertEqual(archived_report.read_bytes(), staged_report.read_bytes())
+
     def test_chapter_commit_requires_humanization_review_manifest_entry(self) -> None:
         root = self.init_project("missing-humanization")
         self.confirm_framework(root)
         package = self.prepare_staged_chapter(root)
         report_path = self.create_passing_audit(root, package)
         self.write_commit_manifest(package, report_path)
-        complete_staged_continuity(root, package)
+        complete_staged_continuity(
+            root,
+            package,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
         commit = read_json(package / "commit.json")
         del commit["humanization_review_file"]
         write_text(
@@ -547,7 +694,12 @@ class NovelV2Tests(unittest.TestCase):
         package = self.prepare_staged_chapter(root)
         report_path = self.create_passing_audit(root, package)
         self.write_commit_manifest(package, report_path)
-        complete_staged_continuity(root, package)
+        complete_staged_continuity(
+            root,
+            package,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
         review = read_json(package / "humanization-review.json")
         review["result"]["sha256"] = "0" * 64
         write_text(
@@ -573,6 +725,12 @@ class NovelV2Tests(unittest.TestCase):
             path.unlink()
         (root / "staging/chapters").rmdir()
         (root / "staging").rmdir()
+        refresh_fixture_base(
+            root,
+            self.workspace,
+            self.work_contexts[root.resolve()],
+            reference="测试夹具已确认待升级文件缺失状态",
+        )
         protected = (
             root / "novel.json",
             root / "planning/framework-session.md",
@@ -580,8 +738,16 @@ class NovelV2Tests(unittest.TestCase):
             root / "research/comparable-works.md",
         )
         before = {path: path.read_bytes() for path in protected}
-        first = novel_project.upgrade_project(SimpleNamespace(root=str(root)))
-        second = novel_project.upgrade_project(SimpleNamespace(root=str(root)))
+        identity = {
+            "workspace": str(self.workspace),
+            "work_id": self.work_contexts[root.resolve()],
+        }
+        first = novel_project.upgrade_project(
+            SimpleNamespace(root=str(root), **identity)
+        )
+        second = novel_project.upgrade_project(
+            SimpleNamespace(root=str(root), **identity)
+        )
         self.assertEqual(first["status"], "upgraded")
         self.assertEqual(second["status"], "already_current")
         self.assertEqual({path: path.read_bytes() for path in protected}, before)
@@ -597,6 +763,8 @@ class NovelV2Tests(unittest.TestCase):
                     candidate_approval=None,
                     deep_analysis="in_progress",
                     authorization_reference="测试尝试越过审批",
+                    workspace=str(self.workspace),
+                    work_id=self.work_contexts[root.resolve()],
                 )
             )
         approved = novel_project.research_state(
@@ -605,6 +773,8 @@ class NovelV2Tests(unittest.TestCase):
                 candidate_approval="approved",
                 deep_analysis=None,
                 authorization_reference="作者明确批准候选",
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
         self.assertEqual(approved["after"]["candidate_approval"], "approved")
@@ -614,6 +784,8 @@ class NovelV2Tests(unittest.TestCase):
                 candidate_approval=None,
                 deep_analysis="in_progress",
                 authorization_reference="已批准候选，开始拆解",
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
         self.assertEqual(started["after"]["deep_analysis"], "in_progress")
@@ -626,6 +798,8 @@ class NovelV2Tests(unittest.TestCase):
                     requirements_confidence=96,
                     story_confidence=96,
                     authorization_reference="占位文件尚未同步",
+                    workspace=str(self.workspace),
+                    work_id=self.work_contexts[root.resolve()],
                 )
             )
 

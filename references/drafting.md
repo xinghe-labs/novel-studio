@@ -20,7 +20,7 @@ POV：谁在感知，叙述距离与时态
 
 用户已经提供完整合同就直接写，不重复提问。
 
-合同完整不等于可以跳过证据绑定。仍要填写上下文中的 `required_reading`、`touched_entities`、`touched_fact_ids`、invariants、风险触发器和逐字引文。复杂时间线、跨十章回调、秘密、核心规则、重要关系、关键物品、数值账或疑似冲突必须标为独立审稿；关键章还要记录作者确认引用。
+合同完整不等于可以跳过证据绑定。仍要填写上下文中的 `required_reading`、`touched_entities`、`touched_fact_ids`、invariants、风险触发器和逐字引文。复杂时间线、`callback_span >= 10` 的回调、秘密、核心规则、重要关系、关键物品、数值账或疑似冲突必须标为独立审稿；关键章还要记录作者确认引用。
 
 ## 场景推进
 
@@ -65,9 +65,9 @@ POV：谁在感知，叙述距离与时态
 3. 先按 [continuity.md](continuity.md) 对照当前正典做连续性初检，再按 [originality-audit.md](originality-audit.md) 做措辞与结构初检；`review`、`incomplete` 或 `block` 都必须先处理，不能用后续润色掩盖。
 4. 前述检查通过后，长篇每个新章和每篇短故事都必须实际调用 `$humanizer-zh` 执行本文件的自然化末轮，保留调用前原稿，生成独立结果稿与审阅记录。Skill 不可用或调用未完成时到此停止，只保留草稿。
 5. 项目级逐章自然化授权允许直接采用不改变语义的结果稿；若建议改变事实、剧情、人物动机、关系、世界规则或 POV，先请求作者确认。结果稿有变化时重新执行第 2-3 步，不能沿用调用前检查结论。
-6. 获得正式提交授权后，在 `staging/chapters/<package>/` 同时放入 `chapter-before-humanizer.md`、最终 `chapter.md` 和 `humanization-review.json`；短故事使用唯一 `0001-complete-story` 包，提交后不得新增 `0002`。在同一包创建 `memory.md`、`continuity-state.json`、`continuity-context.json`、`state-delta.json`、`continuity-audit.json`、`commit.json`，必要时准备完整时间线、线索账本和全书记忆替换稿。
+6. 获得正式提交授权后，按 [commit-protocol.md](commit-protocol.md) 的唯一清单在 `staging/chapters/<package>/` 组装完整输入；字段见 [schemas-and-cli.md](schemas-and-cli.md)。短故事使用唯一 `0001-complete-story` 包，提交后不得新增 `0002`。
 7. 对最终 `chapter.md` 生成精确状态增量，重新绑定并完成九维连续性审计，再运行双层原创性审计。普通小错可在暂存区修复后重审，核心冲突停止并询问作者；正文变化后必须重新绑定自然化记录、连续性审计和原创性报告。
-8. 按 [controlled-automation.md](controlled-automation.md) 使用 `commit-chapter` 验证自然化硬门禁并事务生成索引，写入正文、记忆卡、人物位置、身体与知识状态、时间线、物品和开放线索；连载重大阶段变化或短故事全篇状态同步 `memory/book-summary.md`。
+8. 按 [commit-protocol.md](commit-protocol.md) 使用 `commit-chapter` 验证自然化硬门禁并事务生成索引，写入正文、记忆卡、人物位置、身体与知识状态、时间线、物品和开放线索；连载重大阶段变化或短故事全篇状态同步 `memory/book-summary.md`。
 9. 新设定若与既有正典兼容且正文已经使用，写回相应故事圣经；若会改写核心规则，先请求作者确认并记录到 `memory/decisions.md`。
 10. 提交器最后写入新正典 `head` 并推进 `novel.json`；自然化记录、正文、索引、记忆卡、状态、事实依赖或覆盖最终全文哈希的连续性/原创性报告缺失时不报告写作单位已完成。连载每 5 章执行独立全局连续性审核和独立质量审核；短故事提交后立即执行全篇连续性基线和质量完稿审核。SQLite 缓存只在正典提交成功后更新。
 
@@ -86,4 +86,4 @@ POV：谁在感知，叙述距离与时态
 
 完成上述内置检查后必须实际调用 `$humanizer-zh` 专项复核，并把保留项连同故事风格合同一起提供。该 Skill 不可用或调用未完成时明确报告阻断，不伪装已经调用，也不得正式提交。不要直接接受会把小说改成新闻稿、随笔或统一网文腔的建议。
 
-自然化输出必须是“审阅结论 + 独立结果稿”，不得原地覆盖初稿、暂存包或正式正文。正式暂存包固定保留调用前的 `chapter-before-humanizer.md`、最终 `chapter.md` 与 `humanization-review.json`；即使结论为无需修改，也要保留两个独立 Markdown 文件并记录相同内容哈希和 `outcome: unchanged`。作者设定的项目级逐章自然化要求可作为采用非语义调整的授权；有语义或正典风险时仍展示实质变化和可能损失并单独确认。自然化只服务文字自然度与叙述声音，不承诺规避、欺骗或通过任何 AI 检测器；记录只能验证文件、哈希和执行声明，执行者仍必须真实调用 Skill。记录结构见 [controlled-automation.md](controlled-automation.md)，短故事补充协议见 [short-story-mode.md](short-story-mode.md)。
+自然化输出必须是“审阅结论 + 独立结果稿”，不得原地覆盖初稿、暂存包或正式正文。正式暂存包按 [commit-protocol.md](commit-protocol.md) 保留调用前原稿、最终正文与自然化记录；即使结论为无需修改，也要保留两个独立 Markdown 文件并记录相同内容哈希和 `outcome: unchanged`。作者设定的项目级逐章自然化要求可作为采用非语义调整的授权；有语义或正典风险时仍展示实质变化和可能损失并单独确认。自然化只服务文字自然度与叙述声音，不承诺规避、欺骗或通过任何 AI 检测器；记录只能验证文件、哈希和执行声明，执行者仍必须真实调用 Skill。记录结构见 [schemas-and-cli.md](schemas-and-cli.md)，行为边界见 [controlled-automation.md](controlled-automation.md)，短故事补充协议见 [short-story-mode.md](short-story-mode.md)。

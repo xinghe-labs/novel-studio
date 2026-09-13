@@ -139,47 +139,22 @@ memory/
 
 租约、原子写入和收尾顺序遵循 [commit-protocol.md](commit-protocol.md)；本节只描述短故事的唯一 `0001` 单元和完稿审核差异。
 
-短故事正文仍先进入工作目录。完成强制自然化、确定最终版本并批准正式提交后，才使用一个暂存包：
+短故事正文仍先进入工作目录。完成强制自然化、确定最终版本并批准正式提交后，按 [commit-protocol.md](commit-protocol.md) 组装并提交唯一 `0001` 暂存包；完整文件清单、命令顺序和收尾验证不在本文件重复维护。短故事差异只有：`chapter_number` 必须为 `1`，`chapter.md` 是完整故事，`memory.md` 是全篇记忆卡，索引最终只有一行。字段形状见 [schemas-and-cli.md](schemas-and-cli.md)。
 
-```text
-staging/chapters/0001-complete-story/
-|-- commit.json
-|-- chapter-before-humanizer.md
-|-- chapter.md
-|-- humanization-review.json
-|-- memory.md
-|-- continuity-state.json
-|-- continuity-context.json
-|-- state-delta.json
-|-- continuity-audit.json
-`-- 可选的时间线、线索和全篇记忆替换稿
-```
-
-先完成写前上下文与初稿检查，实际调用 `$humanizer-zh` 并建立 [controlled-automation.md](controlled-automation.md) 规定的哈希绑定自然化记录，再对最终全文完成状态增量、九维连续性审计和原创性审计，最后事务提交：
-
-```powershell
-python -X utf8 .\scripts\novel_continuity.py prepare-context "<project-root>" --chapter 1 --output "<project-root>\staging\chapters\0001-complete-story\continuity-context.json"
-python -X utf8 .\scripts\novel_originality.py audit "<project-root>" --candidate "<project-root>\staging\chapters\0001-complete-story\chapter.md"
-python -X utf8 .\scripts\novel_continuity.py prepare-audit "<project-root>" "staging\chapters\0001-complete-story"
-python -X utf8 .\scripts\novel_continuity.py bind-audit "<project-root>" "staging\chapters\0001-complete-story"
-python -X utf8 .\scripts\novel_continuity.py check-package "<project-root>" "staging\chapters\0001-complete-story"
-python -X utf8 .\scripts\novel_project.py commit-chapter "<project-root>" "staging/chapters/0001-complete-story" --workspace "<workspace-root>" --work-id "<work-id>"
-```
-
-命令之间要按 [continuity.md](continuity.md) 填完并绑定相应文件；这里只列执行顺序，不表示模板可以空着提交。缺少真实的 `$humanizer-zh` 调用或完整 `humanization-review.json` 时只能保留草稿。自然化后的最终全文若发生任何变化，必须重新生成状态增量、重新绑定连续性审计并重跑原创性审计。
+写前上下文必须先留在项目外的工作目录；取得租约并通过 `write-check` 后，才复制到 staging 包。实际调用 `$humanizer-zh` 并建立 [controlled-automation.md](controlled-automation.md) 规定的哈希绑定记录，再对最终全文完成状态增量、九维连续性审计和原创性审计。缺少真实调用或完整记录时只能保留草稿；最终全文变化后必须重新生成状态增量、重新绑定连续性审计并重跑原创性审计。
 
 `short_story` 的全篇连续性间隔和质量审核间隔都为 1。唯一正文提交后，先由独立只读审稿 Agent 完成全篇连续性基线：
 
 ```powershell
 python -X utf8 .\scripts\novel_continuity.py prepare-baseline "<project-root>" --output "<work-root>\reviews\continuity\baseline-packet.json"
-python -X utf8 .\scripts\novel_continuity.py record-baseline "<project-root>" --packet "<packet>" --report "<completed-report>" --authorization-reference "作者确认记录短故事全篇连续性基线"
+python -X utf8 .\scripts\novel_continuity.py record-baseline "<project-root>" --packet "<packet>" --report "<completed-report>" --authorization-reference "作者确认记录短故事全篇连续性基线" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 再完成独立质量完稿审核。`novel_review.py status` 应返回 `review_mode: completion` 与 `review_due: true`：
 
 ```powershell
 python -X utf8 .\scripts\novel_review.py prepare "<project-root>" --output "<work-root>\reviews\completion\review-packet.json"
-python -X utf8 .\scripts\novel_review.py record "<project-root>" --packet "<packet>" --report "<completed-report>" --authorization-reference "作者确认记录短故事全篇审核"
+python -X utf8 .\scripts\novel_review.py record "<project-root>" --packet "<packet>" --report "<completed-report>" --authorization-reference "作者确认记录短故事全篇审核" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 连续性基线必须精读完整正文，覆盖因果、时间、地点、人物状态、知识边界、关系与称谓、物品与资源、世界规则和铺垫回收。质量完稿报告不重复裁决这些事实，重点检查：

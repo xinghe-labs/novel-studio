@@ -24,7 +24,8 @@
 |   |-- market-scan.md
 |   |-- comparable-works.md
 |   |-- originality-map.md
-|   `-- originality-plan.json
+|   |-- originality-plan.json
+|   `-- publication-feedback.jsonl  发布后按需创建的数据回流记录
 |-- sources/
 |-- story-bible/
 |   |-- premise.md
@@ -87,14 +88,14 @@ python -X utf8 .\scripts\novel_workspace.py project-create "<workspace-root>" --
 python -X utf8 .\scripts\novel_workspace.py project-create "<workspace-root>" --title "<故事名>" --genre "<题材>" --work-type short_story --target-words 12000 --short-story-slug "<semantic-slug>"
 python -X utf8 .\scripts\novel_workspace.py work-bind "<workspace-root>" "<work-id>" --project-id "<project-id>"
 python -X utf8 .\scripts\novel_project.py init "<project-root>" --title "<书名>" --genre "<题材>"
-python -X utf8 .\scripts\novel_project.py upgrade "<project-root>"
+python -X utf8 .\scripts\novel_project.py upgrade "<project-root>" --workspace "<workspace-root>" --work-id "<work-id>"
 python -X utf8 .\scripts\novel_project.py validate "<project-root>"
 python -X utf8 .\scripts\novel_project.py status "<project-root>"
 python -X utf8 .\scripts\novel_research.py adapters
 python -X utf8 .\scripts\novel_research.py verify "<project-root>"
 python -X utf8 .\scripts\novel_memory.py rebuild "<project-root>"
 python -X utf8 .\scripts\novel_memory.py status "<project-root>"
-python -X utf8 .\scripts\novel_originality.py audit "<project-root>"
+python -X utf8 .\scripts\novel_originality.py audit "<project-root>" --workspace "<workspace-root>" --work-id "<work-id>"
 python -X utf8 .\scripts\novel_review.py status "<project-root>"
 python -X utf8 .\scripts\novel_export.py export "<project-root>"
 python -X utf8 .\scripts\novel_export.py status "<project-root>"
@@ -153,6 +154,8 @@ python -X utf8 .\scripts\novel_export.py status "<project-root>"
 
 `periodic_review` 只控制质量审核节奏和提交闸门，不承载审稿内容。新项目默认每 5 章审核一次；旧项目没有该字段时也采用同一默认值。连续性每 5 章的独立全局审核由 `continuity/policy.json` 单独控制。两份报告彼此独立，具体协议见 [continuity.md](continuity.md) 和 [periodic-review.md](periodic-review.md)。
 
+框架确认时不要直接覆盖 `novel.json`。使用 [controlled-automation.md](controlled-automation.md) 的 `framework-sync` 和严格的 `project-settings.json`，只合并 POV、时态和目标篇幅，并让脚本维护 `status`、`updated_at`；章节进度、作品类型、审核策略和兼容扩展字段保持现值。
+
 ## 正典优先级
 
 1. 用户本轮明确修改或裁决；跨上下文使用前写入 `memory/decisions.md`。
@@ -168,7 +171,7 @@ python -X utf8 .\scripts\novel_export.py status "<project-root>"
 
 ## 章节命名与合同
 
-连载正文默认使用 `manuscript/chapters/NNNN-title.md`，每章一个文件，四位章号便于排序；禁止把后续章节持续追加到同一个正文文件。短故事只使用 `manuscript/chapters/0001-故事名.md`，正文内部可用二级标题或场景分隔线组织，但不得提交 `0002`。两种模式的中间态都放在 `staging/chapters/<package>/`，每个写作单位必须实际调用 `humanizer-zh` 并通过自然化、原创性与连续性硬门禁后事务提交。每个写作单位在大纲中应有最小合同：
+连载正文默认使用 `manuscript/chapters/NNNN-title.md`，每章一个文件，四位章号便于排序；禁止把后续章节持续追加到同一个正文文件。短故事只使用 `manuscript/chapters/0001-故事名.md`，正文内部可用二级标题或场景分隔线组织，但不得提交 `0002`。两种模式的中间态都放在 `staging/chapters/<package>/`，每个写作单位必须实际调用 `$humanizer-zh` 并通过自然化、原创性与连续性硬门禁后事务提交。每个写作单位在大纲中应有最小合同：
 
 - 章节目的与读者应获得的变化
 - POV、时间、地点和进入状态
@@ -193,7 +196,9 @@ Markdown 正文与 `manuscript/index.md` 是出版导出的唯一输入。连载
 ```markdown
 | 章号 | 标题 | POV | 故事时间 | 地点 | 事实摘要 | 关键变化 | 线索 ID | 正文 |
 |---:|---|---|---|---|---|---|---|---|
-| 0001 | 雾港来信 | 林某D | 第一日凌晨 | 旧邮局 | 林某D收到失踪姐姐的信 | 获得储物柜钥匙 | T-001,T-002 | [正文](chapters/<chapter-file>) |
+| 0001 | 雾港来信 | 林某D | 第一日凌晨 | 旧邮局 | 林某D收到失踪姐姐的信 | 获得储物柜钥匙 | T-001,T-002 | `chapters/0001-雾港来信.md` |
+
+示例链接中的 `0001-雾港来信.md` 仅用于说明相对路径格式；实际项目必须使用真实存在且与文件名/正文标题一致的章节文件。
 ```
 
 摘要只写正文已经发生的事实，不写评价、推测或未来计划。改名、拆章、合章或删除章节时，同时修订索引链接，并在 `memory/decisions.md` 留下追溯记录。
@@ -223,18 +228,18 @@ Markdown 正文与 `manuscript/index.md` 是出版导出的唯一输入。连载
 6. 上一章结尾和所有命中旧章的相关原文片段。
 7. 风格指南中的 POV、叙述距离、禁用习惯和角色声音。
 
-被触及事实的来源旧章必须回读；跨 10 章回调、秘密、核心规则、关键物品、数值账和疑似冲突必须交给独立审稿上下文。账本与原文冲突时回到原文核验，并把账本修复列为独立任务。
+被触及事实的来源旧章必须回读；`callback_span >= 10` 的回调、秘密、核心规则、关键物品、数值账和疑似冲突必须交给独立审稿上下文。账本与原文冲突时回到原文核验，并把账本修复列为独立任务。
 
 ## 提交顺序
 
 完整的提交顺序与命令以 [commit-protocol.md](commit-protocol.md) 为规范真源；本节只保留项目合同层的差异和检查重点。
 
-正式提交使用 [controlled-automation.md](controlled-automation.md) 的章节暂存包与 `commit-chapter` 命令，不建议手工逐个更新正典文件。当前项目还必须满足以下合同要求：
+正式提交使用 [commit-protocol.md](commit-protocol.md) 的暂存清单与 `commit-chapter` 命令，不建议手工逐个更新正典文件。自然化行为边界另见 [controlled-automation.md](controlled-automation.md)。当前项目还必须满足以下合同要求：
 
 进入事务前，当前工作必须持有项目写入租约，并且 `write-check` 证明项目哈希仍等于该工作的 `base_state_hash`。验证失败表示另一项工作已经改变项目，必须重新读取和裁决差异，不能直接覆盖。
 
 - 写前上下文必须绑定当前 `head`，并完成自动来源、被触及事实和相关旧章原文的证据读取。
-- 在工作目录完成初稿及结构、人物、连续性与原创性初检，随后每章实际调用 `humanizer-zh`；调用前原稿、最终结果与审阅记录分别进入暂存包。短故事写完整唯一正文；修订已有正典先建立快照，不先推进 `novel.json`。
+- 在工作目录完成初稿及结构、人物、连续性与原创性初检，随后每章实际调用 `$humanizer-zh`；调用前原稿、最终结果与审阅记录分别进入暂存包。短故事写完整唯一正文；修订已有正典先建立快照，不先推进 `novel.json`。
 - 自然化记录、状态增量、连续性审计和原创性报告都必须覆盖最终正文哈希；风险章由独立上下文审稿，确定矛盾必须阻断。
 - 连载每 5 章分别完成全局连续性基线和独立周期质量审核；短故事完成全篇连续性基线和独立质量完稿审核。任一到期或未通过时停止下一章、导出和上传。
 

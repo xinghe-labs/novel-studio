@@ -4,14 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
 import hashlib
 import html
 import json
 import os
 import re
+import stat
 import sys
-import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -91,9 +92,13 @@ def utc_now() -> str:
 
 
 def resolve_project(raw_root: str) -> Path:
-    root = Path(raw_root).expanduser().resolve()
+    raw = Path(raw_root).expanduser()
+    _assert_path_chain_no_links(raw, label="Project path")
+    root = raw.resolve()
+    _assert_path_chain_no_links(root, label="Resolved project path")
     if not (root / "novel.json").is_file():
         raise OriginalityError(f"Not an initialized novel project: {root}")
+    _assert_no_links(root)
     return root
 
 
@@ -105,51 +110,117 @@ def is_within(path: Path, parent: Path) -> bool:
     return True
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def _link_like(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        checker = getattr(path, "is_junction", None)
+        if checker and checker():
+            return True
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
 
 
-def atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        newline="\n",
-        delete=False,
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
+def _assert_path_chain_no_links(path: Path, *, label: str) -> None:
+    """Reject links/reparse points in every existing component of a path."""
+    absolute = path.expanduser().absolute()
+    components = list(reversed(absolute.parents)) + [absolute]
+    for component in components:
+        if _link_like(component):
+            raise OriginalityError(
+                f"{label} cannot traverse a link or reparse point: {component}"
+            )
+
+
+def _assert_no_links(root: Path) -> None:
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError as exc:
+            raise OriginalityError(f"Unable to inspect project tree: {exc}") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            if _link_like(path):
+                raise OriginalityError(f"Project tree contains a link or reparse point: {path}")
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+            except OSError as exc:
+                raise OriginalityError(f"Unable to inspect project entry: {path}: {exc}") from exc
+
+
+def _read_stable(path: Path, *, label: str) -> bytes:
+    _assert_path_chain_no_links(path, label=label)
+    try:
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            raw = handle.read(MAX_TEXT_BYTES + 1)
+            after = os.fstat(handle.fileno())
+        _assert_path_chain_no_links(path, label=label)
+        path_stat = path.stat()
+        _assert_path_chain_no_links(path, label=label)
+    except OSError as exc:
+        raise OriginalityError(f"Unable to read {label}: {path}: {exc}") from exc
+    if len(raw) > MAX_TEXT_BYTES:
+        raise OriginalityError(
+            f"{label} exceeds the {MAX_TEXT_BYTES}-byte local audit limit: {path}"
+        )
+    path_identity = (
+        getattr(path_stat, "st_dev", None),
+        getattr(path_stat, "st_ino", None),
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
     )
-    temp_path = Path(handle.name)
-    try:
-        with handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    finally:
-        temp_path.unlink(missing_ok=True)
+    if (
+        before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or getattr(before, "st_ino", None) != getattr(after, "st_ino", None)
+        or (
+            getattr(after, "st_dev", None),
+            getattr(after, "st_ino", None),
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        != path_identity
+    ):
+        raise OriginalityError(f"{label} changed while being read: {path}")
+    return raw
 
 
-def read_json(path: Path) -> Any:
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(_read_stable(path, label="Audit source")).hexdigest()
+
+
+def read_json(path: Path, *, raw: bytes | None = None) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        snapshot = raw if raw is not None else _read_stable(path, label="JSON audit input")
+        return json.loads(snapshot.decode("utf-8"))
     except FileNotFoundError as exc:
         raise OriginalityError(f"Missing file: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise OriginalityError(f"JSON audit input is not UTF-8: {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise OriginalityError(f"Invalid JSON in {path}: {exc}") from exc
 
 
 def read_manifest(root: Path) -> list[dict[str, Any]]:
     path = root / MANIFEST_RELATIVE
+    _assert_path_chain_no_links(path, label="Source manifest")
     if not path.exists():
         return []
     records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    try:
+        content = _read_stable(path, label="Source manifest").decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise OriginalityError(f"Source manifest is not UTF-8: {exc}") from exc
+    for line_number, line in enumerate(content.splitlines(), 1):
         if not line.strip():
             continue
         try:
@@ -186,12 +257,16 @@ def json_strings(value: Any) -> Iterable[str]:
             yield from json_strings(item)
 
 
-def extract_text(path: Path) -> str:
-    if path.stat().st_size > MAX_TEXT_BYTES:
+def extract_text(path: Path, *, raw: bytes | None = None) -> str:
+    _assert_path_chain_no_links(path, label="Audit source")
+    if not path.is_file():
+        raise OriginalityError(f"Audit source is not a regular file: {path}")
+    if raw is None:
+        raw = _read_stable(path, label="Audit source")
+    if len(raw) > MAX_TEXT_BYTES:
         raise OriginalityError(
             f"Source exceeds the {MAX_TEXT_BYTES}-byte local audit limit: {path}"
         )
-    raw = path.read_bytes()
     suffix = path.suffix.lower()
     if suffix in {".html", ".htm"}:
         parser = VisibleTextParser()
@@ -598,19 +673,23 @@ def default_candidates(root: Path) -> list[Path]:
     chapter_directory = root / "manuscript/chapters"
     if chapter_directory.is_dir():
         candidates.update(
-            path for path in chapter_directory.glob("*.md") if path.is_file()
+            path
+            for path in chapter_directory.glob("*.md")
+            if not _link_like(path) and path.is_file()
         )
     staging_directory = root / "staging/chapters"
     if staging_directory.is_dir():
         candidates.update(
-            path for path in staging_directory.rglob("chapter.md") if path.is_file()
+            path
+            for path in staging_directory.rglob("chapter.md")
+            if not _link_like(path) and path.is_file()
         )
     manuscript = root / "manuscript"
     if manuscript.is_dir():
         candidates.update(
             path
             for path in manuscript.glob("[0-9][0-9][0-9][0-9]*.md")
-            if path.is_file()
+            if not _link_like(path) and path.is_file()
         )
     return sorted(candidates, key=lambda path: path.relative_to(root).as_posix())
 
@@ -619,6 +698,16 @@ def registered_references(
     root: Path, requested: list[str] | None
 ) -> list[tuple[Path, dict[str, Any]]]:
     records = read_manifest(root)
+    try:
+        import novel_research
+
+        errors, _ = novel_research.validate_manifest_records(root, records)
+    except (ImportError, OSError) as exc:
+        raise OriginalityError(
+            f"Unable to load source-manifest validator: {exc}"
+        ) from exc
+    if errors:
+        raise OriginalityError("Invalid source manifest: " + "; ".join(errors[:8]))
     by_path = {
         str(record.get("path")): record
         for record in records
@@ -631,6 +720,9 @@ def registered_references(
             resolved = Path(raw).expanduser()
             if not resolved.is_absolute():
                 resolved = root / resolved
+            _assert_path_chain_no_links(
+                resolved, label="Originality reference path"
+            )
             resolved = resolved.resolve()
             if not is_within(resolved, root):
                 raise OriginalityError(
@@ -652,7 +744,9 @@ def registered_references(
             raise OriginalityError(
                 f"Reference is not authorized for originality comparison: {relative}"
             )
-        path = (root / relative).resolve()
+        unresolved = root / relative
+        _assert_path_chain_no_links(unresolved, label="Registered reference path")
+        path = unresolved.resolve()
         if not path.is_file():
             raise OriginalityError(f"Registered reference is missing: {relative}")
         if sha256_file(path) != record.get("sha256"):
@@ -669,6 +763,7 @@ def audit_project(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             path = Path(raw).expanduser()
             if not path.is_absolute():
                 path = root / path
+            _assert_path_chain_no_links(path, label="Candidate path")
             path = path.resolve()
             if not is_within(path, root):
                 raise OriginalityError("Candidate files must be inside the project")
@@ -679,25 +774,34 @@ def audit_project(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         candidate_paths = default_candidates(root)
     references = registered_references(root, args.reference)
 
-    candidate_data = [
-        {
-            "path": path.relative_to(root).as_posix(),
-            "sha256": sha256_file(path),
-            "text": extract_text(path),
-        }
-        for path in candidate_paths
-    ]
-    reference_data = [
-        {
-            "path": path.relative_to(root).as_posix(),
-            "source_id": record.get("source_id"),
-            "sha256": record.get("sha256"),
-            "external_use": record.get("external_use"),
-            "rights_status": record.get("rights_status"),
-            "text": extract_text(path),
-        }
-        for path, record in references
-    ]
+    candidate_data: list[dict[str, Any]] = []
+    for path in candidate_paths:
+        raw = _read_stable(path, label="Candidate audit source")
+        candidate_data.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "text": extract_text(path, raw=raw),
+            }
+        )
+    reference_data: list[dict[str, Any]] = []
+    for path, record in references:
+        raw = _read_stable(path, label="Reference audit source")
+        actual_hash = hashlib.sha256(raw).hexdigest()
+        if actual_hash != record.get("sha256"):
+            raise OriginalityError(
+                f"Registered reference hash changed: {path.relative_to(root).as_posix()}"
+            )
+        reference_data.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "source_id": record.get("source_id"),
+                "sha256": actual_hash,
+                "external_use": record.get("external_use"),
+                "rights_status": record.get("rights_status"),
+                "text": extract_text(path, raw=raw),
+            }
+        )
 
     exact_findings: list[dict[str, Any]] = []
     near_findings: list[dict[str, Any]] = []
@@ -754,14 +858,17 @@ def audit_project(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     wording_status = "block" if wording_block else "review" if wording_review else "pass"
 
     plan_path = root / PLAN_RELATIVE
-    structure = audit_structure(read_json(plan_path))
-    plan_hash = sha256_file(plan_path)
+    plan_raw = _read_stable(plan_path, label="Originality plan")
+    structure = audit_structure(read_json(plan_path, raw=plan_raw))
+    plan_hash = hashlib.sha256(plan_raw).hexdigest()
     if wording_status == "block" or structure["status"] == "block":
         decision = "block"
         code = 1
     elif structure["status"] == "incomplete":
         decision = "incomplete"
-        code = 3
+        # Incomplete review input is an expected business-gate result.  Exit
+        # code 3 is reserved by novel_cli for unhandled/serialization errors.
+        code = 1
     elif wording_status == "review" or structure["status"] == "review":
         decision = "review"
         code = 1
@@ -821,9 +928,77 @@ def audit_project(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         fingerprint = hashlib.sha256(
             json.dumps(fingerprint_material, sort_keys=True).encode("utf-8")
         ).hexdigest()[:10]
-        report_path = root / "reviews" / f"originality-audit-{timestamp}-{fingerprint}.json"
-        atomic_write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-        report["report_path"] = report_path.relative_to(root).as_posix()
+        default_path = (
+            root
+            / "staging"
+            / "originality"
+            / f"originality-audit-{timestamp}-{fingerprint}.json"
+        )
+        raw_output = getattr(args, "output", None)
+        raw_report_path = Path(raw_output).expanduser() if raw_output else default_path
+        _assert_path_chain_no_links(raw_report_path, label="Originality report output")
+        report_path = raw_report_path.resolve()
+        _assert_path_chain_no_links(
+            report_path, label="Resolved originality report output"
+        )
+        if report_path.suffix.lower() != ".json":
+            raise OriginalityError("Originality report output must be a .json file")
+        if report_path.exists():
+            raise OriginalityError(
+                f"Refusing to overwrite an existing originality report: {report_path}"
+            )
+        if is_within(report_path, root) and not is_within(
+            report_path, (root / "staging").resolve()
+        ):
+            raise OriginalityError(
+                "Project-local originality reports must be written under staging; "
+                "commit-chapter archives a passing report to reviews atomically"
+            )
+        report["report_path"] = (
+            report_path.relative_to(root).as_posix()
+            if is_within(report_path, root)
+            else str(report_path)
+        )
+        # A report under the project tree is still a project write, even though
+        # it lives in staging and is excluded from the canonical state hash.
+        # Require the same explicit lease as every other project-local artifact;
+        # work-directory reports remain available without a project lease.
+        write_context: Any = contextlib.nullcontext()
+        if is_within(report_path, root):
+            try:
+                import novel_workspace
+
+                @contextlib.contextmanager
+                def _authorized_context():
+                    try:
+                        with novel_workspace.project_write_context(
+                            root,
+                            workspace=getattr(args, "workspace", None),
+                            work_id=getattr(args, "work_id", None),
+                            allow_bootstrap=bool(getattr(args, "allow_bootstrap", False)),
+                        ) as context:
+                            yield context
+                    except novel_workspace.WorkspaceError as exc:
+                        raise OriginalityError(str(exc)) from exc
+
+                write_context = _authorized_context()
+            except (ImportError, OSError) as exc:
+                raise OriginalityError(
+                    f"Project write authorization module unavailable: {exc}"
+                ) from exc
+        with write_context as context:
+            try:
+                novel_cli.atomic_create_text(
+                    report_path,
+                    json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+                )
+            except FileExistsError as exc:
+                raise OriginalityError(
+                    f"Refusing to overwrite an existing originality report: {report_path}"
+                ) from exc
+            if hasattr(context, "assert_live"):
+                context.assert_live()
+                context.refresh_base_after_write("originality audit report")
     return report, code
 
 
@@ -856,12 +1031,24 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--exact-minimum", type=int, default=18)
     audit.add_argument("--near-threshold", type=float, default=0.72)
     audit.add_argument("--max-findings", type=int, default=30)
+    audit.add_argument(
+        "--output",
+        help=(
+            "New JSON report path. Project-local output must be under staging; "
+            "an external work-directory path is also allowed."
+        ),
+    )
     audit.add_argument("--no-report", action="store_true")
+    audit.add_argument("--workspace")
+    audit.add_argument("--work-id")
+    audit.add_argument("--allow-bootstrap", action="store_true")
     return parser
 
 
 def main() -> int:
     def dispatch(args: argparse.Namespace) -> Any:
+        if args.no_report and args.output:
+            raise OriginalityError("--output cannot be combined with --no-report")
         if args.exact_minimum < 12 or args.exact_minimum > 80:
             raise OriginalityError("--exact-minimum must be from 12 to 80")
         if args.near_threshold < 0.5 or args.near_threshold > 1.0:

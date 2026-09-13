@@ -1,6 +1,6 @@
 # 工作区与并行隔离
 
-每次使用本 Skill 都先读取本文件并执行目录预检。这里的“工作”不绑定 Codex 会话：它可以来自任何 Agent、脚本、窗口、进程或人工操作。工作身份由 `work_id` 和本地 `work.json` 决定。
+只有会创建草稿、研究、报告或修改项目资料的操作才需要读取本文件并建立工作上下文；只读的 `doctor`、`status`、`validate`、`help` 和版本查询可以直接执行。这里的“工作”不绑定 Codex 会话：它可以来自任何 Agent、脚本、窗口、进程或人工操作。工作身份由 `work_id` 和本地 `work.json` 决定。
 
 ## 两层目录
 
@@ -29,9 +29,9 @@
 - `registry.sqlite3` 使用 SQLite WAL 协调项目、工作上下文和单写者租约；项目和工作目录内的 JSON 元数据可用于恢复登记。注册表不是小说正典。
 - `projects/<project-id>/exports/` 是从已提交 Markdown 重建的交付目录，不是正典，也不计入项目状态哈希；它不能用来绕过正典写入协议。
 
-## 调用前强制预检
+## 需要写入时的预检
 
-在提问、搜索、策划、审稿或写作之前，先运行：
+在需要保存草稿、研究、审核包或正典变更时，先运行：
 
 ```powershell
 python -X utf8 .\scripts\novel_workspace.py work-ensure "<workspace-root>" --client "generic"
@@ -44,6 +44,18 @@ python -X utf8 .\scripts\novel_workspace.py work-ensure "<workspace-root>" --wor
 ```
 
 如果当前工作目录或父目录已经有有效 `work.json`，`work-ensure` 返回 `reused`；没有时才创建新的 `work-*` 目录。不得在同一次工作中重复创建目录，也不得用“最近一个活跃工作”猜测上下文。
+
+工作生命周期命令：
+
+```powershell
+python -X utf8 .\scripts\novel_workspace.py work-start "<workspace-root>" --purpose "..."
+python -X utf8 .\scripts\novel_workspace.py work-resume "<workspace-root>" "<work-id>"
+python -X utf8 .\scripts\novel_workspace.py work-reconcile "<workspace-root>" "<work-id>"
+python -X utf8 .\scripts\novel_workspace.py work-list "<workspace-root>" --active-only
+python -X utf8 .\scripts\novel_workspace.py work-close "<workspace-root>" "<work-id>"
+```
+
+`work-reconcile` 只从 SQLite 注册表修复便携的 `work.json` 投影，不修改正典、草稿或注册表事实；`work-close` 只更新状态，不删除工作目录、草稿或报告；`work-resume` 只恢复 `active` 工作。
 
 新建的工作可以先保持未绑定。需要继续已有小说时先列出项目，再绑定：
 
@@ -115,16 +127,14 @@ python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<proj
 
 正式提交的文件替换期间，提交器通过 `write_guard` 持有 `BEGIN IMMEDIATE` 注册表事务，并在最终验证中再次检查 owner 和心跳；这使租约检查与原子文件事务处于同一受保护窗口。
 
-完成一次已授权写入后，先运行项目级验证，再更新基准并释放租约：
+完成一次已授权写入后，严格执行 [commit-protocol.md](commit-protocol.md) 的完整“提交后”验证清单；本文件不再维护一个可能漂移的验证子集。验证全部通过后，再更新基准并释放租约：
 
 ```powershell
-python -X utf8 .\scripts\novel_project.py validate "<project-root>"
-python -X utf8 .\scripts\novel_memory.py status "<project-root>"
 python -X utf8 .\scripts\novel_workspace.py base-refresh "<workspace-root>" "<work-id>" --validation-reference "项目与长期记忆验证通过"
 python -X utf8 .\scripts\novel_workspace.py lock-release "<workspace-root>" "<work-id>"
 ```
 
-`base-refresh` 必须记录非空验证说明，不能用空说明掩盖未经回读的并发变化。即使写入、验证或后续命令失败，也要尝试释放自己持有的租约；不能释放其他工作的租约。租约过期只能允许另一工作重新取得写入权，状态哈希检查仍然不能跳过。
+`base-refresh` 必须记录非空验证说明，不能用空说明掩盖未经回读的并发变化。若项目已被当前工作之外的进程修改，普通 `base-refresh` 必须失败；只有逐项回读并验证变化后，才能额外提供 `--accept-external-change --validation-report <项目外 JSON>`。报告字段和哈希绑定见 [schemas-and-cli.md](schemas-and-cli.md#外部变更验证报告)。即使写入、验证或后续命令失败，也要尝试释放自己持有的租约；不能释放其他工作的租约。租约过期只能允许另一工作重新取得写入权，状态哈希检查仍然不能跳过。
 
 ## 项目登记与恢复
 

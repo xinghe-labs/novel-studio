@@ -12,9 +12,11 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +38,17 @@ IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 SHORT_STORY_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+){0,2}$")
 PROJECT_DATE = re.compile(r"^\d{8}$")
 WORK_SUBDIRECTORIES = ("drafts", "research", "reports", "temp")
-HASH_EXCLUDED_PARTS = frozenset({".git", ".novel-cache", "__pycache__"})
+HASH_EXCLUDED_PARTS = frozenset(
+    {
+        ".git",
+        ".novel-cache",
+        ".novel-transaction",
+        ".novel-upgrade-transaction",
+        ".novel-export.lock",
+        ".novel-export-journal.json",
+        "__pycache__",
+    }
+)
 HASH_EXCLUDED_ROOTS = frozenset({"exports", "staging"})
 LEGACY_HASH_EXCLUDED_ROOTS = frozenset({"exports"})
 STATE_HASH_VERSION = 2
@@ -83,7 +95,14 @@ REQUIRED_REGISTRY_COLUMNS = {
             "previous_expires_at",
             "current_state_hash",
             "state_hash_error",
+            "previous_state_hash",
+            "validated_state_hash",
+            "validation_result",
+            "validation_reference",
         }
+    ),
+    "project_reservations": frozenset(
+        {"project_id", "project_root", "reserved_at"}
     ),
 }
 
@@ -111,6 +130,7 @@ class WriteGuard:
         self.project_root = project_root
         self.state_hash = state_hash
         self.hash_version = hash_version
+        self.projection_extra: dict[str, Any] | None = None
 
     def assert_live(self) -> sqlite3.Row:
         """Recheck ownership while the guard's write transaction is held."""
@@ -123,6 +143,215 @@ class WriteGuard:
         if Path(project["project_root"]).resolve() != Path(self.project_root).resolve():
             raise WorkspaceError("The guarded project root changed")
         return owner
+
+    def refresh_base_after_write(
+        self,
+        validation_reference: str = "authorized project write",
+        *,
+        record_event: bool = False,
+    ) -> str:
+        """Persist the hash produced by an already-authorized write.
+
+        The caller must hold this guard's SQLite transaction.  This is only for
+        writes performed while the guard is held; accepting an arbitrary new
+        project state belongs to :func:`refresh_base`, which requires an
+        explicit, hash-bound validation receipt.
+        """
+
+        reference = " ".join(str(validation_reference).split()).strip()
+        if not reference:
+            raise WorkspaceError("validation_reference cannot be empty")
+        owner = self.assert_live()
+        # The guard owns the active file transaction.  Hashing its post-write
+        # view must be allowed to see the still-pending journal; callers
+        # outside the guard continue to fail closed until recovery completes.
+        current_hash = project_state_hash(
+            self.project_root, allow_pending_transactions=True
+        )
+        work = work_row(self.connection, self.work_id)
+        previous_hash = work["base_state_hash"]
+        now = utc_now()
+        self.connection.execute(
+            "UPDATE works SET base_state_hash = ?, updated_at = ? WHERE work_id = ?",
+            (current_hash, now, work["work_id"]),
+        )
+        self.projection_extra = {
+            "last_base_refresh": {
+                "validation_reference": reference,
+                "refreshed_at": now,
+                "validation_result": "authorized_write",
+            }
+        }
+        if record_event:
+            record_lease_event(
+                self.connection,
+                project_id=self.project_id,
+                previous_work_id=owner["work_id"],
+                event="base_refreshed",
+                reason="authorized_write",
+                actor_work_id=owner["work_id"],
+                previous_expires_at=owner["expires_at"],
+                current_state_hash=current_hash,
+                previous_state_hash=previous_hash,
+                validated_state_hash=current_hash,
+                validation_result="authorized_write",
+                validation_reference=reference,
+            )
+        self.state_hash = current_hash
+        return current_hash
+
+
+class ProjectWriteContext:
+    """Function-level authorization for a project mutation.
+
+    A caller that owns a live lease receives the real SQLite-backed guard.  A
+    missing identity is only accepted for an unregistered project during an
+    explicit bootstrap operation.  A process-local capability or a lease's
+    mere absence is not sufficient authorization for a registered project.
+    """
+
+    def __init__(
+        self,
+        guard: WriteGuard | None,
+        *,
+        project_root: Path,
+        workspace_root: Path | None = None,
+    ) -> None:
+        self.guard = guard
+        self.project_root = project_root
+        self.workspace_root = workspace_root
+
+    def assert_live(self) -> None:
+        if self.guard is not None:
+            self.guard.assert_live()
+
+    def refresh_base_after_write(
+        self,
+        validation_reference: str = "authorized project write",
+        *,
+        record_event: bool = False,
+    ) -> str | None:
+        """Refresh the owning work's base hash after an authorized mutation.
+
+        Bootstrap writes performed before a project has a registered lease have
+        no registry row to update, so they return ``None``.  Once a caller has
+        supplied an explicit ``workspace``/``work_id`` pair, the refresh is
+        performed inside the same SQLite reservation as the file mutation.
+        """
+
+        if self.guard is None:
+            return None
+        return self.guard.refresh_base_after_write(
+            validation_reference, record_event=record_event
+        )
+
+
+_ACTIVE_WRITE_CONTEXT: ContextVar[ProjectWriteContext | None] = ContextVar(
+    "novel_studio_active_write_context", default=None
+)
+
+
+def _workspace_candidate_for_project(project_root: Path) -> Path | None:
+    """Infer the conventional workspace root without scanning the filesystem."""
+
+    candidate = project_root.parent.parent.resolve()
+    if (candidate / "workspace.json").is_file():
+        return candidate
+    return None
+
+
+@contextlib.contextmanager
+def project_write_context(
+    project_root: str | Path,
+    *,
+    workspace: str | Path | None = None,
+    work_id: str | None = None,
+    allow_bootstrap: bool = False,
+) -> Any:
+    """Authorize one project-level mutation.
+
+    ``workspace`` and ``work_id`` must be supplied together.  When omitted,
+    only an unregistered project may be written, and only when
+    ``allow_bootstrap`` is true.  Initialization uses this narrow exception;
+    all registered-project mutations require an explicit live lease.
+    """
+
+    _assert_path_chain_no_links(project_root, label="Project path")
+    project = Path(project_root).expanduser().resolve()
+    if (workspace is None) != (work_id is None):
+        raise WorkspaceError("workspace and work_id must be supplied together")
+    active = _ACTIVE_WRITE_CONTEXT.get()
+    if active is not None and active.project_root == project:
+        # Nested helpers may omit identity when they deliberately reuse the
+        # outer guard. If they do provide one, it must name that exact guard;
+        # otherwise a recursive call could silently write with another work's
+        # credentials.
+        if workspace is not None or work_id is not None:
+            if active.guard is None or work_id != active.guard.work_id:
+                raise WorkspaceError(
+                    "Nested project write context does not match the active work"
+                )
+            if (
+                active.workspace_root is None
+                or Path(workspace).expanduser().resolve()
+                != active.workspace_root
+            ):
+                raise WorkspaceError(
+                    "Nested project write context does not match the active workspace"
+                )
+        yield active
+        return
+    if workspace is not None and work_id is not None:
+        _assert_path_chain_no_links(workspace, label="Workspace path")
+        with write_guard(workspace, work_id, expected_project_root=project) as guard:
+            context = ProjectWriteContext(
+                guard,
+                project_root=project,
+                workspace_root=Path(workspace).expanduser().resolve(),
+            )
+            token = _ACTIVE_WRITE_CONTEXT.set(context)
+            try:
+                yield context
+            finally:
+                _ACTIVE_WRITE_CONTEXT.reset(token)
+        return
+
+    candidate = _workspace_candidate_for_project(project)
+    if candidate is not None:
+        root = require_workspace(candidate)
+        connection = open_registry(root)
+        try:
+            row = connection.execute(
+                "SELECT project_id FROM projects WHERE project_root = ?",
+                (str(project),),
+            ).fetchone()
+            if row is not None:
+                raise WorkspaceError(
+                    "Registered project writes require workspace and work_id"
+                )
+        finally:
+            connection.close()
+        # A project under a managed workspace is never implicitly authorized.
+        # Even before registration, callers must opt into the narrow bootstrap
+        # path explicitly; this prevents a path-layout accident from becoming
+        # a write capability.
+        if not allow_bootstrap:
+            raise WorkspaceError(
+                "Project writes without workspace and work_id require explicit allow_bootstrap=True"
+            )
+    elif not allow_bootstrap:
+        # Keep the same fail-closed rule for projects outside a conventional
+        # workspace.  Initialization and other internal scaffold builders pass
+        # allow_bootstrap=True deliberately.
+        raise WorkspaceError(
+            "Project writes without workspace and work_id require explicit allow_bootstrap=True"
+        )
+    context = ProjectWriteContext(None, project_root=project)
+    token = _ACTIVE_WRITE_CONTEXT.set(context)
+    try:
+        yield context
+    finally:
+        _ACTIVE_WRITE_CONTEXT.reset(token)
 
 
 def utc_datetime() -> datetime:
@@ -144,7 +373,9 @@ def parse_timestamp(value: str) -> datetime:
 
 
 def resolve_root(raw_root: str | Path) -> Path:
-    root = Path(raw_root).expanduser().resolve()
+    raw = Path(raw_root).expanduser()
+    _assert_path_chain_no_links(raw, label="Workspace path")
+    root = raw.resolve()
     anchor = Path(root.anchor).resolve()
     home = Path.home().resolve()
     if root == anchor:
@@ -160,6 +391,82 @@ def is_within(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _link_like(path: Path) -> bool:
+    """Detect symlinks, junctions, and Windows reparse points safely."""
+
+    try:
+        if path.is_symlink():
+            return True
+        checker = getattr(path, "is_junction", None)
+        if checker and checker():
+            return True
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _assert_path_chain_no_links(
+    path: str | Path,
+    *,
+    stop: str | Path | None = None,
+    label: str = "Path",
+) -> Path:
+    """Reject links/reparse points in the lexical path before resolving it."""
+
+    current = Path(os.path.abspath(Path(path).expanduser()))
+    stop_path = (
+        Path(os.path.abspath(Path(stop).expanduser())) if stop is not None else None
+    )
+    while True:
+        if _link_like(current):
+            raise WorkspaceError(
+                f"{label} cannot traverse a symbolic link or reparse point: {path}"
+            )
+        if stop_path is not None and current == stop_path:
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+    return Path(path).expanduser()
+
+
+def _iter_hash_files(root: Path, excluded_roots: set[str]) -> list[Path]:
+    """Walk canonical files without following links or reparse points."""
+
+    files: list[Path] = []
+    pending: list[tuple[Path, tuple[str, ...]]] = [(root, ())]
+    while pending:
+        directory, relative_parts = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError as exc:
+            raise WorkspaceError(f"Unable to inspect project state: {directory}: {exc}") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            parts = relative_parts + (entry.name,)
+            if parts and parts[0] in excluded_roots:
+                continue
+            if any(part in HASH_EXCLUDED_PARTS for part in parts):
+                continue
+            if _link_like(path):
+                raise WorkspaceError(f"Project state hashing refuses links or reparse points: {path}")
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise WorkspaceError(f"Unable to stat project state entry: {path}: {exc}") from exc
+            if stat.S_ISDIR(entry_stat.st_mode):
+                pending.append((path, parts))
+            elif stat.S_ISREG(entry_stat.st_mode):
+                files.append(path)
+            else:
+                raise WorkspaceError(f"Project state contains a non-regular entry: {path}")
+    return files
 
 
 def validate_identifier(value: str, label: str) -> str:
@@ -221,6 +528,12 @@ def reserve_short_story_project_root(
         registered = {
             row[0] for row in connection.execute("SELECT project_id FROM projects")
         }
+        reserved = {
+            row[0]
+            for row in connection.execute(
+                "SELECT project_id FROM project_reservations"
+            )
+        }
         suffix = 1
         while True:
             suffix_text = "" if suffix == 1 else f"-{suffix}"
@@ -229,19 +542,42 @@ def reserve_short_story_project_root(
             project_root = (projects_root / normalized_id).resolve()
             if project_root.parent != projects_root:
                 raise WorkspaceError("Generated short-story project path escaped projects/.")
-            if normalized_id in registered or project_root.exists():
+            if (
+                normalized_id in registered
+                or normalized_id in reserved
+                or project_root.exists()
+            ):
                 suffix += 1
                 continue
-            try:
-                project_root.mkdir(parents=False, exist_ok=False)
-            except FileExistsError:
-                suffix += 1
-                continue
+            connection.execute(
+                "INSERT INTO project_reservations(project_id, project_root, reserved_at) "
+                "VALUES(?, ?, ?)",
+                (normalized_id, str(project_root), utc_now()),
+            )
             connection.commit()
             return normalized_id, project_root
-    except Exception:
-        connection.rollback()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
         raise
+    finally:
+        connection.close()
+
+
+def release_project_reservation(
+    raw_workspace: str | Path, project_id: str
+) -> None:
+    """Release a failed or completed project ID reservation."""
+
+    root = require_workspace(raw_workspace)
+    normalized = validate_identifier(project_id, "project_id")
+    connection = open_registry(root)
+    try:
+        with connection:
+            connection.execute(
+                "DELETE FROM project_reservations WHERE project_id = ?",
+                (normalized,),
+            )
     finally:
         connection.close()
 
@@ -268,11 +604,15 @@ def dump_json(data: dict[str, Any]) -> str:
 
 
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    atomic_write_bytes(path, dump_json(data).encode("utf-8"))
+
+
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    if _link_like(path):
+        raise WorkspaceError(f"Refusing to write through a link or reparse point: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        newline="\n",
+        "wb",
         delete=False,
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -281,7 +621,7 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     temp_path = Path(handle.name)
     try:
         with handle:
-            handle.write(dump_json(data))
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
@@ -309,8 +649,11 @@ def initialize_workspace(
     config_path = workspace_config_path(root)
     if config_path.is_file():
         validate_workspace_config(root)
-        (root / "projects").mkdir(parents=True, exist_ok=True)
-        (root / "workspaces").mkdir(parents=True, exist_ok=True)
+        for directory in (root / "projects", root / "workspaces"):
+            _assert_path_chain_no_links(directory, label="Workspace directory")
+            if directory.exists() and not directory.is_dir():
+                raise WorkspaceError(f"Workspace directory is not a directory: {directory}")
+            directory.mkdir(parents=True, exist_ok=True)
         connection = open_registry(root)
         connection.close()
         return {
@@ -320,8 +663,11 @@ def initialize_workspace(
         }
 
     if root.exists():
+        _assert_path_chain_no_links(root, label="Workspace path")
         unexpected = sorted(
-            item.name for item in root.iterdir() if item.name not in {".git"}
+            item.name
+            for item in root.iterdir()
+            if item.name not in {".git"}
         )
         if unexpected and not adopt_existing:
             raise WorkspaceError(
@@ -330,8 +676,12 @@ def initialize_workspace(
             )
 
     root.mkdir(parents=True, exist_ok=True)
-    (root / "projects").mkdir(parents=True, exist_ok=True)
-    (root / "workspaces").mkdir(parents=True, exist_ok=True)
+    for directory in (root / "projects", root / "workspaces"):
+        _assert_path_chain_no_links(directory, label="Workspace directory")
+        if directory.exists() and not directory.is_dir():
+            raise WorkspaceError(f"Workspace directory is not a directory: {directory}")
+        directory.mkdir(parents=True, exist_ok=True)
+    _assert_path_chain_no_links(config_path, label="Workspace configuration")
     config = {
         "schema_version": SCHEMA_VERSION,
         "kind": WORKSPACE_KIND,
@@ -465,7 +815,16 @@ def create_schema(connection: sqlite3.Connection) -> None:
             occurred_at TEXT NOT NULL,
             previous_expires_at TEXT,
             current_state_hash TEXT,
-            state_hash_error TEXT
+            state_hash_error TEXT,
+            previous_state_hash TEXT,
+            validated_state_hash TEXT,
+            validation_result TEXT,
+            validation_reference TEXT
+        );
+        CREATE TABLE IF NOT EXISTS project_reservations (
+            project_id TEXT PRIMARY KEY,
+            project_root TEXT NOT NULL UNIQUE,
+            reserved_at TEXT NOT NULL
         );
         """
     )
@@ -486,6 +845,16 @@ def create_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE lease_events ADD COLUMN state_hash_error TEXT"
         )
+    for column in (
+        "previous_state_hash",
+        "validated_state_hash",
+        "validation_result",
+        "validation_reference",
+    ):
+        if column not in event_columns:
+            connection.execute(
+                f"ALTER TABLE lease_events ADD COLUMN {column} TEXT"
+            )
     if legacy_lease_layout or legacy_schema:
         # Older implementations had no verified heartbeat contract.  Keep
         # their original expires_at-only semantics until each lease is renewed
@@ -508,9 +877,15 @@ def create_schema(connection: sqlite3.Connection) -> None:
 def sync_registry(connection: sqlite3.Connection, root: Path) -> None:
     projects_root = root / "projects"
     workspaces_root = root / "workspaces"
+    _assert_path_chain_no_links(projects_root, label="Projects directory")
+    _assert_path_chain_no_links(workspaces_root, label="Workspaces directory")
     with connection:
         if projects_root.is_dir():
             for project_root in sorted(projects_root.iterdir()):
+                if _link_like(project_root):
+                    raise WorkspaceError(
+                        f"Projects directory contains a link or reparse point: {project_root}"
+                    )
                 metadata_path = project_root / ".novel-project.json"
                 manifest_path = project_root / "novel.json"
                 if not project_root.is_dir() or not metadata_path.is_file():
@@ -549,6 +924,10 @@ def sync_registry(connection: sqlite3.Connection, root: Path) -> None:
         }
         if workspaces_root.is_dir():
             for work_root in sorted(workspaces_root.iterdir()):
+                if _link_like(work_root):
+                    raise WorkspaceError(
+                        f"Workspaces directory contains a link or reparse point: {work_root}"
+                    )
                 context_path = work_root / "work.json"
                 if not work_root.is_dir() or not context_path.is_file():
                     continue
@@ -599,7 +978,7 @@ def open_registry(root: Path, *, synchronize: bool = True) -> sqlite3.Connection
         if synchronize:
             sync_registry(connection, root)
         return connection
-    except Exception:
+    except BaseException:
         # ``sqlite3.Connection`` keeps a Windows file handle until close().
         # In particular, a future/invalid schema must not leave the registry
         # undeletable after this function fails closed.
@@ -608,7 +987,10 @@ def open_registry(root: Path, *, synchronize: bool = True) -> sqlite3.Connection
 
 
 def project_state_hash(
-    project_root: str | Path, *, include_staging: bool = False
+    project_root: str | Path,
+    *,
+    include_staging: bool = False,
+    allow_pending_transactions: bool = False,
 ) -> str:
     """Hash canonical project files.
 
@@ -621,27 +1003,33 @@ def project_state_hash(
     root = Path(project_root).resolve()
     if not (root / "novel.json").is_file():
         raise WorkspaceError(f"Not an initialized novel project: {root}")
+    if not allow_pending_transactions:
+        try:
+            novel_project.assert_no_pending_transactions(root)
+        except novel_project.ProjectError as exc:
+            raise WorkspaceError(str(exc)) from exc
     excluded_roots = (
         LEGACY_HASH_EXCLUDED_ROOTS if include_staging else HASH_EXCLUDED_ROOTS
     )
     digest = hashlib.sha256()
-    files: list[Path] = []
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if relative.parts and relative.parts[0] in excluded_roots:
-            continue
-        if any(part in HASH_EXCLUDED_PARTS for part in relative.parts):
-            continue
-        if path.is_symlink():
-            raise WorkspaceError(f"Project state hashing refuses symbolic links: {path}")
-        if path.is_file():
-            files.append(path)
+    files = _iter_hash_files(root, set(excluded_roots))
     for path in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
         relative = path.relative_to(root).as_posix()
         file_digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                file_digest.update(block)
+        try:
+            before = path.stat()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    file_digest.update(block)
+            after = path.stat()
+        except OSError as exc:
+            raise WorkspaceError(f"Unable to read project state entry: {path}: {exc}") from exc
+        if (
+            before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or getattr(before, "st_ino", None) != getattr(after, "st_ino", None)
+        ):
+            raise WorkspaceError(f"Project state entry changed while being read: {path}")
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(file_digest.hexdigest().encode("ascii"))
@@ -714,6 +1102,61 @@ def work_row(connection: sqlite3.Connection, work_id: str) -> sqlite3.Row:
     return row
 
 
+def _reconcile_work_file(
+    connection: sqlite3.Connection,
+    work: sqlite3.Row,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> bool:
+    """Project the authoritative SQLite work row into ``work.json``.
+
+    ``work.json`` is a portable convenience record, not a second source of
+    truth.  A missing, malformed, or stale file is repaired from the registry;
+    extension keys that are still readable are preserved.
+    """
+
+    work_root = Path(work["work_root"]).expanduser().resolve()
+    context_path = work_root / "work.json"
+    context: dict[str, Any] = {}
+    if context_path.is_file():
+        try:
+            value = read_json(context_path)
+            if isinstance(value, dict):
+                context = dict(value)
+        except (OSError, UnicodeError, json.JSONDecodeError, WorkspaceError):
+            context = {}
+
+    project_root: str | None = None
+    if work["project_id"] is not None:
+        project = project_row(connection, work["project_id"])
+        project_root = str(Path(project["project_root"]).resolve())
+    canonical = {
+        "schema_version": SCHEMA_VERSION,
+        "work_id": str(work["work_id"]),
+        "status": str(work["status"]),
+        "project_id": work["project_id"],
+        "project_root": project_root,
+        "purpose": str(work["purpose"]),
+        "client": str(work["client"]),
+        "base_state_hash": work["base_state_hash"],
+        "created_at": str(work["created_at"]),
+        "updated_at": str(work["updated_at"]),
+    }
+    merged = {**context, **canonical}
+    if extra:
+        merged.update(extra)
+    encoded = dump_json(merged).encode("utf-8")
+    try:
+        current = context_path.read_bytes() if context_path.is_file() else None
+    except OSError:
+        current = None
+    if current == encoded:
+        return False
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(context_path, merged)
+    return True
+
+
 def register_project(
     raw_workspace: str | Path,
     raw_project_root: str | Path,
@@ -723,6 +1166,10 @@ def register_project(
     root = require_workspace(raw_workspace)
     project_root = Path(raw_project_root).expanduser().resolve()
     projects_root = (root / "projects").resolve()
+    try:
+        novel_project._assert_tree_has_no_links(project_root)
+    except novel_project.ProjectError as exc:
+        raise WorkspaceError(str(exc)) from exc
     if project_root.parent != projects_root:
         raise WorkspaceError(
             f"Project must be an immediate child of {projects_root}: {project_root}"
@@ -757,6 +1204,8 @@ def register_project(
                 f"Project path is already registered as {by_path['project_id']}"
             )
         existing_metadata = project_root / ".novel-project.json"
+        if _link_like(existing_metadata):
+            raise WorkspaceError("Project metadata cannot be a link or reparse point")
         created_at = utc_now()
         prior_metadata: dict[str, Any] | None = None
         if existing_metadata.is_file():
@@ -789,11 +1238,19 @@ def register_project(
             prior_metadata.get(key) != metadata.get(key)
             for key in metadata_keys
         )
-        if metadata_changed:
-            atomic_write_json(existing_metadata, metadata)
-        else:
+        metadata_bytes = dump_json(metadata).encode("utf-8")
+        prior_metadata_bytes = (
+            existing_metadata.read_bytes() if existing_metadata.is_file() else None
+        )
+        if not metadata_changed:
             metadata["updated_at"] = str(prior_metadata.get("updated_at") or created_at)
-        with connection:
+            metadata_bytes = existing_metadata.read_bytes()
+        metadata_attempted = False
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if metadata_changed:
+                metadata_attempted = True
+                atomic_write_bytes(existing_metadata, metadata_bytes)
             connection.execute(
                 """
                 INSERT INTO projects(
@@ -813,6 +1270,45 @@ def register_project(
                     metadata["updated_at"],
                 ),
             )
+            connection.execute(
+                "DELETE FROM project_reservations WHERE project_id = ?",
+                (normalized_id,),
+            )
+            connection.commit()
+        except BaseException as exc:
+            if connection.in_transaction:
+                connection.rollback()
+            if metadata_attempted:
+                try:
+                    if _link_like(existing_metadata):
+                        raise WorkspaceError(
+                            "Project metadata became a link or reparse point during registration"
+                        )
+                    if existing_metadata.exists():
+                        if not existing_metadata.is_file():
+                            raise WorkspaceError(
+                                "Project metadata changed to a non-file during registration"
+                            )
+                        current = existing_metadata.read_bytes()
+                    else:
+                        current = None
+                    if current == prior_metadata_bytes:
+                        pass
+                    elif current == metadata_bytes:
+                        if prior_metadata_bytes is None:
+                            existing_metadata.unlink(missing_ok=True)
+                        else:
+                            atomic_write_bytes(existing_metadata, prior_metadata_bytes)
+                    else:
+                        raise WorkspaceError(
+                            "Project metadata changed externally during registration; "
+                            "manual reconciliation is required"
+                        )
+                except BaseException as restore_exc:
+                    raise WorkspaceError(
+                        f"Registry registration failed and metadata rollback failed: {restore_exc}"
+                    ) from exc
+            raise
         result = {
             "status": "already_registered" if by_id or by_path else "registered",
             "project_id": normalized_id,
@@ -876,14 +1372,16 @@ def create_project(
                 target_words=target_words,
             )
         )
-    except novel_project.ProjectError as exc:
-        if (
-            reserved_short_story_root
-            and project_root.parent == (root / "projects").resolve()
-        ):
-            shutil.rmtree(project_root, ignore_errors=True)
+    except (novel_project.ProjectError, KeyboardInterrupt) as exc:
+        if reserved_short_story_root:
+            release_project_reservation(root, normalized_id)
         raise WorkspaceError(str(exc)) from exc
-    result = register_project(root, project_root, project_id=normalized_id)
+    try:
+        result = register_project(root, project_root, project_id=normalized_id)
+    except BaseException:
+        if reserved_short_story_root:
+            release_project_reservation(root, normalized_id)
+        raise
     result["status"] = "created"
     return result
 
@@ -1023,26 +1521,22 @@ def resume_work(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
     root = require_workspace(raw_workspace)
     connection = open_registry(root)
     try:
+        connection.execute("BEGIN IMMEDIATE")
         row = work_row(connection, work_id)
         work_root = Path(row["work_root"]).resolve()
         if work_root.parent != (root / "workspaces").resolve():
             raise WorkspaceError("Registered work directory escapes workspaces/")
-        context = read_json(work_root / "work.json")
-        if context.get("work_id") != row["work_id"]:
-            raise WorkspaceError("work.json does not match the registry work_id")
-        if context.get("project_id") != row["project_id"]:
-            raise WorkspaceError("work.json project_id does not match the registry")
-        if context.get("base_state_hash") != row["base_state_hash"]:
-            raise WorkspaceError("work.json base_state_hash does not match the registry")
         if row["status"] != "active":
+            connection.commit()
+            _reconcile_work_file(connection, row)
             raise WorkspaceError(
                 f"Work {row['work_id']} is {row['status']}; start a new work context."
             )
         project_root: str | None = None
         if row["project_id"] is not None:
             project_root = project_row(connection, row["project_id"])["project_root"]
-            if context.get("project_root") != project_root:
-                raise WorkspaceError("work.json project_root does not match the registry")
+        connection.commit()
+        reconciled = _reconcile_work_file(connection, row)
         return {
             "status": "reused",
             "workspace_root": str(root),
@@ -1051,7 +1545,42 @@ def resume_work(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
             "project_id": row["project_id"],
             "project_root": project_root,
             "base_state_hash": row["base_state_hash"],
+            "reconciled": reconciled,
         }
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def reconcile_work(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
+    """Repair the portable work file from the SQLite registry projection."""
+
+    root = require_workspace(raw_workspace)
+    connection = open_registry(root)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        work = work_row(connection, work_id)
+        work_root = Path(work["work_root"]).resolve()
+        if work_root.parent != (root / "workspaces").resolve():
+            raise WorkspaceError("Registered work directory escapes workspaces/")
+        connection.commit()
+        changed = _reconcile_work_file(connection, work)
+        return {
+            "status": "reconciled" if changed else "already_current",
+            "workspace_root": str(root),
+            "work_id": work["work_id"],
+            "work_root": str(work_root),
+            "project_id": work["project_id"],
+            "base_state_hash": work["base_state_hash"],
+            "changed": changed,
+        }
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -1062,6 +1591,10 @@ def bind_work(
     root = require_workspace(raw_workspace)
     connection = open_registry(root)
     try:
+        # Lock before reading either row or project state.  Otherwise a
+        # concurrent bind/close can race the snapshot that is projected to
+        # work.json.
+        connection.execute("BEGIN IMMEDIATE")
         work = work_row(connection, work_id)
         if work["status"] != "active":
             raise WorkspaceError(f"Cannot bind a {work['status']} work context")
@@ -1070,29 +1603,22 @@ def bind_work(
             raise WorkspaceError(
                 f"Work is already bound to project {work['project_id']}"
             )
-        work_root = Path(work["work_root"])
-        context_path = work_root / "work.json"
-        context = read_json(context_path)
+        work_root = Path(work["work_root"]).resolve()
+        if work_root.parent != (root / "workspaces").resolve():
+            raise WorkspaceError("Registered work directory escapes workspaces/")
         state_hash = project_state_hash(project["project_root"])
         now = utc_now()
-        context.update(
-            {
-                "project_id": project["project_id"],
-                "project_root": project["project_root"],
-                "base_state_hash": state_hash,
-                "updated_at": now,
-            }
+        connection.execute(
+            """
+            UPDATE works
+            SET project_id = ?, base_state_hash = ?, updated_at = ?
+            WHERE work_id = ?
+            """,
+            (project["project_id"], state_hash, now, work["work_id"]),
         )
-        atomic_write_json(context_path, context)
-        with connection:
-            connection.execute(
-                """
-                UPDATE works
-                SET project_id = ?, base_state_hash = ?, updated_at = ?
-                WHERE work_id = ?
-                """,
-                (project["project_id"], state_hash, now, work["work_id"]),
-            )
+        updated_work = work_row(connection, work["work_id"])
+        connection.commit()
+        _reconcile_work_file(connection, updated_work)
         return {
             "status": "bound",
             "work_id": work["work_id"],
@@ -1101,6 +1627,10 @@ def bind_work(
             "project_root": project["project_root"],
             "base_state_hash": state_hash,
         }
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -1240,13 +1770,19 @@ def record_lease_event(
     previous_expires_at: str | None,
     current_state_hash: str | None,
     state_hash_error: str | None = None,
+    previous_state_hash: str | None = None,
+    validated_state_hash: str | None = None,
+    validation_result: str | None = None,
+    validation_reference: str | None = None,
 ) -> None:
     connection.execute(
         """
         INSERT INTO lease_events(
             project_id, previous_work_id, event, reason, actor_work_id,
-            occurred_at, previous_expires_at, current_state_hash, state_hash_error
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            occurred_at, previous_expires_at, current_state_hash, state_hash_error,
+            previous_state_hash, validated_state_hash, validation_result,
+            validation_reference
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             project_id,
@@ -1258,6 +1794,10 @@ def record_lease_event(
             previous_expires_at,
             current_state_hash,
             state_hash_error,
+            previous_state_hash,
+            validated_state_hash,
+            validation_result,
+            validation_reference,
         ),
     )
 
@@ -1299,6 +1839,13 @@ def acquire_lock(
                 )
             else:
                 status = "reclaimed"
+        # A durable file journal may remain after a process crash.  Recover it
+        # only after the registry transaction has established that no other
+        # live owner can currently be writing the project.
+        try:
+            novel_project.recover_pending_transactions(project["project_root"])
+        except novel_project.ProjectError as exc:
+            raise WorkspaceError(f"Unable to recover the project transaction: {exc}") from exc
         current_hash, hash_version, hash_error = safe_match_project_state_hash(
             project["project_root"], work["base_state_hash"]
         )
@@ -1355,7 +1902,7 @@ def acquire_lock(
             "state_hash_version": hash_version,
             "state_hash_error": hash_error,
         }
-    except Exception:
+    except BaseException:
         if connection.in_transaction:
             connection.rollback()
         raise
@@ -1454,7 +2001,7 @@ def renew_lock(
             "state_hash_version": hash_version,
             "state_hash_error": hash_error,
         }
-    except Exception:
+    except BaseException:
         if connection.in_transaction:
             connection.rollback()
         raise
@@ -1466,11 +2013,16 @@ def write_check(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
     root = require_workspace(raw_workspace)
     connection = open_registry(root)
     try:
+        connection.execute("BEGIN IMMEDIATE")
         work = work_row(connection, work_id)
         owner = require_live_owned_lease(connection, work)
         project = project_row(connection, work["project_id"])
         if not work["base_state_hash"]:
             raise WorkspaceError("Work context has no base_state_hash")
+        try:
+            novel_project.recover_pending_transactions(project["project_root"])
+        except novel_project.ProjectError as exc:
+            raise WorkspaceError(f"Unable to recover the project transaction: {exc}") from exc
         try:
             current_hash, hash_version = match_project_state_hash(
                 project["project_root"], work["base_state_hash"]
@@ -1482,7 +2034,7 @@ def write_check(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
                 "Project changed after this work context was bound. Re-read the "
                 "project, resolve differences, then refresh the base hash before writing."
             )
-        return {
+        result = {
             "status": "pass",
             "work_id": work["work_id"],
             "project_id": work["project_id"],
@@ -1492,6 +2044,13 @@ def write_check(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
             "legacy_hash_accepted": hash_version == LEGACY_STATE_HASH_VERSION,
             "lease": lease_status(owner),
         }
+        connection.commit()
+        _reconcile_work_file(connection, work)
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -1529,6 +2088,18 @@ def write_guard(
         if not work["base_state_hash"]:
             raise WorkspaceError("Work context has no base_state_hash")
         try:
+            novel_project.recover_pending_transactions(project_root)
+            upgrade_recovery = novel_project.recover_pending_upgrade(project_root)
+        except novel_project.ProjectError as exc:
+            raise WorkspaceError(f"Unable to recover the project transaction: {exc}") from exc
+        if upgrade_recovery:
+            recovered_hash = project_state_hash(project_root)
+            connection.execute(
+                "UPDATE works SET base_state_hash = ?, updated_at = ? WHERE work_id = ?",
+                (recovered_hash, utc_now(), work["work_id"]),
+            )
+            work = work_row(connection, work_id)
+        try:
             current_hash, hash_version = match_project_state_hash(
                 project_root, work["base_state_hash"]
             )
@@ -1552,7 +2123,18 @@ def write_guard(
         _ = owner
         yield guard
         connection.commit()
-    except Exception:
+        try:
+            _reconcile_work_file(
+                connection,
+                work_row(connection, guard.work_id),
+                extra=guard.projection_extra,
+            )
+        except (OSError, UnicodeError, WorkspaceError) as exc:
+            raise WorkspaceError(
+                "Project write committed, but work.json projection failed; "
+                f"run work-reconcile: {exc}"
+            ) from exc
+    except BaseException:
         if connection.in_transaction:
             connection.rollback()
         raise
@@ -1560,8 +2142,76 @@ def write_guard(
         connection.close()
 
 
+def _read_external_validation_report(
+    raw_report: str | Path,
+    *,
+    project_root: Path,
+    previous_state_hash: str,
+    validated_state_hash: str,
+) -> dict[str, Any]:
+    """Load and verify an explicit report for accepting an external change."""
+
+    raw_report_path = Path(raw_report).expanduser()
+    _assert_path_chain_no_links(raw_report_path, label="Validation report path")
+    try:
+        report_bytes = novel_project.read_stable_bytes(
+            raw_report_path, label="validation report"
+        )
+        report = json.loads(report_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, novel_project.ProjectError) as exc:
+        raise WorkspaceError(f"Unable to read validation report: {exc}") from exc
+    report_path = raw_report_path.resolve()
+    if is_within(report_path, project_root):
+        raise WorkspaceError(
+            "Validation report must be stored outside the project tree"
+        )
+    if (
+        not isinstance(report, dict)
+        or type(report.get("schema_version")) is not int
+        or report.get("schema_version") != 1
+    ):
+        raise WorkspaceError("Validation report must be a schema_version=1 object")
+    if Path(str(report.get("project_root", ""))).expanduser().resolve() != project_root:
+        raise WorkspaceError("Validation report project_root does not match the project")
+    if report.get("previous_state_hash") != previous_state_hash:
+        raise WorkspaceError("Validation report previous_state_hash does not match the work base")
+    if report.get("validated_state_hash") != validated_state_hash:
+        raise WorkspaceError("Validation report validated_state_hash does not match the current project")
+    if report.get("result") != "pass":
+        raise WorkspaceError("Validation report result must be pass")
+    reference = report.get("validation_reference")
+    if not isinstance(reference, str) or not reference.strip():
+        raise WorkspaceError("Validation report validation_reference must not be empty")
+    checked_at = report.get("checked_at")
+    if not isinstance(checked_at, str) or not checked_at.strip():
+        raise WorkspaceError("Validation report checked_at must not be empty")
+    try:
+        parsed_checked_at = datetime.fromisoformat(
+            checked_at.strip().replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise WorkspaceError(
+            "Validation report checked_at must be timezone-aware ISO-8601"
+        ) from exc
+    if parsed_checked_at.tzinfo is None:
+        raise WorkspaceError(
+            "Validation report checked_at must be timezone-aware ISO-8601"
+        )
+    return {
+        "path": str(report_path),
+        "sha256": hashlib.sha256(report_bytes).hexdigest(),
+        "reference": reference.strip(),
+        "checked_at": checked_at.strip(),
+    }
+
+
 def refresh_base(
-    raw_workspace: str | Path, work_id: str, validation_reference: str
+    raw_workspace: str | Path,
+    work_id: str,
+    validation_reference: str,
+    *,
+    accept_external_change: bool = False,
+    validation_report: str | Path | None = None,
 ) -> dict[str, Any]:
     reference = validation_reference.strip()
     if not reference:
@@ -1569,32 +2219,86 @@ def refresh_base(
     root = require_workspace(raw_workspace)
     connection = open_registry(root)
     try:
+        connection.execute("BEGIN IMMEDIATE")
         work = work_row(connection, work_id)
-        require_live_owned_lease(connection, work)
+        owner = require_live_owned_lease(connection, work)
         project = project_row(connection, work["project_id"])
-        state_hash = project_state_hash(project["project_root"])
-        now = utc_now()
-        context_path = Path(work["work_root"]) / "work.json"
-        context = read_json(context_path)
-        context["base_state_hash"] = state_hash
-        context["last_base_refresh"] = {
-            "validation_reference": reference,
-            "refreshed_at": now,
-        }
-        context["updated_at"] = now
-        atomic_write_json(context_path, context)
-        with connection:
-            connection.execute(
-                "UPDATE works SET base_state_hash = ?, updated_at = ? WHERE work_id = ?",
-                (state_hash, now, work["work_id"]),
+        project_root = Path(project["project_root"]).resolve()
+        state_hash = project_state_hash(project_root)
+        matched_hash, match_version = match_project_state_hash(
+            project_root, work["base_state_hash"]
+        )
+        external_validation: dict[str, Any] | None = None
+        if match_version is None:
+            if not accept_external_change:
+                raise WorkspaceError(
+                    "Project state changed since this work was bound; provide an "
+                    "explicit validation report and --accept-external-change to "
+                    "record the external change"
+                )
+            if validation_report is None:
+                raise WorkspaceError(
+                    "--accept-external-change requires --validation-report"
+                )
+            external_validation = _read_external_validation_report(
+                validation_report,
+                project_root=project_root,
+                previous_state_hash=str(work["base_state_hash"]),
+                validated_state_hash=state_hash,
             )
+            if project_state_hash(project_root) != state_hash:
+                raise WorkspaceError(
+                    "Project changed while the external validation report was read"
+                )
+        elif matched_hash != state_hash:
+            raise WorkspaceError("Unable to reconcile the project base hash")
+        now = utc_now()
+        connection.execute(
+            "UPDATE works SET base_state_hash = ?, updated_at = ? WHERE work_id = ?",
+            (state_hash, now, work["work_id"]),
+        )
+        updated_work = work_row(connection, work["work_id"])
+        projection_extra = {
+            "last_base_refresh": {
+                "validation_reference": reference,
+                "refreshed_at": now,
+                "validation_result": (
+                    "external_change_accepted"
+                    if external_validation is not None
+                    else "validated_external_state"
+                ),
+            }
+        }
+        if external_validation is not None:
+            record_lease_event(
+                connection,
+                project_id=work["project_id"],
+                previous_work_id=owner["work_id"],
+                event="external_change_accepted",
+                reason=reference,
+                actor_work_id=work["work_id"],
+                previous_expires_at=owner["expires_at"],
+                current_state_hash=state_hash,
+                previous_state_hash=str(work["base_state_hash"]),
+                validated_state_hash=state_hash,
+                validation_result="pass",
+                validation_reference=external_validation["reference"],
+            )
+        connection.commit()
+        _reconcile_work_file(connection, updated_work, extra=projection_extra)
         return {
             "status": "refreshed",
             "work_id": work["work_id"],
             "project_id": work["project_id"],
             "base_state_hash": state_hash,
             "validation_reference": reference,
+            "external_change_accepted": external_validation is not None,
+            "validation_report": external_validation,
         }
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -1643,7 +2347,7 @@ def release_lock(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
             "current_state_hash": current_hash,
             "state_hash_error": hash_error,
         }
-    except Exception:
+    except BaseException:
         if connection.in_transaction:
             connection.rollback()
         raise
@@ -1717,7 +2421,7 @@ def break_lock(
             "current_state_hash": current_hash,
             "state_hash_error": hash_error,
         }
-    except Exception:
+    except BaseException:
         if connection.in_transaction:
             connection.rollback()
         raise
@@ -1729,27 +2433,32 @@ def close_work(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
     root = require_workspace(raw_workspace)
     connection = open_registry(root)
     try:
+        # The lease check and status transition must be one serialized
+        # operation; checking before BEGIN IMMEDIATE leaves a window in which
+        # another worker can acquire the lease before this work is closed.
+        connection.execute("BEGIN IMMEDIATE")
         work = work_row(connection, work_id)
         if work["project_id"] is not None:
             owner = lease_owner(connection, work["project_id"])
             if owner is not None and owner["work_id"] == work["work_id"]:
                 raise WorkspaceError("Release the project write lock before closing work")
         now = utc_now()
-        context_path = Path(work["work_root"]) / "work.json"
-        context = read_json(context_path)
-        context["status"] = "closed"
-        context["updated_at"] = now
-        atomic_write_json(context_path, context)
-        with connection:
-            connection.execute(
-                "UPDATE works SET status = 'closed', updated_at = ? WHERE work_id = ?",
-                (now, work["work_id"]),
-            )
+        connection.execute(
+            "UPDATE works SET status = 'closed', updated_at = ? WHERE work_id = ?",
+            (now, work["work_id"]),
+        )
+        updated_work = work_row(connection, work["work_id"])
+        connection.commit()
+        _reconcile_work_file(connection, updated_work)
         return {
             "status": "closed",
             "work_id": work["work_id"],
             "work_root": work["work_root"],
         }
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -1812,9 +2521,12 @@ def open_read_only_registry(registry: Path) -> sqlite3.Connection:
     without permitting SQL writes.
     """
 
+    _assert_path_chain_no_links(registry, label="Registry path")
     registry = Path(registry).expanduser().resolve()
     wal_path = Path(f"{registry}-wal")
     shm_path = Path(f"{registry}-shm")
+    if _link_like(wal_path) or _link_like(shm_path):
+        raise WorkspaceError("Registry WAL/SHM sidecar cannot be a link or reparse point")
     query = "mode=ro"
     if not wal_path.exists() and not shm_path.exists():
         query += "&immutable=1"
@@ -2237,6 +2949,12 @@ def build_parser() -> argparse.ArgumentParser:
     work_resume.add_argument("workspace")
     work_resume.add_argument("work_id")
 
+    work_reconcile = subparsers.add_parser(
+        "work-reconcile", help="Repair work.json from the SQLite registry."
+    )
+    work_reconcile.add_argument("workspace")
+    work_reconcile.add_argument("work_id")
+
     work_list_parser = subparsers.add_parser(
         "work-list", help="List known work contexts."
     )
@@ -2277,6 +2995,15 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("workspace")
     refresh.add_argument("work_id")
     refresh.add_argument("--validation-reference", required=True)
+    refresh.add_argument(
+        "--accept-external-change",
+        action="store_true",
+        help="Accept a changed project only with a verified validation report.",
+    )
+    refresh.add_argument(
+        "--validation-report",
+        help="JSON report containing previous/current hashes and result=pass.",
+    )
 
     lock_release = subparsers.add_parser(
         "lock-release", help="Release a project write lease owned by this work."
@@ -2344,6 +3071,8 @@ def main() -> int:
             return bind_work(args.workspace, args.work_id, args.project_id)
         if args.command == "work-resume":
             return resume_work(args.workspace, args.work_id)
+        if args.command == "work-reconcile":
+            return reconcile_work(args.workspace, args.work_id)
         if args.command == "work-list":
             return work_list(args.workspace, active_only=args.active_only)
         if args.command == "work-close":
@@ -2360,7 +3089,11 @@ def main() -> int:
             return write_check(args.workspace, args.work_id)
         if args.command == "base-refresh":
             return refresh_base(
-                args.workspace, args.work_id, args.validation_reference
+                args.workspace,
+                args.work_id,
+                args.validation_reference,
+                accept_external_change=args.accept_external_change,
+                validation_report=args.validation_report,
             )
         if args.command == "lock-break":
             return break_lock(
@@ -2369,7 +3102,9 @@ def main() -> int:
                 expected_owner=args.expected_owner,
                 reason=args.reason,
             )
-        return release_lock(args.workspace, args.work_id)
+        if args.command == "lock-release":
+            return release_lock(args.workspace, args.work_id)
+        raise WorkspaceError(f"Unsupported command: {args.command}")
 
     return novel_cli.run_cli(
         build_parser,

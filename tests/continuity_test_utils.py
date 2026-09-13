@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable
 
 import novel_continuity
+import novel_workspace
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -29,75 +32,142 @@ def evidence_quote(path: Path) -> str:
     raise AssertionError(f"Test evidence source is empty: {path}")
 
 
-def seal_full_baseline(root: Path, reviewer_id: str = "test-independent-baseline") -> dict[str, Any]:
+def refresh_fixture_base(
+    root: Path,
+    workspace: Path | None,
+    work_id: str | None,
+    *,
+    reference: str = "unit test fixture validated external seed",
+) -> None:
+    """Accept direct fixture edits through the production validation receipt path."""
+
+    if workspace is None or work_id is None:
+        return
+    connection = novel_workspace.open_registry(workspace)
+    try:
+        work = novel_workspace.work_row(connection, work_id)
+        project = novel_workspace.project_row(connection, work["project_id"])
+        project_root = Path(project["project_root"]).resolve()
+        if project_root != root.resolve():
+            raise AssertionError("fixture work does not belong to the requested project")
+        previous = str(work["base_state_hash"])
+    finally:
+        connection.close()
+    current = novel_workspace.project_state_hash(root)
+    if current == previous:
+        return
+    report_path = root.parent / f".fixture-validation-{uuid.uuid4().hex}.json"
+    write_json(
+        report_path,
+        {
+            "schema_version": 1,
+            "project_root": str(root.resolve()),
+            "previous_state_hash": previous,
+            "validated_state_hash": current,
+            "result": "pass",
+            "validation_reference": reference,
+            "checked_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        },
+    )
+    try:
+        novel_workspace.refresh_base(
+            workspace,
+            work_id,
+            reference,
+            accept_external_change=True,
+            validation_report=report_path,
+        )
+    finally:
+        report_path.unlink(missing_ok=True)
+
+
+def seal_full_baseline(
+    root: Path,
+    reviewer_id: str = "test-independent-baseline",
+    *,
+    workspace: Path | None = None,
+    work_id: str | None = None,
+) -> dict[str, Any]:
     """Seal directly seeded fixture chapters through the production baseline path."""
-    novel_continuity.install_project(root)
+    bootstrap = workspace is None and work_id is None
+    refresh_fixture_base(root, workspace, work_id)
+    novel_continuity.install_project(
+        root,
+        workspace=workspace,
+        work_id=work_id,
+        allow_bootstrap=bootstrap,
+    )
     packet = novel_continuity.build_baseline_packet(root)
     token = uuid.uuid4().hex
-    packet_path = root / "staging/test-continuity" / f"packet-{token}.json"
-    report_path = root / "staging/test-continuity" / f"report-{token}.json"
-    write_json(packet_path, packet)
-    report = novel_continuity.baseline_report_template(
-        packet, novel_continuity.sha256_file(packet_path)
-    )
-    through = int(packet["chapter_through"])
-    facts: list[dict[str, Any]] = []
-    dependencies: dict[str, Any] = {}
-    for number, relative in novel_continuity.chapter_paths(root, through):
-        quote = evidence_quote(root / relative)
-        fact_id = f"F-CHAPTER-{number:04d}"
-        facts.append(
+    with tempfile.TemporaryDirectory(dir=root.parent) as external_dir:
+        external = Path(external_dir)
+        packet_path = external / f"packet-{token}.json"
+        report_path = external / f"report-{token}.json"
+        write_json(packet_path, packet)
+        report = novel_continuity.baseline_report_template(
+            packet, novel_continuity.sha256_file(packet_path)
+        )
+        through = int(packet["chapter_through"])
+        facts: list[dict[str, Any]] = []
+        dependencies: dict[str, Any] = {}
+        for number, relative in novel_continuity.chapter_paths(root, through):
+            quote = evidence_quote(root / relative)
+            fact_id = f"F-CHAPTER-{number:04d}"
+            facts.append(
+                {
+                    "schema_version": 1,
+                    "fact_id": fact_id,
+                    "category": "canon_truth",
+                    "subject": f"第{number:04d}章",
+                    "predicate": "正文事件已发生",
+                    "object": quote,
+                    "status": "active",
+                    "significance": "normal",
+                    "valid_from_chapter": number,
+                    "source": {
+                        "path": relative,
+                        "location": "首个非空行",
+                        "quote": quote,
+                    },
+                }
+            )
+            dependencies[f"{number:04d}"] = {
+                "fact_ids": [fact_id],
+                "depends_on_chapters": ([number - 1] if number > 1 else []),
+                "evidence_paths": [relative],
+                "risk_triggers": [],
+            }
+        report.update(
             {
-                "schema_version": 1,
-                "fact_id": fact_id,
-                "category": "canon_truth",
-                "subject": f"第{number:04d}章",
-                "predicate": "正文事件已发生",
-                "object": quote,
-                "status": "active",
-                "significance": "normal",
-                "valid_from_chapter": number,
-                "source": {
-                    "path": relative,
-                    "location": "首个非空行",
-                    "quote": quote,
+                "status": "complete",
+                "reviewed_chapters": list(range(1, through + 1)),
+                "reviewer": {
+                    "mode": "independent" if through else "deterministic",
+                    "reviewer_id": reviewer_id,
+                    "independent_context": bool(through),
                 },
+                "decision": "pass",
+                "summary": "单元测试已逐章核对连续性并建立稳定事实基线。",
+                "findings": [],
+                "residual_risks": [],
+                "facts": facts,
+                "intentional_exceptions": [],
+                "chapter_dependencies": dependencies,
+                "reviewed_at": "2026-09-02T00:00:00+00:00",
             }
         )
-        dependencies[f"{number:04d}"] = {
-            "fact_ids": [fact_id],
-            "depends_on_chapters": ([number - 1] if number > 1 else []),
-            "evidence_paths": [relative],
-            "risk_triggers": [],
-        }
-    report.update(
-        {
-            "status": "complete",
-            "reviewed_chapters": list(range(1, through + 1)),
-            "reviewer": {
-                "mode": "independent" if through else "deterministic",
-                "reviewer_id": reviewer_id,
-                "independent_context": bool(through),
-            },
-            "decision": "pass",
-            "summary": "单元测试已逐章核对连续性并建立稳定事实基线。",
-            "findings": [],
-            "residual_risks": [],
-            "facts": facts,
-            "intentional_exceptions": [],
-            "chapter_dependencies": dependencies,
-            "reviewed_at": "2026-09-02T00:00:00+00:00",
-        }
-    )
-    write_json(report_path, report)
-    return novel_continuity.record_baseline(
-        SimpleNamespace(
-            root=str(root),
-            packet=str(packet_path),
-            report=str(report_path),
-            authorization_reference="unit test fixture continuity baseline",
+        write_json(report_path, report)
+        return novel_continuity.record_baseline(
+            SimpleNamespace(
+                root=str(root),
+                packet=str(packet_path),
+                report=str(report_path),
+                authorization_reference="unit test fixture continuity baseline",
+                workspace=str(workspace) if workspace is not None else None,
+                work_id=work_id,
+                allow_bootstrap=bootstrap,
+            )
         )
-    )
 
 
 def complete_staged_continuity(
@@ -108,6 +178,8 @@ def complete_staged_continuity(
     chapter_class: str = "normal",
     reviewer_id: str = "test-continuity-reviewer",
     fact_changes: Iterable[dict[str, Any]] = (),
+    workspace: Path | None = None,
+    work_id: str | None = None,
 ) -> None:
     """Complete a hash-bound passing continuity package for commit tests."""
     commit = read_json(package / "commit.json")
@@ -115,12 +187,15 @@ def complete_staged_continuity(
     context_path = package / str(
         commit.get("continuity_context_file", "continuity-context.json")
     )
-    novel_continuity.prepare_context(
-        SimpleNamespace(
-            root=str(root), chapter=chapter_number, output=str(context_path)
+    with tempfile.TemporaryDirectory() as context_temp:
+        prepared_context = Path(context_temp) / "continuity-context.json"
+        novel_continuity.prepare_context(
+            SimpleNamespace(
+                root=str(root), chapter=chapter_number, output=str(prepared_context)
+            )
         )
-    )
-    context = read_json(context_path)
+        context = read_json(prepared_context)
+    write_json(context_path, context)
     candidate = package / str(commit.get("chapter_file", "chapter.md"))
     humanization_source = package / "chapter-before-humanizer.md"
     humanization_source.write_bytes(candidate.read_bytes())
@@ -211,8 +286,15 @@ def complete_staged_continuity(
         context["author_confirmation_reference"] = "unit test author confirmation"
     write_json(context_path, context)
 
+    bootstrap = workspace is None and work_id is None
     novel_continuity.prepare_audit(
-        SimpleNamespace(root=str(root), package=str(package))
+        SimpleNamespace(
+            root=str(root),
+            package=str(package),
+            workspace=str(workspace) if workspace is not None else None,
+            work_id=work_id,
+            allow_bootstrap=bootstrap,
+        )
     )
     delta_path = package / str(commit.get("state_delta_file", "state-delta.json"))
     delta = read_json(delta_path)
@@ -237,7 +319,13 @@ def complete_staged_continuity(
     )
     write_json(delta_path, delta)
     novel_continuity.bind_audit(
-        SimpleNamespace(root=str(root), package=str(package))
+        SimpleNamespace(
+            root=str(root),
+            package=str(package),
+            workspace=str(workspace) if workspace is not None else None,
+            work_id=work_id,
+            allow_bootstrap=bootstrap,
+        )
     )
 
     audit_path = package / str(

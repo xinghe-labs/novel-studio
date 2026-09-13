@@ -9,13 +9,18 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(SKILL_ROOT / "tests"))
 
 import novel_workspace  # noqa: E402
+import novel_project  # noqa: E402
+from continuity_test_utils import refresh_fixture_base  # noqa: E402
 
 
 class WorkspaceIsolationTests(unittest.TestCase):
@@ -260,6 +265,12 @@ class WorkspaceIsolationTests(unittest.TestCase):
         )
         with self.assertRaises(novel_workspace.WorkspaceError):
             novel_workspace.write_check(self.workspace, work["work_id"])
+        refresh_fixture_base(
+            project_root,
+            self.workspace,
+            work["work_id"],
+            reference="test external change reviewed",
+        )
         refreshed = novel_workspace.refresh_base(
             self.workspace,
             work["work_id"],
@@ -300,6 +311,48 @@ class WorkspaceIsolationTests(unittest.TestCase):
         self.assertEqual(
             (project_root / ".novel-project.json").read_bytes(), before_metadata
         )
+
+    def test_registration_interrupt_after_metadata_replace_restores_metadata_and_registry(self) -> None:
+        novel_workspace.initialize_workspace(self.workspace)
+        project_root = self.workspace / "projects" / "interrupted-register"
+        created = novel_project.init_project(
+            SimpleNamespace(
+                root=str(project_root),
+                title="中断登记测试",
+                language="zh-CN",
+                genre="悬疑",
+            )
+        )
+        self.assertEqual(created["status"], "created")
+        metadata = project_root / ".novel-project.json"
+        self.assertFalse(metadata.exists())
+        real_atomic_write = novel_workspace.atomic_write_bytes
+        calls = {"count": 0}
+
+        def write_then_interrupt(path: Path, content: bytes) -> None:
+            calls["count"] += 1
+            real_atomic_write(path, content)
+            if calls["count"] == 1:
+                raise KeyboardInterrupt()
+
+        with mock.patch.object(
+            novel_workspace, "atomic_write_bytes", side_effect=write_then_interrupt
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                novel_workspace.register_project(
+                    self.workspace, project_root, project_id="interrupted-register"
+                )
+
+        self.assertFalse(metadata.exists())
+        connection = sqlite3.connect(self.workspace / "registry.sqlite3")
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM projects WHERE project_id = ?",
+                ("interrupted-register",),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNone(row)
 
     def test_state_hash_ignores_rebuildable_exports(self) -> None:
         project = self.create_project()
@@ -356,7 +409,7 @@ class WorkspaceIsolationTests(unittest.TestCase):
         )
         novel_workspace.release_lock(self.workspace, work["work_id"])
 
-    def test_work_json_cannot_overwrite_live_registry_state(self) -> None:
+    def test_work_json_is_repaired_from_live_registry_state(self) -> None:
         project = self.create_project()
         work = novel_workspace.create_work(
             self.workspace, project_id=project["project_id"]
@@ -370,8 +423,10 @@ class WorkspaceIsolationTests(unittest.TestCase):
             newline="\n",
         )
         novel_workspace.workspace_status(self.workspace)
-        with self.assertRaises(novel_workspace.WorkspaceError):
-            novel_workspace.resume_work(self.workspace, work["work_id"])
+        resumed = novel_workspace.resume_work(self.workspace, work["work_id"])
+        self.assertTrue(resumed["reconciled"])
+        repaired = json.loads(context_path.read_text(encoding="utf-8"))
+        self.assertEqual(repaired["base_state_hash"], work["base_state_hash"])
 
     def test_close_work_requires_release_and_persists_closed_state(self) -> None:
         project = self.create_project("novel-close")

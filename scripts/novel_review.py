@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
-import os
 import re
+import os
+import stat
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,28 @@ class ReviewError(RuntimeError):
     pass
 
 
+def project_write_context(root: Path, args: argparse.Namespace):
+    try:
+        import novel_workspace
+
+        @contextlib.contextmanager
+        def _context():
+            try:
+                with novel_workspace.project_write_context(
+                    root,
+                    workspace=getattr(args, "workspace", None),
+                    work_id=getattr(args, "work_id", None),
+                    allow_bootstrap=bool(getattr(args, "allow_bootstrap", False)),
+                ) as context:
+                    yield context
+            except novel_workspace.WorkspaceError as exc:
+                raise ReviewError(str(exc)) from exc
+
+        return _context()
+    except (ImportError, OSError) as exc:
+        raise ReviewError(f"Project write authorization module unavailable: {exc}") from exc
+
+
 def work_type_for_manifest(manifest: dict[str, Any]) -> str:
     work_type = manifest.get("work_type", "serial_novel")
     if work_type not in {"serial_novel", "short_story"}:
@@ -88,7 +111,12 @@ def utc_now() -> str:
 
 
 def resolve_root(raw_root: str | Path) -> Path:
-    root = Path(raw_root).expanduser().resolve()
+    raw = Path(raw_root).expanduser()
+    if _path_chain_has_link(raw):
+        raise ReviewError(
+            f"Project path cannot traverse a symbolic link or reparse point: {raw}"
+        )
+    root = raw.resolve()
     anchor = Path(root.anchor).resolve()
     home = Path.home().resolve()
     if root == anchor:
@@ -102,10 +130,10 @@ def resolve_root(raw_root: str | Path) -> Path:
 
 def read_json(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(_read_stable_bytes(path, label="JSON input").decode("utf-8"))
     except FileNotFoundError as exc:
         raise ReviewError(f"Missing file: {path}") from exc
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReviewError(f"Invalid JSON in {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ReviewError(f"Expected a JSON object in {path}")
@@ -117,42 +145,174 @@ def dump_json(data: dict[str, Any]) -> str:
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        newline="\n",
-        delete=False,
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temp_path = Path(handle.name)
-    try:
-        with handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    finally:
-        temp_path.unlink(missing_ok=True)
+    return hashlib.sha256(_read_stable_bytes(path, label="review source")).hexdigest()
 
 
 def write_new_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with path.open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(dump_json(data))
+        novel_cli.atomic_create_text(path, dump_json(data))
     except FileExistsError as exc:
         raise ReviewError(f"Refusing to overwrite an existing file: {path}") from exc
+
+
+def _link_like(path: Path) -> bool:
+    """Detect symbolic links, junctions, and Windows reparse points."""
+
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if is_junction and is_junction():
+            return True
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _path_chain_has_link(path: Path) -> bool:
+    current = Path(path).expanduser()
+    if not current.is_absolute():
+        current = Path.cwd() / current
+    while True:
+        if _link_like(current):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _read_stable_bytes(path: Path, *, label: str) -> bytes:
+    raw = Path(path).expanduser()
+    if _path_chain_has_link(raw):
+        raise ReviewError(
+            f"{label} cannot traverse a symbolic link or reparse point: {raw}"
+        )
+    try:
+        with raw.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            content = handle.read()
+            after = os.fstat(handle.fileno())
+        current = raw.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ReviewError(f"Unable to read {label}: {raw}: {exc}") from exc
+    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    current_identity = (
+        current.st_dev,
+        current.st_ino,
+        current.st_size,
+        current.st_mtime_ns,
+    )
+    if before_identity != after_identity or after_identity != current_identity:
+        raise ReviewError(f"{label} changed while being read: {raw}")
+    return content
+
+
+def _external_review_input(
+    raw_path: str | Path,
+    *,
+    project_root: Path,
+    label: str,
+) -> tuple[Path, bytes]:
+    raw = Path(raw_path).expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    if _path_chain_has_link(raw):
+        raise ReviewError(
+            f"{label} cannot traverse a symbolic link or reparse point: {raw}"
+        )
+    path = raw.resolve()
+    if path == project_root or project_root in path.parents:
+        raise ReviewError(f"{label} must be stored outside the project tree")
+    if not path.is_file():
+        raise ReviewError(f"{label} is not a regular file: {path}")
+    return path, _read_stable_bytes(path, label=label)
+
+
+def _json_object_from_bytes(content: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewError(f"{label} must be valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ReviewError(f"{label} must be a JSON object")
+    return value
+
+
+def safe_external_output(raw: str | Path, project_root: Path) -> Path:
+    """Resolve a new preparation output outside the canonical project tree."""
+
+    raw_path = Path(raw).expanduser()
+    if not raw_path.is_absolute():
+        raw_path = Path.cwd() / raw_path
+    if _path_chain_has_link(raw_path):
+        raise ReviewError(
+            f"Preparation output cannot traverse a symbolic link or reparse point: {raw_path}"
+        )
+    path = raw_path.resolve()
+    if path == project_root or project_root in path.parents:
+        raise ReviewError(
+            "Review preparation output must be outside the project tree; use the current work-root"
+        )
+    if path.exists():
+        raise ReviewError(f"Refusing to overwrite an existing file: {path}")
+    return path
+
+
+def write_external_pair(
+    first: Path, first_data: dict[str, Any], second: Path, second_data: dict[str, Any]
+) -> None:
+    """Create two external JSON files and clean up only files created here on failure."""
+
+    if first.resolve() == second.resolve():
+        raise ReviewError("Review packet and report outputs must be different files")
+    items = (
+        (first, dump_json(first_data).encode("utf-8")),
+        (second, dump_json(second_data).encode("utf-8")),
+    )
+    for path, _ in items:
+        if _path_chain_has_link(path):
+            raise ReviewError(
+                f"Preparation output cannot traverse a symbolic link or reparse point: {path}"
+            )
+        if path.exists():
+            raise ReviewError(f"Refusing to overwrite an existing file: {path}")
+
+    created: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        for path, content in items:
+            try:
+                identity = novel_cli.atomic_create_bytes(path, content)
+            except FileExistsError as exc:
+                raise ReviewError(
+                    f"Refusing to overwrite an existing file: {path}"
+                ) from exc
+            created.append((path, identity))
+    except BaseException as exc:
+        cleanup_errors: list[str] = []
+        for path, identity in reversed(created):
+            try:
+                current = path.stat(follow_symlinks=False)
+                if _link_like(path) or not path.is_file():
+                    cleanup_errors.append(f"owned output changed type: {path}")
+                elif (current.st_dev, current.st_ino) != identity:
+                    cleanup_errors.append(f"owned output was replaced concurrently: {path}")
+                else:
+                    path.unlink()
+            except FileNotFoundError:
+                continue
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(f"{path}: {cleanup_exc}")
+        if cleanup_errors:
+            raise ReviewError(
+                "Review preparation failed and partial-output cleanup requires "
+                "manual reconciliation: " + "; ".join(cleanup_errors)
+            ) from exc
+        raise
 
 
 def clean_reference(value: str) -> str:
@@ -239,12 +399,11 @@ def chapter_map(root: Path, through: int | None = None) -> dict[int, Path]:
 
 
 def source_entry(root: Path, path: Path, kind: str) -> dict[str, str]:
-    if not path.is_file():
-        raise ReviewError(f"Review source is missing: {path}")
+    content = _read_stable_bytes(path, label="review source")
     return {
         "path": path.relative_to(root).as_posix(),
         "kind": kind,
-        "sha256": sha256_file(path),
+        "sha256": hashlib.sha256(content).hexdigest(),
     }
 
 
@@ -275,6 +434,91 @@ def build_source_snapshot(root: Path, through: int) -> list[dict[str, str]]:
     return sorted(snapshot, key=lambda item: (item["kind"], item["path"]))
 
 
+def _expected_reading_scope(
+    snapshot: list[dict[str, str]], chapter_from: int, through: int
+) -> dict[str, Any]:
+    """Build the non-editable reading scope represented by a review packet."""
+
+    return {
+        "full_text_primary": [
+            entry["path"]
+            for entry in snapshot
+            if entry["kind"] == "chapter"
+            and chapter_from <= int(Path(entry["path"]).name[:4]) <= through
+        ],
+        "chapter_memory_global": [
+            entry["path"] for entry in snapshot if entry["kind"] == "chapter_memory"
+        ],
+        "stable_context": [
+            entry["path"] for entry in snapshot if entry["kind"] == "context"
+        ],
+        "targeted_older_full_text": (
+            "Read any older chapter whose facts are implicated by a possible "
+            "conflict; memory cards alone cannot prove a finding."
+        ),
+    }
+
+
+def _validate_review_packet_scope(
+    root: Path,
+    packet: dict[str, Any],
+    identity: dict[str, str],
+    manifest: dict[str, Any],
+) -> list[str]:
+    """Reject packets that silently narrow the files or dimensions being reviewed."""
+
+    errors: list[str] = []
+    through = packet.get("chapter_through")
+    chapter_from = packet.get("chapter_from")
+    if (
+        not isinstance(through, int)
+        or isinstance(through, bool)
+        or not isinstance(chapter_from, int)
+        or isinstance(chapter_from, bool)
+        or chapter_from < 1
+        or through < chapter_from
+    ):
+        return ["Review packet has an invalid chapter range"]
+    status = review_status(root)
+    if through > status["current_chapter"]:
+        return ["Review packet chapter_through exceeds current_chapter"]
+    expected_from = (
+        1 if identity["mode"] == "completion" else status["last_passed_through"] + 1
+    )
+    if expected_from > through and identity["mode"] != "completion":
+        expected_from = max(1, through - status["policy"]["interval_chapters"] + 1)
+    if chapter_from != expected_from:
+        errors.append("Review packet chapter_from does not match the current review scope")
+    if packet.get("project_title") != status["title"]:
+        errors.append("Review packet project_title does not match the current project")
+    try:
+        expected_snapshot = build_source_snapshot(root, through)
+    except ReviewError as exc:
+        return [str(exc)]
+    if packet.get("source_snapshot") != expected_snapshot:
+        errors.append(
+            "Review packet source_snapshot must exactly cover the current review sources"
+        )
+    if packet.get("review_dimensions") != list(REQUIRED_DIMENSIONS):
+        errors.append("Review packet must cover exactly the independent quality dimensions")
+    if packet.get("review_domain") != "quality":
+        errors.append("Review packet review_domain must be quality")
+    if packet.get("continuity_review_separate") is not True:
+        errors.append("Review packet must declare continuity_review_separate=true")
+    if packet.get("global_context_through") != through:
+        errors.append("Review packet global_context_through must equal chapter_through")
+    if packet.get("policy") != policy_for_manifest(manifest):
+        errors.append("Review packet policy is stale; prepare a new packet")
+    expected_scope = _expected_reading_scope(expected_snapshot, chapter_from, through)
+    if packet.get("reading_scope") != expected_scope:
+        errors.append("Review packet reading_scope must exactly cover its source snapshot")
+    if identity["mode"] == "completion" and packet.get("review_mode") != identity["mode"]:
+        errors.append("Review packet mode does not match the project work type")
+    if identity["mode"] == "periodic" and "review_mode" in packet:
+        errors.append("Periodic review packet must not contain review_mode")
+    return errors
+
+
 def validate_snapshot_current(root: Path, snapshot: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(snapshot, list) or not snapshot:
@@ -288,7 +532,11 @@ def validate_snapshot_current(root: Path, snapshot: Any) -> list[str]:
         if not isinstance(relative, str) or not relative:
             errors.append("source_snapshot entry has an invalid path")
             continue
-        path = (root / relative).resolve()
+        raw_path = root / relative
+        if _path_chain_has_link(raw_path):
+            errors.append(f"source_snapshot path traverses a link: {relative}")
+            continue
+        path = raw_path.resolve()
         try:
             path.relative_to(root)
         except ValueError:
@@ -297,7 +545,12 @@ def validate_snapshot_current(root: Path, snapshot: Any) -> list[str]:
         if not path.is_file():
             errors.append(f"review source is missing: {relative}")
             continue
-        if not isinstance(expected_hash, str) or sha256_file(path) != expected_hash:
+        try:
+            actual_hash = sha256_file(path)
+        except ReviewError as exc:
+            errors.append(str(exc))
+            continue
+        if not isinstance(expected_hash, str) or actual_hash != expected_hash:
             errors.append(f"review source changed after preparation: {relative}")
     return errors
 
@@ -581,15 +834,15 @@ def prepare_review(args: argparse.Namespace) -> dict[str, Any]:
     }
     if identity["mode"] == "completion":
         packet["review_mode"] = identity["mode"]
-    output = Path(args.output).expanduser().resolve()
-    write_new_json(output, packet)
-    packet_hash = sha256_file(output)
+    output = safe_external_output(args.output, root)
 
     report_output = (
-        Path(args.report_output).expanduser().resolve()
+        safe_external_output(args.report_output, root)
         if args.report_output
-        else output.with_name(output.stem + "-report.json")
+        else safe_external_output(output.with_name(output.stem + "-report.json"), root)
     )
+    packet_bytes = dump_json(packet).encode("utf-8")
+    packet_hash = hashlib.sha256(packet_bytes).hexdigest()
     report_template = {
         "schema_version": SCHEMA_VERSION,
         "report_kind": identity["report_kind"],
@@ -615,7 +868,7 @@ def prepare_review(args: argparse.Namespace) -> dict[str, Any]:
     }
     if identity["mode"] == "completion":
         report_template["review_mode"] = identity["mode"]
-    write_new_json(report_output, report_template)
+    write_external_pair(output, packet, report_output, report_template)
     result = {
         "status": "prepared",
         "project_root": str(root),
@@ -671,21 +924,31 @@ def expected_decision(findings: list[dict[str, Any]]) -> str:
     return "pass"
 
 
-def record_review(args: argparse.Namespace) -> dict[str, Any]:
-    root = resolve_root(args.root)
+def _record_review(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     manifest = read_json(root / "novel.json")
     identity = review_identity(manifest)
-    packet_path = Path(args.packet).expanduser().resolve()
-    report_path = Path(args.report).expanduser().resolve()
-    packet = read_json(packet_path)
-    report = read_json(report_path)
+    packet_path, packet_bytes = _external_review_input(
+        args.packet, project_root=root, label="Review packet"
+    )
+    report_path, report_bytes = _external_review_input(
+        args.report, project_root=root, label="Review report"
+    )
+    if packet_path == report_path:
+        raise ReviewError("Review packet and report must be different files")
+    packet = _json_object_from_bytes(packet_bytes, label="Review packet")
+    report = _json_object_from_bytes(report_bytes, label="Review report")
     if packet.get("schema_version") != SCHEMA_VERSION:
         raise ReviewError("Review packet has an unsupported schema_version")
     if packet.get("packet_kind") != identity["packet_kind"]:
         raise ReviewError("Unexpected review packet kind")
     if Path(str(packet.get("project_root", ""))).resolve() != root:
         raise ReviewError("Review packet belongs to a different project")
-    packet_hash = sha256_file(packet_path)
+    packet_scope_errors = _validate_review_packet_scope(
+        root, packet, identity, manifest
+    )
+    if packet_scope_errors:
+        raise ReviewError("; ".join(packet_scope_errors))
+    packet_hash = hashlib.sha256(packet_bytes).hexdigest()
     if report.get("packet_sha256") != packet_hash:
         raise ReviewError("Report does not reference the current review packet hash")
     if report.get("schema_version") != SCHEMA_VERSION:
@@ -778,7 +1041,24 @@ def record_review(args: argparse.Namespace) -> dict[str, Any]:
             f"{int(report['chapter_through']):04d}-{stamp}-{digest}.json"
         )
     )
-    write_new_json(target, recorded)
+    try:
+        import novel_project
+
+        novel_project.transactional_write(
+            [(target, dump_json(recorded).encode("utf-8"))],
+            journal_root=root,
+            expected_existing={
+                packet_path: hashlib.sha256(packet_bytes).hexdigest(),
+                report_path: hashlib.sha256(report_bytes).hexdigest(),
+                **{
+                    root / entry["path"]: entry["sha256"]
+                    for entry in packet["source_snapshot"]
+                },
+            },
+            expected_targets={target: None},
+        )
+    except Exception as exc:
+        raise ReviewError(str(exc)) from exc
     status = review_status(root)
     result = {
         "status": "recorded",
@@ -792,8 +1072,16 @@ def record_review(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def configure_policy(args: argparse.Namespace) -> dict[str, Any]:
+def record_review(args: argparse.Namespace) -> dict[str, Any]:
     root = resolve_root(args.root)
+    with project_write_context(root, args) as context:
+        result = _record_review(args, root)
+        context.assert_live()
+        context.refresh_base_after_write("quality review record")
+        return result
+
+
+def _configure_policy(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     manifest_path = root / "novel.json"
     manifest = read_json(manifest_path)
     work_type = work_type_for_manifest(manifest)
@@ -825,7 +1113,14 @@ def configure_policy(args: argparse.Namespace) -> dict[str, Any]:
         "block_next_commit": block,
     }
     updated["updated_at"] = utc_now()
-    atomic_write_text(manifest_path, dump_json(updated))
+    try:
+        import novel_project
+
+        novel_project.transactional_write(
+            [(manifest_path, dump_json(updated).encode("utf-8"))], journal_root=root
+        )
+    except Exception as exc:
+        raise ReviewError(str(exc)) from exc
     return {
         "status": "configured",
         "project_root": str(root),
@@ -833,6 +1128,15 @@ def configure_policy(args: argparse.Namespace) -> dict[str, Any]:
         "after": policy_for_manifest(updated),
         "authorization_reference": authorization,
     }
+
+
+def configure_policy(args: argparse.Namespace) -> dict[str, Any]:
+    root = resolve_root(args.root)
+    with project_write_context(root, args) as context:
+        result = _configure_policy(args, root)
+        context.assert_live()
+        context.refresh_base_after_write("quality review policy update")
+        return result
 
 
 def collect_review_validation(root: str | Path) -> tuple[list[str], list[str]]:
@@ -890,6 +1194,9 @@ def build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument("--packet", required=True, help="Prepared packet JSON.")
     record_parser.add_argument("--report", required=True, help="Completed report JSON.")
     record_parser.add_argument("--authorization-reference", required=True)
+    record_parser.add_argument("--workspace")
+    record_parser.add_argument("--work-id")
+    record_parser.add_argument("--allow-bootstrap", action="store_true")
 
     configure_parser = subparsers.add_parser(
         "configure", help="Configure the per-project review interval and gate."
@@ -901,6 +1208,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--block-next-commit", choices=("true", "false")
     )
     configure_parser.add_argument("--authorization-reference", required=True)
+    configure_parser.add_argument("--workspace")
+    configure_parser.add_argument("--work-id")
+    configure_parser.add_argument("--allow-bootstrap", action="store_true")
     return parser
 
 
@@ -912,7 +1222,9 @@ def main() -> int:
             return prepare_review(args)
         if args.command == "record":
             return record_review(args)
-        return configure_policy(args)
+        if args.command == "configure":
+            return configure_policy(args)
+        raise ReviewError(f"Unsupported command: {args.command}")
 
     return novel_cli.run_cli(
         build_parser,

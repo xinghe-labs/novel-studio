@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import hashlib
 import json
 import os
 import re
+import stat
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -118,6 +119,48 @@ class ContinuityError(RuntimeError):
     pass
 
 
+def project_write_context(
+    root: Path,
+    args: argparse.Namespace | None = None,
+    *,
+    allow_bootstrap: bool = False,
+):
+    """Return the shared project-write authorization context.
+
+    ``allow_bootstrap`` is intentionally explicit and is only used while a
+    project is being initialized before it has a registry/lease row.  Keeping
+    it on this adapter (rather than silently inferring it from ``args``)
+    ensures callers cannot accidentally turn a registered-project mutation
+    into an unauthenticated write.
+    """
+    try:
+        import novel_workspace
+
+        allow_bootstrap = bool(
+            allow_bootstrap
+            or (args is not None and getattr(args, "allow_bootstrap", False))
+        )
+
+        @contextlib.contextmanager
+        def _context():
+            try:
+                with novel_workspace.project_write_context(
+                    root,
+                    workspace=getattr(args, "workspace", None) if args is not None else None,
+                    work_id=getattr(args, "work_id", None) if args is not None else None,
+                    allow_bootstrap=allow_bootstrap,
+                ) as context:
+                    yield context
+            except novel_workspace.WorkspaceError as exc:
+                raise ContinuityError(str(exc)) from exc
+
+        return _context()
+    except (ImportError, OSError) as exc:
+        raise ContinuityError(
+            f"Project write authorization module unavailable: {exc}"
+        ) from exc
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -127,7 +170,12 @@ def compact_stamp() -> str:
 
 
 def resolve_root(raw_root: str | Path) -> Path:
-    root = Path(raw_root).expanduser().resolve()
+    raw = Path(raw_root).expanduser()
+    if _path_chain_has_link(raw):
+        raise ContinuityError(
+            f"Project path cannot traverse a symbolic link or reparse point: {raw}"
+        )
+    root = raw.resolve()
     if root == Path(root.anchor).resolve() or root == Path.home().resolve():
         raise ContinuityError("Project root cannot be a filesystem root or user home")
     if not (root / "novel.json").is_file():
@@ -143,12 +191,42 @@ def is_within(path: Path, parent: Path) -> bool:
     return True
 
 
+def _link_like(path: Path) -> bool:
+    """Detect symbolic links, junctions, and Windows reparse points."""
+
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if is_junction and is_junction():
+            return True
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _path_chain_has_link(path: Path) -> bool:
+    current = Path(path).expanduser()
+    if not current.is_absolute():
+        current = Path.cwd() / current
+    while True:
+        if _link_like(current):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
 def read_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ContinuityError(f"Missing file: {path}") from exc
-    except json.JSONDecodeError as exc:
+        value = json.loads(_read_stable_bytes(path, label="JSON input").decode("utf-8"))
+    except ContinuityError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ContinuityError(f"Invalid JSON in {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ContinuityError(f"Expected a JSON object in {path}")
@@ -164,55 +242,118 @@ def sha256_bytes(value: bytes) -> str:
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return sha256_bytes(_read_stable_bytes(path, label="file"))
 
 
-def atomic_write_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        "wb", delete=False, dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    temp_path = Path(handle.name)
+def _read_stable_bytes(path: Path, *, label: str) -> bytes:
+    """Read one ordinary file without accepting a link or replacement race."""
+
+    raw = Path(path).expanduser()
+    if _path_chain_has_link(raw):
+        raise ContinuityError(
+            f"{label} cannot traverse a symbolic link or reparse point: {raw}"
+        )
     try:
-        with handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    finally:
-        temp_path.unlink(missing_ok=True)
+        with raw.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            content = handle.read()
+            after = os.fstat(handle.fileno())
+        current = os.stat(raw, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise ContinuityError(f"Missing {label}: {raw}") from exc
+    except OSError as exc:
+        raise ContinuityError(f"Unable to read {label}: {raw}: {exc}") from exc
+    before_identity = (
+        getattr(before, "st_dev", None),
+        getattr(before, "st_ino", None),
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_identity = (
+        getattr(after, "st_dev", None),
+        getattr(after, "st_ino", None),
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    current_identity = (
+        getattr(current, "st_dev", None),
+        getattr(current, "st_ino", None),
+        current.st_size,
+        current.st_mtime_ns,
+    )
+    if before_identity != after_identity or after_identity != current_identity:
+        raise ContinuityError(f"{label} changed while being read: {raw}")
+    if not stat.S_ISREG(current.st_mode):
+        raise ContinuityError(f"{label} is not a regular file: {raw}")
+    return content
+
+
+def _json_object_from_bytes(content: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ContinuityError(f"{label} must be valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ContinuityError(f"{label} must be a JSON object")
+    return value
+
+
+def _external_baseline_input(
+    raw_path: str | Path, *, project_root: Path, label: str
+) -> tuple[Path, bytes]:
+    raw = Path(raw_path).expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    if _path_chain_has_link(raw):
+        raise ContinuityError(
+            f"{label} cannot traverse a symbolic link or reparse point: {raw}"
+        )
+    path = raw.resolve()
+    if path == project_root or project_root in path.parents:
+        raise ContinuityError(f"{label} must be stored outside the project tree")
+    if not path.is_file():
+        raise ContinuityError(f"{label} is not a regular file: {path}")
+    return path, _read_stable_bytes(path, label=label)
 
 
 def write_new(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("xb") as handle:
-        handle.write(content)
-
-
-def transactional_write(files: list[tuple[Path, bytes]]) -> None:
-    backups = {path: path.read_bytes() if path.exists() else None for path, _ in files}
-    applied: list[Path] = []
     try:
-        for path, content in files:
-            atomic_write_bytes(path, content)
-            applied.append(path)
+        novel_cli.atomic_create_bytes(path, content)
+    except FileExistsError as exc:
+        raise ContinuityError(f"Refusing to overwrite an existing output: {path}") from exc
+
+
+def transactional_write(
+    files: list[tuple[Path, bytes]],
+    *,
+    journal_root: str | Path | None = None,
+    expected_existing: dict[Path | str, str | None] | None = None,
+    expected_targets: dict[Path | str, str | None] | None = None,
+) -> None:
+    """Use the canonical persistent transaction implementation."""
+
+    if not files:
+        return
+    try:
+        import novel_project
+
+        root = journal_root
+        if root is None:
+            first = Path(files[0][0]).resolve()
+            for parent in (first.parent, *first.parents):
+                if (parent / "novel.json").is_file():
+                    root = parent
+                    break
+        novel_project.transactional_write(
+            files,
+            journal_root=root,
+            expected_existing=expected_existing,
+            expected_targets=expected_targets,
+        )
     except Exception as exc:
-        rollback_errors: list[str] = []
-        for path in reversed(applied):
-            try:
-                previous = backups[path]
-                if previous is None:
-                    path.unlink(missing_ok=True)
-                else:
-                    atomic_write_bytes(path, previous)
-            except Exception as rollback_exc:  # pragma: no cover - catastrophic I/O
-                rollback_errors.append(f"{path}: {rollback_exc}")
-        suffix = "; rollback errors: " + "; ".join(rollback_errors) if rollback_errors else ""
-        raise ContinuityError(f"Continuity transaction failed: {exc}{suffix}") from exc
+        if isinstance(exc, ContinuityError):
+            raise
+        raise ContinuityError(str(exc)) from exc
 
 
 def default_policy() -> dict[str, Any]:
@@ -335,10 +476,15 @@ def canonical_snapshot(
     for relative in canonical_relative_paths(root, normalized):
         content = normalized.get(relative)
         if content is None:
-            path = (root / relative).resolve()
+            raw_path = root / relative
+            if _path_chain_has_link(raw_path):
+                raise ContinuityError(
+                    f"Canonical source traverses a symbolic link or reparse point: {relative}"
+                )
+            path = raw_path.resolve()
             if not is_within(path, root) or not path.is_file():
                 raise ContinuityError(f"Canonical source is missing or out of scope: {relative}")
-            content = path.read_bytes()
+            content = _read_stable_bytes(raw_path, label=f"canonical source {relative}")
         entries.append({"path": relative, "sha256": sha256_bytes(content)})
     return entries, snapshot_digest(entries)
 
@@ -464,10 +610,23 @@ def build_baseline_record(
     }
 
 
-def reseal_zero_baseline(root: Path, authorization_reference: str) -> dict[str, Any]:
+def reseal_zero_baseline(
+    root: Path,
+    authorization_reference: str,
+    *,
+    extra_writes: list[tuple[Path, bytes]] | None = None,
+    expected_existing: dict[Path | str, str | None] | None = None,
+    expected_targets: dict[Path | str, str | None] | None = None,
+) -> dict[str, Any]:
     if current_chapter(root) != 0:
         raise ContinuityError("Only an empty project can use the zero-chapter baseline")
-    snapshot, canon_hash = canonical_snapshot(root)
+    overrides: dict[str, bytes] = {}
+    for path, content in extra_writes or []:
+        resolved = path.resolve()
+        if not is_within(resolved, root):
+            raise ContinuityError("Zero-baseline write escapes the project root")
+        overrides[resolved.relative_to(root).as_posix()] = content
+    snapshot, canon_hash = canonical_snapshot(root, overrides)
     baseline = build_baseline_record(
         root=root,
         through=0,
@@ -497,15 +656,28 @@ def reseal_zero_baseline(root: Path, authorization_reference: str) -> dict[str, 
         "authorization_reference": authorization_reference,
         "updated_at": utc_now(),
     }
-    writes: list[tuple[Path, bytes]] = []
+    writes: list[tuple[Path, bytes]] = list(extra_writes or [])
     if not baseline_path.exists():
         writes.append((baseline_path, baseline_bytes))
     writes.append((root / HEAD_PATH, dump_json(head).encode("utf-8")))
-    transactional_write(writes)
+    target_receipts = {
+        Path(target).resolve(): expected
+        for target, expected in (expected_targets or {}).items()
+    }
+    for target, _ in writes:
+        resolved = target.resolve()
+        if resolved not in target_receipts:
+            target_receipts[resolved] = sha256_file(resolved) if resolved.is_file() else None
+    transactional_write(
+        writes,
+        journal_root=root,
+        expected_existing=expected_existing,
+        expected_targets=target_receipts,
+    )
     return {"status": "sealed", "through_chapter": 0, "canon_sha256": canon_hash, "baseline_file": baseline_relative}
 
 
-def install_project(raw_root: str | Path) -> dict[str, Any]:
+def _install_project(raw_root: str | Path) -> dict[str, Any]:
     root = resolve_root(raw_root)
     created_directories: list[str] = []
     for relative in (BASELINES_DIR, AUDITS_DIR):
@@ -516,17 +688,29 @@ def install_project(raw_root: str | Path) -> dict[str, Any]:
         elif not path.is_dir():
             raise ContinuityError(f"Expected a directory: {path}")
     created_files: list[str] = []
+    scaffold_writes: list[tuple[Path, bytes]] = []
     for relative, content in scaffold_contents().items():
         path = root / relative
         if not path.exists():
-            write_new(path, content)
+            scaffold_writes.append((path, content))
             created_files.append(relative)
         elif not path.is_file():
             raise ContinuityError(f"Expected a file: {path}")
     baseline_result: dict[str, Any] | None = None
     if not (root / HEAD_PATH).is_file() and current_chapter(root) == 0:
-        baseline_result = reseal_zero_baseline(root, "Initialized continuity hard gate before the first canonical unit")
+        baseline_result = reseal_zero_baseline(
+            root,
+            "Initialized continuity hard gate before the first canonical unit",
+            extra_writes=scaffold_writes,
+            expected_targets={path: None for path, _ in scaffold_writes},
+        )
         created_files.extend([baseline_result["baseline_file"], HEAD_PATH])
+    elif scaffold_writes:
+        transactional_write(
+            scaffold_writes,
+            journal_root=root,
+            expected_targets={path: None for path, _ in scaffold_writes},
+        )
     return {
         "status": "installed" if created_directories or created_files else "already_current",
         "project_root": str(root),
@@ -535,6 +719,26 @@ def install_project(raw_root: str | Path) -> dict[str, Any]:
         "baseline": baseline_result,
         "baseline_required": not (root / HEAD_PATH).is_file(),
     }
+
+
+def install_project(
+    raw_root: str | Path,
+    *,
+    workspace: str | Path | None = None,
+    work_id: str | None = None,
+    allow_bootstrap: bool = False,
+) -> dict[str, Any]:
+    root = resolve_root(raw_root)
+    args = argparse.Namespace(workspace=workspace, work_id=work_id)
+    with project_write_context(
+        root,
+        args,
+        allow_bootstrap=allow_bootstrap,
+    ) as context:
+        result = _install_project(root)
+        context.assert_live()
+        context.refresh_base_after_write("continuity project installation")
+        return result
 
 
 def unresolved_invalidations(root: Path) -> list[dict[str, Any]]:
@@ -711,11 +915,72 @@ def ensure_delivery_allowed(raw_root: str | Path) -> dict[str, Any]:
     return ensure_ready(root, "derived export or platform delivery")
 
 
-def safe_output(raw: str | Path) -> Path:
-    path = Path(raw).expanduser().resolve()
+def safe_output(raw: str | Path, *, project_root: Path | None = None) -> Path:
+    raw_path = Path(raw).expanduser()
+    if not raw_path.is_absolute():
+        raw_path = Path.cwd() / raw_path
+    if _path_chain_has_link(raw_path):
+        raise ContinuityError(
+            f"Output path cannot traverse a symbolic link or reparse point: {raw_path}"
+        )
+    path = raw_path.resolve()
+    if project_root is not None and is_within(path, Path(project_root).resolve()):
+        raise ContinuityError(
+            "Preparation output must be outside the project tree; use the current "
+            "work-root and copy completed input into staging only under a lease"
+        )
     if path.exists():
         raise ContinuityError(f"Refusing to overwrite an existing output: {path}")
     return path
+
+
+def write_external_pair(
+    first: Path, first_content: bytes, second: Path, second_content: bytes
+) -> None:
+    """Create two external preparation files and remove this attempt on failure."""
+
+    if first.resolve() == second.resolve():
+        raise ContinuityError("Preparation packet and report outputs must be different files")
+    items = ((first, first_content), (second, second_content))
+    for path, _ in items:
+        if _path_chain_has_link(path):
+            raise ContinuityError(
+                f"Output path cannot traverse a symbolic link or reparse point: {path}"
+            )
+        if path.exists():
+            raise ContinuityError(f"Refusing to overwrite an existing output: {path}")
+
+    created: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        for path, content in items:
+            try:
+                identity = novel_cli.atomic_create_bytes(path, content)
+            except FileExistsError as exc:
+                raise ContinuityError(
+                    f"Refusing to overwrite an existing output: {path}"
+                ) from exc
+            created.append((path, identity))
+    except BaseException as exc:
+        cleanup_errors: list[str] = []
+        for path, identity in reversed(created):
+            try:
+                current = path.stat(follow_symlinks=False)
+                if _link_like(path) or not path.is_file():
+                    cleanup_errors.append(f"owned output changed type: {path}")
+                elif (current.st_dev, current.st_ino) != identity:
+                    cleanup_errors.append(f"owned output was replaced concurrently: {path}")
+                else:
+                    path.unlink()
+            except FileNotFoundError:
+                continue
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(f"{path}: {cleanup_exc}")
+        if cleanup_errors:
+            raise ContinuityError(
+                "Preparation failed and partial-output cleanup requires manual "
+                "reconciliation: " + "; ".join(cleanup_errors)
+            ) from exc
+        raise
 
 
 def resolve_package_directory(root: Path, raw_package: str | Path) -> Path:
@@ -840,7 +1105,7 @@ def build_context(root: Path, chapter_number: int) -> dict[str, Any]:
 
 def prepare_context(args: argparse.Namespace) -> dict[str, Any]:
     root = resolve_root(args.root)
-    output = safe_output(args.output)
+    output = safe_output(args.output, project_root=root)
     context = build_context(root, args.chapter)
     write_new(output, dump_json(context).encode("utf-8"))
     return {"status": "prepared", "chapter_number": args.chapter, "output": str(output), "base_canon_sha256": context["base_canon_sha256"]}
@@ -1109,8 +1374,7 @@ def apply_change(document: Any, change: dict[str, Any]) -> Any:
     return result
 
 
-def prepare_audit(args: argparse.Namespace) -> dict[str, Any]:
-    root = resolve_root(args.root)
+def _prepare_audit(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     package = resolve_package_directory(root, args.package)
     commit = read_json(package / "commit.json")
     chapter_number = commit.get("chapter_number")
@@ -1181,13 +1445,26 @@ def prepare_audit(args: argparse.Namespace) -> dict[str, Any]:
     )
     if delta_path.exists() or audit_path.exists():
         raise ContinuityError("Refusing to overwrite an existing state delta or continuity audit")
-    write_new(delta_path, dump_json(state_delta).encode("utf-8"))
-    write_new(audit_path, dump_json(audit).encode("utf-8"))
+    transactional_write(
+        [
+            (delta_path, dump_json(state_delta).encode("utf-8")),
+            (audit_path, dump_json(audit).encode("utf-8")),
+        ],
+        journal_root=root,
+    )
     return {"status": "prepared", "chapter_number": chapter_number, "state_delta": str(delta_path), "continuity_audit": str(audit_path), "requires_independent_review": context["derived_independent_review"]}
 
 
-def bind_audit(args: argparse.Namespace) -> dict[str, Any]:
+def prepare_audit(args: argparse.Namespace) -> dict[str, Any]:
     root = resolve_root(args.root)
+    with project_write_context(root, args) as context:
+        result = _prepare_audit(args, root)
+        context.assert_live()
+        context.refresh_base_after_write("continuity audit preparation")
+        return result
+
+
+def _bind_audit(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     package = resolve_package_directory(root, args.package)
     commit = read_json(package / "commit.json")
     chapter_number = commit.get("chapter_number")
@@ -1222,7 +1499,9 @@ def bind_audit(args: argparse.Namespace) -> dict[str, Any]:
             "binding_status": "current",
         }
     )
-    atomic_write_bytes(audit_path, dump_json(audit).encode("utf-8"))
+    transactional_write(
+        [(audit_path, dump_json(audit).encode("utf-8"))], journal_root=root
+    )
     return {
         "status": "bound",
         "chapter_number": chapter_number,
@@ -1230,6 +1509,15 @@ def bind_audit(args: argparse.Namespace) -> dict[str, Any]:
         "state_delta_sha256": audit["state_delta_sha256"],
         "requires_independent_review": context["derived_independent_review"],
     }
+
+
+def bind_audit(args: argparse.Namespace) -> dict[str, Any]:
+    root = resolve_root(args.root)
+    with project_write_context(root, args) as context:
+        result = _bind_audit(args, root)
+        context.assert_live()
+        context.refresh_base_after_write("continuity audit binding")
+        return result
 
 
 def fact_record_errors(record: Any, label: str) -> list[str]:
@@ -1645,10 +1933,12 @@ def validate_baseline_fact_source(root: Path, snapshot: list[dict[str, str]], re
         errors.append(f"{label}.source.quote must not be empty")
     else:
         try:
-            text = (root / relative).read_text(encoding="utf-8")
+            text = _read_stable_bytes(
+                root / relative, label=f"{label}.source"
+            ).decode("utf-8")
             if quote.strip() not in text:
                 errors.append(f"{label}.source.quote was not found verbatim")
-        except (OSError, UnicodeError) as exc:
+        except (ContinuityError, UnicodeError) as exc:
             errors.append(f"{label}.source cannot be read: {exc}")
     return errors
 
@@ -1708,15 +1998,18 @@ def baseline_report_template(packet: dict[str, Any], packet_hash: str) -> dict[s
 
 def prepare_baseline(args: argparse.Namespace) -> dict[str, Any]:
     root = resolve_root(args.root)
-    output = safe_output(args.output)
-    report_output = safe_output(args.report_output) if args.report_output else output.with_name(output.stem + "-report.json")
-    if report_output.exists():
-        raise ContinuityError(f"Refusing to overwrite an existing output: {report_output}")
+    output = safe_output(args.output, project_root=root)
+    report_raw = args.report_output or output.with_name(output.stem + "-report.json")
+    report_output = safe_output(report_raw, project_root=root)
     packet = build_baseline_packet(root)
     packet_bytes = dump_json(packet).encode("utf-8")
-    write_new(output, packet_bytes)
     report = baseline_report_template(packet, sha256_bytes(packet_bytes))
-    write_new(report_output, dump_json(report).encode("utf-8"))
+    write_external_pair(
+        output,
+        packet_bytes,
+        report_output,
+        dump_json(report).encode("utf-8"),
+    )
     return {"status": "prepared", "packet": str(output), "packet_sha256": sha256_bytes(packet_bytes), "report_template": str(report_output), "chapter_through": packet["chapter_through"], "required_full_text_chapters": packet["required_full_text_chapters"]}
 
 
@@ -1763,19 +2056,74 @@ def validate_baseline_finding(
 
 
 def validate_baseline_report(root: Path, packet_path: Path, report_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    packet = read_json(packet_path)
-    report = read_json(report_path)
+    packet_path, packet_bytes = _external_baseline_input(
+        packet_path, project_root=root, label="Baseline packet"
+    )
+    report_path, report_bytes = _external_baseline_input(
+        report_path, project_root=root, label="Baseline report"
+    )
+    if packet_path == report_path:
+        raise ContinuityError("Baseline packet and report must be different files")
+    packet = _json_object_from_bytes(packet_bytes, label="Baseline packet")
+    report = _json_object_from_bytes(report_bytes, label="Baseline report")
+    return _validate_baseline_report_data(
+        root,
+        packet,
+        report,
+        packet_bytes=packet_bytes,
+    )
+
+
+def _validate_baseline_report_data(
+    root: Path,
+    packet: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    packet_bytes: bytes,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     errors: list[str] = []
     if packet.get("schema_version") != SCHEMA_VERSION or packet.get("packet_kind") != "canon_continuity_baseline_packet":
         errors.append("baseline packet has an unsupported schema or kind")
     if Path(str(packet.get("project_root", ""))).resolve() != root:
         errors.append("baseline packet belongs to another project")
-    errors.extend(validate_snapshot_current(root, packet.get("source_snapshot")))
-    if packet.get("source_snapshot_sha256") != snapshot_digest(packet.get("source_snapshot", [])):
+    raw_snapshot = packet.get("source_snapshot")
+    snapshot = raw_snapshot if isinstance(raw_snapshot, list) else []
+    errors.extend(validate_snapshot_current(root, raw_snapshot))
+    try:
+        snapshot_hash = snapshot_digest(snapshot)
+    except (KeyError, TypeError, UnicodeEncodeError):
+        snapshot_hash = None
+    if packet.get("source_snapshot_sha256") != snapshot_hash:
         errors.append("baseline packet source snapshot hash is invalid")
+    try:
+        expected_packet = build_baseline_packet(root)
+    except ContinuityError as exc:
+        errors.append(str(exc))
+    else:
+        protected_packet_fields = (
+            "status",
+            "chapter_from",
+            "chapter_through",
+            "source_snapshot",
+            "source_snapshot_sha256",
+            "required_full_text_chapters",
+            "required_dimensions",
+            "requires_independent_review",
+            "scaffold_status",
+        )
+        mismatched = [
+            key
+            for key in protected_packet_fields
+            if packet.get(key) != expected_packet.get(key)
+        ]
+        if mismatched:
+            errors.append(
+                "baseline packet does not exactly match the current review scope: "
+                + ", ".join(mismatched)
+            )
     if report.get("schema_version") != SCHEMA_VERSION or report.get("report_kind") != "canon_continuity_baseline_review":
         errors.append("baseline report has an unsupported schema or kind")
-    if report.get("packet_sha256") != sha256_file(packet_path):
+    if report.get("packet_sha256") != sha256_bytes(packet_bytes):
         errors.append("baseline report does not bind the current packet")
     if report.get("status") != "complete":
         errors.append("baseline report status must be complete")
@@ -1787,6 +2135,9 @@ def validate_baseline_report(root: Path, packet_path: Path, report_path: Path) -
         through = -1
     else:
         through = raw_through
+    for key in ("project_root", "chapter_from", "chapter_through"):
+        if report.get(key) != packet.get(key):
+            errors.append(f"baseline report {key} does not match the packet")
     expected_chapters = list(range(1, through + 1))
     if report.get("reviewed_chapters") != expected_chapters:
         errors.append("baseline report reviewed_chapters must list every chapter in order")
@@ -1805,7 +2156,7 @@ def validate_baseline_report(root: Path, packet_path: Path, report_path: Path) -
         for index, finding in enumerate(findings):
             errors.extend(
                 validate_baseline_finding(
-                    root, packet.get("source_snapshot", []), finding, index
+                    root, snapshot, finding, index
                 )
             )
     decision = report.get("decision")
@@ -1819,7 +2170,7 @@ def validate_baseline_report(root: Path, packet_path: Path, report_path: Path) -
         facts = []
     seen_facts: set[str] = set()
     for index, fact in enumerate(facts):
-        errors.extend(validate_baseline_fact_source(root, packet.get("source_snapshot", []), fact, f"facts[{index}]"))
+        errors.extend(validate_baseline_fact_source(root, snapshot, fact, f"facts[{index}]"))
         if isinstance(fact, dict):
             fact_id = fact.get("fact_id")
             if fact_id in seen_facts:
@@ -1841,6 +2192,8 @@ def validate_baseline_report(root: Path, packet_path: Path, report_path: Path) -
     if not isinstance(dependencies, dict):
         errors.append("chapter_dependencies must be an object")
         dependencies = {}
+    elif set(dependencies) != {f"{number:04d}" for number in expected_chapters}:
+        errors.append("chapter_dependencies must exactly cover every reviewed chapter")
     chapter_map = dict(chapter_paths(root, through))
     for number in expected_chapters:
         key = f"{number:04d}"
@@ -1868,18 +2221,43 @@ def validate_baseline_report(root: Path, packet_path: Path, report_path: Path) -
     return packet, report
 
 
-def record_baseline(args: argparse.Namespace) -> dict[str, Any]:
-    root = resolve_root(args.root)
-    packet_path = Path(args.packet).expanduser().resolve()
-    report_path = Path(args.report).expanduser().resolve()
+def _record_baseline(args: argparse.Namespace, root: Path) -> dict[str, Any]:
+    packet_path, packet_bytes = _external_baseline_input(
+        args.packet, project_root=root, label="Baseline packet"
+    )
+    report_path, report_bytes = _external_baseline_input(
+        args.report, project_root=root, label="Baseline report"
+    )
+    if packet_path == report_path:
+        raise ContinuityError("Baseline packet and report must be different files")
     authorization = str(args.authorization_reference or "").strip()
     if not authorization:
         raise ContinuityError("authorization_reference must not be empty")
-    packet, report = validate_baseline_report(root, packet_path, report_path)
-    report_bytes = report_path.read_bytes()
+    packet = _json_object_from_bytes(packet_bytes, label="Baseline packet")
+    report = _json_object_from_bytes(report_bytes, label="Baseline report")
+    packet, report = _validate_baseline_report_data(
+        root,
+        packet,
+        report,
+        packet_bytes=packet_bytes,
+    )
+    source_preconditions = {
+        packet_path: sha256_bytes(packet_bytes),
+        report_path: sha256_bytes(report_bytes),
+    }
+    snapshot_preconditions = {
+        root / entry["path"]: entry["sha256"]
+        for entry in packet["source_snapshot"]
+    }
     if report["decision"] != "pass":
+        source_preconditions.update(snapshot_preconditions)
         target = root / AUDITS_DIR / f"baseline-review-{int(packet['chapter_through']):04d}-{compact_stamp()}-{sha256_bytes(report_bytes)[:10]}.json"
-        write_new(target, report_bytes)
+        transactional_write(
+            [(target, report_bytes)],
+            journal_root=root,
+            expected_existing=source_preconditions,
+            expected_targets={target: None},
+        )
         return {"status": "blocked", "decision": report["decision"], "report_path": target.relative_to(root).as_posix(), "findings": len(report["findings"])}
     facts_bytes = dump_jsonl(report["facts"], "fact_id")
     exceptions_bytes = dump_jsonl(report["intentional_exceptions"], "exception_id")
@@ -1887,10 +2265,9 @@ def record_baseline(args: argparse.Namespace) -> dict[str, Any]:
     chapter_map = dict(chapter_paths(root, int(packet["chapter_through"])))
     for key, entry in report["chapter_dependencies"].items():
         number = int(key)
-        source = root / chapter_map[number]
         chapters[key] = {
             **entry,
-            "chapter_sha256": sha256_file(source),
+            "chapter_sha256": snapshot_preconditions[root / chapter_map[number]],
             "audit_path": None,
             "audit_sha256": None,
             "context_sha256": None,
@@ -1899,7 +2276,14 @@ def record_baseline(args: argparse.Namespace) -> dict[str, Any]:
             "covered_by_baseline": True,
         }
     dependencies_bytes = dump_json({"schema_version": SCHEMA_VERSION, "chapters": chapters}).encode("utf-8")
-    invalidations = read_json(root / INVALIDATIONS_PATH)
+    invalidations_source = _read_stable_bytes(
+        root / INVALIDATIONS_PATH, label="continuity invalidations"
+    )
+    if sha256_bytes(invalidations_source) != snapshot_preconditions[root / INVALIDATIONS_PATH]:
+        raise ContinuityError("continuity invalidations changed after baseline validation")
+    invalidations = _json_object_from_bytes(
+        invalidations_source, label="continuity invalidations"
+    )
     for item in invalidations.get("items", []):
         if isinstance(item, dict) and item.get("status") == "open":
             item["status"] = "resolved"
@@ -1912,8 +2296,16 @@ def record_baseline(args: argparse.Namespace) -> dict[str, Any]:
         DEPENDENCIES_PATH: dependencies_bytes,
         INVALIDATIONS_PATH: invalidations_bytes,
     }
+    replaced_sources = {root / relative for relative in overrides}
+    source_preconditions.update(
+        {
+            path: digest
+            for path, digest in snapshot_preconditions.items()
+            if path not in replaced_sources
+        }
+    )
     snapshot, canon_hash = canonical_snapshot(root, overrides)
-    report_hash = sha256_file(report_path)
+    report_hash = sha256_bytes(report_bytes)
     baseline = build_baseline_record(
         root=root,
         through=int(packet["chapter_through"]),
@@ -1923,19 +2315,29 @@ def record_baseline(args: argparse.Namespace) -> dict[str, Any]:
         reviewer=report["reviewer"],
         findings=report["findings"],
         residual_risks=report.get("residual_risks", []),
-        packet_sha256=sha256_file(packet_path),
+        packet_sha256=sha256_bytes(packet_bytes),
         report_sha256=report_hash,
     )
     baseline_path = baseline_path_for(
         root, int(packet["chapter_through"]), canon_hash, report_hash
     )
     baseline_bytes = dump_json(baseline).encode("utf-8")
+    head_path = root / HEAD_PATH
+    if head_path.is_file():
+        previous_head_bytes = _read_stable_bytes(head_path, label="continuity head")
+        previous_head = _json_object_from_bytes(
+            previous_head_bytes, label="continuity head"
+        )
+        previous_head_hash = sha256_bytes(previous_head_bytes)
+    else:
+        previous_head = {}
+        previous_head_hash = None
     head = {
         "schema_version": SCHEMA_VERSION,
         "status": "current",
         "through_chapter": int(packet["chapter_through"]),
         "canon_sha256": canon_hash,
-        "parent_canon_sha256": read_json(root / HEAD_PATH).get("canon_sha256") if (root / HEAD_PATH).is_file() else None,
+        "parent_canon_sha256": previous_head.get("canon_sha256"),
         "baseline_file": baseline_path.relative_to(root).as_posix(),
         "baseline_sha256": sha256_bytes(baseline_bytes),
         "latest_audit": None,
@@ -1948,10 +2350,34 @@ def record_baseline(args: argparse.Namespace) -> dict[str, Any]:
         (root / DEPENDENCIES_PATH, dependencies_bytes),
         (root / INVALIDATIONS_PATH, invalidations_bytes),
         (baseline_path, baseline_bytes),
-        (root / HEAD_PATH, dump_json(head).encode("utf-8")),
+        (head_path, dump_json(head).encode("utf-8")),
     ]
-    transactional_write(writes)
+    target_preconditions = {
+        root / relative: snapshot_preconditions[root / relative]
+        for relative in overrides
+    }
+    target_preconditions.update(
+        {
+            baseline_path: None,
+            head_path: previous_head_hash,
+        }
+    )
+    transactional_write(
+        writes,
+        journal_root=root,
+        expected_existing=source_preconditions,
+        expected_targets=target_preconditions,
+    )
     return {"status": "sealed", "decision": "pass", "through_chapter": packet["chapter_through"], "canon_sha256": canon_hash, "baseline_file": baseline_path.relative_to(root).as_posix(), "facts": len(report["facts"]), "intentional_exceptions": len(report["intentional_exceptions"]), "dependencies": len(chapters)}
+
+
+def record_baseline(args: argparse.Namespace) -> dict[str, Any]:
+    root = resolve_root(args.root)
+    with project_write_context(root, args) as context:
+        result = _record_baseline(args, root)
+        context.assert_live()
+        context.refresh_base_after_write("continuity baseline record")
+        return result
 
 
 def dependency_impact(root: Path, changed_paths: list[str], change_type: str) -> dict[str, Any]:
@@ -1996,8 +2422,7 @@ def impact_command(args: argparse.Namespace) -> dict[str, Any]:
     return dependency_impact(root, args.changed_path, args.change_type)
 
 
-def invalidate_command(args: argparse.Namespace) -> dict[str, Any]:
-    root = resolve_root(args.root)
+def _invalidate_command(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     authorization = str(args.authorization_reference or "").strip()
     reason = str(args.reason or "").strip()
     if not authorization or not reason:
@@ -2020,8 +2445,23 @@ def invalidate_command(args: argparse.Namespace) -> dict[str, Any]:
     head = read_json(root / HEAD_PATH)
     _, canon_hash = canonical_snapshot(root, {INVALIDATIONS_PATH: invalidations_bytes})
     head.update({"status": "blocked", "canon_sha256": canon_hash, "authorization_reference": authorization, "updated_at": utc_now()})
-    transactional_write([(root / INVALIDATIONS_PATH, invalidations_bytes), (root / HEAD_PATH, dump_json(head).encode("utf-8"))])
+    transactional_write(
+        [
+            (root / INVALIDATIONS_PATH, invalidations_bytes),
+            (root / HEAD_PATH, dump_json(head).encode("utf-8")),
+        ],
+        journal_root=root,
+    )
     return {"status": "invalidated", "invalidation": item, "commit_blocked": True, "delivery_blocked": True}
+
+
+def invalidate_command(args: argparse.Namespace) -> dict[str, Any]:
+    root = resolve_root(args.root)
+    with project_write_context(root, args) as context:
+        result = _invalidate_command(args, root)
+        context.assert_live()
+        context.refresh_base_after_write("continuity invalidation record")
+        return result
 
 
 def check_package_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -2051,6 +2491,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     install = subparsers.add_parser("install", help="Add continuity hard-gate scaffolding without changing prose.")
     install.add_argument("root")
+    install.add_argument("--workspace")
+    install.add_argument("--work-id")
+    install.add_argument("--allow-bootstrap", action="store_true")
     status = subparsers.add_parser("status", help="Check the current continuity seal and invalidations.")
     status.add_argument("root")
     context = subparsers.add_parser("prepare-context", help="Create the next chapter's pre-writing continuity context.")
@@ -2060,9 +2503,15 @@ def build_parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser("prepare-audit", help="Create state-delta and continuity-audit templates for a staged chapter.")
     audit.add_argument("root")
     audit.add_argument("package")
+    audit.add_argument("--workspace")
+    audit.add_argument("--work-id")
+    audit.add_argument("--allow-bootstrap", action="store_true")
     bind = subparsers.add_parser("bind-audit", help="Validate a completed state delta and bind the draft continuity audit to its final hash.")
     bind.add_argument("root")
     bind.add_argument("package")
+    bind.add_argument("--workspace")
+    bind.add_argument("--work-id")
+    bind.add_argument("--allow-bootstrap", action="store_true")
     check = subparsers.add_parser("check-package", help="Validate a staged chapter's complete continuity evidence.")
     check.add_argument("root")
     check.add_argument("package")
@@ -2075,6 +2524,9 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--packet", required=True)
     record.add_argument("--report", required=True)
     record.add_argument("--authorization-reference", required=True)
+    record.add_argument("--workspace")
+    record.add_argument("--work-id")
+    record.add_argument("--allow-bootstrap", action="store_true")
     impact = subparsers.add_parser("impact", help="Calculate downstream chapters affected by proposed canonical changes.")
     impact.add_argument("root")
     impact.add_argument("--changed-path", action="append", required=True)
@@ -2085,13 +2537,21 @@ def build_parser() -> argparse.ArgumentParser:
     invalidate.add_argument("--change-type", choices=sorted(REVISION_TYPES), default="unknown")
     invalidate.add_argument("--reason", required=True)
     invalidate.add_argument("--authorization-reference", required=True)
+    invalidate.add_argument("--workspace")
+    invalidate.add_argument("--work-id")
+    invalidate.add_argument("--allow-bootstrap", action="store_true")
     return parser
 
 
 def main() -> int:
     def dispatch(args: argparse.Namespace) -> Any:
         if args.command == "install":
-            return install_project(args.root)
+            return install_project(
+                args.root,
+                workspace=getattr(args, "workspace", None),
+                work_id=getattr(args, "work_id", None),
+                allow_bootstrap=bool(getattr(args, "allow_bootstrap", False)),
+            )
         if args.command == "status":
             result = continuity_status(args.root)
             return result, 0 if result["status"] == "current" else 1
@@ -2110,7 +2570,9 @@ def main() -> int:
             return result, 0 if result["status"] == "sealed" else 1
         if args.command == "impact":
             return impact_command(args)
-        return invalidate_command(args)
+        if args.command == "invalidate":
+            return invalidate_command(args)
+        raise ContinuityError(f"Unsupported command: {args.command}")
 
     return novel_cli.run_cli(
         build_parser,

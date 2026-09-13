@@ -13,6 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,102 @@ class CliContractTests(unittest.TestCase):
             capture_output=True,
             env=process_env,
         )
+
+    def test_atomic_write_text_uses_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "text.txt"
+            novel_cli.atomic_write_text(target, "中文内容\n")
+            self.assertEqual(target.read_bytes(), "中文内容\n".encode("utf-8"))
+
+    def test_atomic_write_bytes_preserves_raw_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "raw.bin"
+            content = b"\xff\xfe\x00raw\x80"
+            novel_cli.atomic_write_bytes(target, content)
+            self.assertEqual(target.read_bytes(), content)
+
+    def test_atomic_write_replacement_leaves_no_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "replace.bin"
+            target.write_bytes(b"old")
+            novel_cli.atomic_write_bytes(target, b"new")
+            self.assertEqual(target.read_bytes(), b"new")
+            self.assertEqual(
+                [path for path in root.iterdir() if path.suffix == ".tmp"],
+                [],
+            )
+
+    def test_atomic_create_refuses_existing_target_without_changing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "new.bin"
+            target.write_bytes(b"existing")
+
+            with self.assertRaises(FileExistsError):
+                novel_cli.atomic_create_bytes(target, b"replacement")
+
+            self.assertEqual(target.read_bytes(), b"existing")
+            self.assertEqual(list(root.glob(".*.tmp")), [])
+
+    def test_atomic_create_interrupt_before_install_leaves_no_partial_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "new.bin"
+
+            with mock.patch.object(
+                novel_cli.os, "fsync", side_effect=KeyboardInterrupt()
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    novel_cli.atomic_create_bytes(target, b"complete content")
+
+            self.assertFalse(target.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_atomic_create_preserves_concurrent_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "new.bin"
+
+            def concurrent_winner(_source: Path, destination: Path) -> None:
+                Path(destination).write_bytes(b"winner")
+                raise FileExistsError("injected concurrent creator")
+
+            with mock.patch.object(
+                novel_cli.os, "link", side_effect=concurrent_winner
+            ):
+                with self.assertRaises(FileExistsError):
+                    novel_cli.atomic_create_bytes(target, b"ours")
+
+            self.assertEqual(target.read_bytes(), b"winner")
+            self.assertEqual(
+                [path for path in root.iterdir() if path.suffix == ".tmp"],
+                [],
+            )
+
+    def test_atomic_create_does_not_delete_concurrent_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "new.bin"
+            real_link = os.link
+
+            def replace_then_interrupt(source: Path, destination: Path) -> None:
+                real_link(source, destination)
+                Path(destination).unlink()
+                Path(destination).write_bytes(b"concurrent")
+                raise SystemExit("injected interrupt after install")
+
+            with mock.patch.object(
+                novel_cli.os, "link", side_effect=replace_then_interrupt
+            ):
+                with self.assertRaises(SystemExit):
+                    novel_cli.atomic_create_bytes(target, b"ours")
+
+            self.assertEqual(target.read_bytes(), b"concurrent")
+            self.assertEqual(
+                [path for path in root.iterdir() if path.suffix == ".tmp"],
+                [],
+            )
 
     def test_every_tool_exposes_json_version_and_usage_errors(self) -> None:
         scripts = (
@@ -158,6 +255,23 @@ class CliContractTests(unittest.TestCase):
             blocked_payload = json.loads(blocked.stdout.decode("utf-8"))
             self.assertEqual(blocked_payload["status"], "blocked")
             self.assertEqual(blocked.stderr, b"")
+
+    def test_incomplete_originality_audit_is_a_business_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "project"
+            initialized = self.run_script(
+                "novel_project.py", "init", str(root), "--title", "原创性契约测试"
+            )
+            self.assertEqual(initialized.returncode, 0)
+
+            result = self.run_script(
+                "novel_originality.py", "audit", str(root), "--no-report"
+            )
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout.decode("utf-8"))
+            self.assertEqual(payload["decision"], "incomplete")
+            self.assertNotIn("recoverable", payload)
+            self.assertEqual(result.stderr, b"")
 
     def test_workspace_bind_close_and_status_cli_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

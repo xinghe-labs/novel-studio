@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -15,9 +16,10 @@ sys.path.insert(0, str(SKILL_ROOT / "tests"))
 
 import novel_project  # noqa: E402
 import novel_review  # noqa: E402
+import novel_cli  # noqa: E402
 import novel_continuity  # noqa: E402
 import novel_workspace  # noqa: E402
-from continuity_test_utils import seal_full_baseline  # noqa: E402
+from continuity_test_utils import refresh_fixture_base, seal_full_baseline  # noqa: E402
 
 
 def write_text(path: Path, text: str) -> None:
@@ -49,6 +51,11 @@ class PeriodicReviewTests(unittest.TestCase):
             )
         )
         novel_workspace.register_project(self.workspace, root, project_id=name)
+        work = novel_workspace.create_work(
+            self.workspace, project_id=name, purpose="周期审核测试"
+        )
+        novel_workspace.acquire_lock(self.workspace, work["work_id"])
+        self.work_ids[root.resolve()] = work["work_id"]
         return root
 
     def commit_args(self, root: Path, package: Path) -> SimpleNamespace:
@@ -112,7 +119,11 @@ class PeriodicReviewTests(unittest.TestCase):
             root / "continuity/state.json",
             json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         )
-        seal_full_baseline(root)
+        seal_full_baseline(
+            root,
+            workspace=self.workspace,
+            work_id=self.work_ids[root.resolve()],
+        )
 
     def prepare_and_record(
         self,
@@ -170,6 +181,8 @@ class PeriodicReviewTests(unittest.TestCase):
                 packet=str(packet_path),
                 report=str(report_path),
                 authorization_reference="单元测试中确认记录本轮审核结论",
+                workspace=str(self.workspace),
+                work_id=self.work_ids[root.resolve()],
             )
         )
 
@@ -199,6 +212,162 @@ class PeriodicReviewTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertTrue(any("Periodic review is due" in item for item in warnings))
 
+    def test_review_root_rejects_link_like_path(self) -> None:
+        root = self.init_project("review-link-root")
+        with mock.patch.object(novel_review, "_path_chain_has_link", return_value=True):
+            with self.assertRaisesRegex(novel_review.ReviewError, "cannot traverse"):
+                novel_review.review_status(root)
+
+    def test_record_requires_external_stable_inputs(self) -> None:
+        root = self.init_project("review-input-boundary")
+        self.seed_chapters(root, 5)
+        packet_path = root / "staging/review-packet.json"
+        with self.assertRaisesRegex(novel_review.ReviewError, "outside the project"):
+            novel_review.prepare_review(
+                SimpleNamespace(
+                    root=str(root),
+                    output=str(packet_path),
+                    report_output=None,
+                    through=None,
+                    force=False,
+                )
+            )
+
+        prepared_path = self.base / "stable-review-packet.json"
+        prepared = novel_review.prepare_review(
+            SimpleNamespace(
+                root=str(root),
+                output=str(prepared_path),
+                report_output=None,
+                through=None,
+                force=False,
+            )
+        )
+        report_path = Path(prepared["report_template_path"])
+        report = read_json(report_path)
+        report.update(
+            {
+                "status": "complete",
+                "reviewed_at": "2026-09-13T00:00:00+00:00",
+                "summary": "已完成独立质量审核。",
+                "reviewer": {
+                    "mode": "independent",
+                    "reviewer_id": "stable-input-reviewer",
+                    "independent_context": True,
+                },
+            }
+        )
+        write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        args = SimpleNamespace(
+            root=str(root),
+            packet=str(prepared_path),
+            report=str(report_path),
+            authorization_reference="测试审核输入稳定绑定",
+            workspace=str(self.workspace),
+            work_id=self.work_ids[root.resolve()],
+        )
+        original_transaction = novel_project.transactional_write
+
+        def replace_report_before_commit(*transaction_args, **transaction_kwargs):
+            write_text(report_path, "{}\n")
+            return original_transaction(*transaction_args, **transaction_kwargs)
+
+        with mock.patch.object(
+            novel_project,
+            "transactional_write",
+            side_effect=replace_report_before_commit,
+        ):
+            with self.assertRaisesRegex(novel_review.ReviewError, "precondition failed"):
+                novel_review.record_review(args)
+        self.assertFalse(any((root / "reviews/periodic").glob("*.json")))
+
+    def test_record_rejects_packet_with_omitted_context_source(self) -> None:
+        root = self.init_project("review-packet-scope")
+        self.seed_chapters(root, 5)
+        packet_path = self.base / "scope-review-packet.json"
+        prepared = novel_review.prepare_review(
+            SimpleNamespace(
+                root=str(root),
+                output=str(packet_path),
+                report_output=None,
+                through=None,
+                force=False,
+            )
+        )
+        report_path = Path(prepared["report_template_path"])
+        packet = read_json(packet_path)
+        packet["source_snapshot"] = [
+            entry
+            for entry in packet["source_snapshot"]
+            if entry["path"] != "memory/decisions.md"
+        ]
+        packet["reading_scope"]["stable_context"] = [
+            path
+            for path in packet["reading_scope"]["stable_context"]
+            if path != "memory/decisions.md"
+        ]
+        write_text(packet_path, json.dumps(packet, ensure_ascii=False, indent=2) + "\n")
+        report = read_json(report_path)
+        report.update(
+            {
+                "packet_sha256": novel_review.sha256_file(packet_path),
+                "status": "complete",
+                "reviewed_at": "2026-09-13T00:00:00+00:00",
+                "summary": "尝试使用删减后的质量审核范围。",
+                "reviewer": {
+                    "mode": "independent",
+                    "reviewer_id": "scope-reviewer",
+                    "independent_context": True,
+                },
+            }
+        )
+        write_text(report_path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+
+        with self.assertRaisesRegex(novel_review.ReviewError, "exactly cover"):
+            novel_review.record_review(
+                SimpleNamespace(
+                    root=str(root),
+                    packet=str(packet_path),
+                    report=str(report_path),
+                    authorization_reference="测试拒绝删减审核上下文",
+                    workspace=str(self.workspace),
+                    work_id=self.work_ids[root.resolve()],
+                )
+            )
+        self.assertFalse(any((root / "reviews/periodic").glob("*.json")))
+
+    def test_prepare_interrupt_removes_only_outputs_created_by_this_attempt(self) -> None:
+        root = self.init_project()
+        self.seed_chapters(root, 5)
+        packet = self.base / "interrupted-review-packet.json"
+        report = self.base / "interrupted-review-report.json"
+        real_create = novel_cli.atomic_create_bytes
+        calls = 0
+
+        def interrupt_second(path: Path, content: bytes) -> tuple[int, int]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise SystemExit(9)
+            return real_create(path, content)
+
+        with mock.patch.object(
+            novel_cli, "atomic_create_bytes", side_effect=interrupt_second
+        ):
+            with self.assertRaises(SystemExit):
+                novel_review.prepare_review(
+                    SimpleNamespace(
+                        root=str(root),
+                        output=str(packet),
+                        report_output=str(report),
+                        through=None,
+                        force=False,
+                    )
+                )
+
+        self.assertFalse(packet.exists())
+        self.assertFalse(report.exists())
+
     def test_passing_report_advances_next_checkpoint_to_ten(self) -> None:
         root = self.init_project()
         self.seed_chapters(root, 5)
@@ -224,6 +393,12 @@ class PeriodicReviewTests(unittest.TestCase):
 
         chapter = root / "manuscript/chapters/0001-测试章.md"
         write_text(chapter, chapter.read_text(encoding="utf-8") + "地点冲突已经修正。\n")
+        refresh_fixture_base(
+            root,
+            self.workspace,
+            self.work_ids[root.resolve()],
+            reference="测试夹具已回读并确认修订后的正文",
+        )
         self.prepare_and_record(root)
         status = novel_review.ensure_commit_allowed(root, 6)
         self.assertFalse(status["commit_blocked"])
@@ -322,6 +497,8 @@ class PeriodicReviewTests(unittest.TestCase):
                 enabled=None,
                 block_next_commit=None,
                 authorization_reference="作者确认改为每三章审核一次",
+                workspace=str(self.workspace),
+                work_id=self.work_ids[root.resolve()],
             )
         )
         self.assertEqual(result["after"]["interval_chapters"], 3)

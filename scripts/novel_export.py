@@ -4,14 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import html
 import json
 import os
 import posixpath
 import re
+import secrets
+import shutil
+import stat
 import sys
 import tempfile
+import threading
+import time
 import urllib.parse
 import unicodedata
 import uuid
@@ -141,6 +147,768 @@ ET.register_namespace("xsi", XSI_NS)
 
 class ExportError(RuntimeError):
     pass
+
+
+_EXPORT_LOCKS: dict[Path, threading.RLock] = {}
+_EXPORT_LOCKS_GUARD = threading.Lock()
+EXPORT_LOCK_NAME = ".novel-export.lock"
+EXPORT_BACKUP_PREFIX = ".exports-backup-"
+EXPORT_GENERATION_PREFIX = ".novel-export-generation-"
+EXPORT_JOURNAL_NAME = ".novel-export-journal.json"
+EXPORT_JOURNAL_SCHEMA_VERSION = 2
+SUPPORTED_EXPORT_JOURNAL_SCHEMAS = frozenset({1, 2})
+EXPORT_LOCK_STALE_SECONDS = 3600.0
+_REAL_OS_REPLACE = os.replace
+
+
+def _thread_export_lock(root: Path) -> threading.RLock:
+    with _EXPORT_LOCKS_GUARD:
+        return _EXPORT_LOCKS.setdefault(root, threading.RLock())
+
+
+@contextlib.contextmanager
+def export_lock(root: Path):
+    """Serialize export installation in-process and across processes."""
+
+    _export_assert_no_links(root, root=root)
+    if not root.is_dir():
+        raise ExportError(f"Project root is not a directory: {root}")
+    local_lock = _thread_export_lock(root)
+    local_lock.acquire()
+    lock_path = root / EXPORT_LOCK_NAME
+    descriptor = None
+    token = secrets.token_hex(16)
+    lock_payload = (
+        f"pid={os.getpid()}\n"
+        f"created_at_epoch={time.time():.6f}\n"
+        f"created_at={utc_now()}\n"
+        f"token={token}\n"
+    )
+    try:
+        deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                descriptor = lock_path.open("x", encoding="ascii", newline="\n")
+                descriptor.write(lock_payload)
+                descriptor.flush()
+                os.fsync(descriptor.fileno())
+                break
+            except FileExistsError:
+                _reclaim_stale_export_lock(lock_path)
+                if time.monotonic() >= deadline:
+                    raise ExportError(
+                        f"Timed out waiting for the project export lock: {lock_path}"
+                    )
+                time.sleep(0.05)
+        yield
+    finally:
+        if descriptor is not None:
+            descriptor.close()
+            try:
+                raw = lock_path.read_text(encoding="ascii")
+                fields = _parse_export_lock(raw)
+                if fields.get("token") == token and fields.get("pid") == os.getpid():
+                    lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except (OSError, UnicodeError, ExportError):
+                # A lock changed or became malformed while this process was
+                # running. Never delete another owner's lock.
+                pass
+        local_lock.release()
+
+
+def _parse_export_lock(raw: str) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for line in raw.splitlines():
+        if "=" not in line:
+            raise ExportError("Malformed export lock")
+        key, value = line.split("=", 1)
+        if key in fields or not key:
+            raise ExportError("Malformed export lock")
+        fields[key] = value
+    try:
+        pid = int(fields["pid"])
+        created_epoch = float(fields["created_at_epoch"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ExportError("Malformed export lock") from exc
+    token = fields.get("token")
+    if pid <= 0 or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ExportError("Malformed export lock")
+    if not (created_epoch > 0 and created_epoch <= time.time() + 5):
+        raise ExportError("Malformed export lock timestamp")
+    fields["pid"] = pid
+    fields["created_at_epoch"] = created_epoch
+    return fields
+
+
+def _pid_is_alive(pid: int) -> bool | None:
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _reclaim_stale_export_lock(lock_path: Path) -> None:
+    try:
+        raw = lock_path.read_text(encoding="ascii")
+        fields = _parse_export_lock(raw)
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeError, ExportError) as exc:
+        raise ExportError(f"Cannot inspect export lock safely: {lock_path}: {exc}") from exc
+    age = time.time() - float(fields["created_at_epoch"])
+    if age < EXPORT_LOCK_STALE_SECONDS:
+        return
+    alive = _pid_is_alive(int(fields["pid"]))
+    if alive is not False:
+        return
+    # Re-read immediately before unlinking and require the same token. This
+    # prevents reclaiming a lock that was replaced by a live exporter.
+    try:
+        if lock_path.read_text(encoding="ascii") == raw:
+            lock_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ExportError(f"Unable to reclaim stale export lock: {exc}") from exc
+
+
+def _export_link_like(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        checker = getattr(path, "is_junction", None)
+        if checker and checker():
+            return True
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _export_assert_no_links(path: Path, *, root: Path | None = None) -> None:
+    # Walk the lexical path before resolving it.  Resolving first would hide a
+    # nested symlink/junction whose destination happens to remain under the
+    # expected directory.
+    current = Path(os.path.abspath(Path(path).expanduser()))
+    stop = (
+        Path(os.path.abspath(Path(root).expanduser())) if root is not None else None
+    )
+    while True:
+        if _export_link_like(current):
+            raise ExportError(f"Export path cannot traverse a link or reparse point: {path}")
+        if stop is not None and current == stop:
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+
+
+def _resolve_export_project(raw_root: str | Path) -> Path:
+    """Resolve a project root only after checking its lexical path chain."""
+
+    raw = Path(os.path.abspath(Path(raw_root).expanduser()))
+    _export_assert_no_links(raw)
+    root = raw.resolve()
+    _export_assert_no_links(root, root=root)
+    if not root.is_dir():
+        raise ExportError(f"Project root is not a directory: {root}")
+    return root
+
+
+def _export_tree_fingerprint(directory: Path) -> tuple[str, dict[str, dict[str, Any]]]:
+    if _export_link_like(directory) or not directory.is_dir():
+        raise ExportError(f"Export generation is not a regular directory: {directory}")
+    entries: dict[str, dict[str, Any]] = {}
+    for path in directory.rglob("*"):
+        relative = path.relative_to(directory).as_posix()
+        if _export_link_like(path):
+            raise ExportError(f"Export generation contains a link: {relative}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ExportError(f"Export generation contains a non-file: {relative}")
+        content = path.read_bytes()
+        entries[relative] = {"sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)}
+    digest = hashlib.sha256()
+    for relative in sorted(entries):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(entries[relative]["sha256"].encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest(), entries
+
+
+def _inventory_tree_hash(inventory: dict[str, dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(inventory):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(inventory[relative]["sha256"].encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _validate_export_inventory(value: Any, *, field: str) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        raise ExportError(f"Export journal field {field} must be an object")
+    normalized: dict[str, dict[str, Any]] = {}
+    for relative, record in value.items():
+        if not isinstance(relative, str):
+            raise ExportError(f"Export journal field {field} has a non-string path")
+        try:
+            normalized_relative = validate_managed_relative_path(relative)
+        except ExportError as exc:
+            raise ExportError(
+                f"Export journal field {field} has an invalid path: {relative}"
+            ) from exc
+        if normalized_relative != relative:
+            raise ExportError(
+                f"Export journal field {field} path is not normalized: {relative}"
+            )
+        if not isinstance(record, dict) or set(record) != {"sha256", "bytes"}:
+            raise ExportError(
+                f"Export journal field {field} has an invalid record: {relative}"
+            )
+        digest = record.get("sha256")
+        size = record.get("bytes")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ExportError(
+                f"Export journal field {field} has an invalid SHA-256: {relative}"
+            )
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ExportError(
+                f"Export journal field {field} has an invalid byte count: {relative}"
+            )
+        normalized[relative] = {"sha256": digest, "bytes": size}
+    return normalized
+
+
+def _write_export_journal(root: Path, journal: dict[str, Any]) -> None:
+    path = root / EXPORT_JOURNAL_NAME
+    _export_assert_no_links(path, root=root)
+    payload = json.dumps(journal, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+    handle = tempfile.NamedTemporaryFile("wb", delete=False, dir=root, prefix=".export-journal-", suffix=".tmp")
+    temp_path = Path(handle.name)
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _REAL_OS_REPLACE(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _read_export_journal(root: Path) -> dict[str, Any]:
+    path = root / EXPORT_JOURNAL_NAME
+    _export_assert_no_links(path, root=root)
+    if not path.is_file():
+        raise ExportError(f"Export journal is missing: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ExportError(f"Unreadable export journal: {exc}") from exc
+    if (
+        not isinstance(value, dict)
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") not in SUPPORTED_EXPORT_JOURNAL_SCHEMAS
+    ):
+        raise ExportError("Unsupported export journal schema")
+    if value.get("status") not in {
+        "building",
+        "ready",
+        "swapping",
+        "aborted",
+        "committed",
+    }:
+        raise ExportError("Invalid export journal status")
+    project_root = value.get("project_root")
+    if not isinstance(project_root, str):
+        raise ExportError("Export journal project_root is invalid")
+    project_root_path = Path(project_root).expanduser()
+    if not project_root_path.is_absolute():
+        raise ExportError("Export journal project_root must be absolute")
+    _export_assert_no_links(project_root_path)
+    if project_root_path.resolve() != root:
+        raise ExportError("Export journal belongs to another project")
+    generation = value.get("generation")
+    backup = value.get("backup")
+    if not isinstance(generation, str) or not generation.startswith(EXPORT_GENERATION_PREFIX):
+        raise ExportError("Export journal has an invalid generation path")
+    if not isinstance(backup, str) or not backup.startswith(EXPORT_BACKUP_PREFIX):
+        raise ExportError("Export journal has an invalid backup path")
+    for relative in (generation, backup):
+        if Path(relative).name != relative or "/" in relative or "\\" in relative:
+            raise ExportError("Export journal path must be a direct project child")
+        _export_assert_no_links(root / relative, root=root)
+    if value.get("output") != "exports":
+        raise ExportError("Export journal output path is invalid")
+    generation_id = value.get("generation_id")
+    if not isinstance(generation_id, str) or not re.fullmatch(
+        r"[0-9a-f]{32}", generation_id
+    ):
+        raise ExportError("Export journal has an invalid generation id")
+    if generation != f"{EXPORT_GENERATION_PREFIX}{generation_id}":
+        raise ExportError("Export journal generation path does not match its generation id")
+    if backup != f"{EXPORT_BACKUP_PREFIX}{generation_id}":
+        raise ExportError("Export journal backup path does not match its generation id")
+    for field in ("had_output", "old_output_moved", "new_output_installed"):
+        if type(value.get(field)) is not bool:
+            raise ExportError(f"Export journal field {field} must be boolean")
+    status = value["status"]
+    if status in {"building", "ready"} and (
+        value["old_output_moved"] or value["new_output_installed"]
+    ):
+        raise ExportError("Export journal flags conflict with its status")
+    if status == "committed" and (
+        not value["new_output_installed"]
+        or value["old_output_moved"] != value["had_output"]
+    ):
+        raise ExportError("Committed export journal has inconsistent swap flags")
+    if status == "aborted" and value["new_output_installed"]:
+        raise ExportError("Aborted export journal cannot record an installed output")
+
+    hash_fields = (
+        "tree_sha256",
+        "manifest_sha256",
+        "backup_tree_sha256",
+        "backup_manifest_sha256",
+    )
+    for field in hash_fields:
+        field_value = value.get(field)
+        if field_value is not None and (
+            not isinstance(field_value, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", field_value)
+        ):
+            raise ExportError(f"Export journal field {field} has an invalid SHA-256")
+    backup_generation_id = value.get("backup_generation_id")
+    if backup_generation_id is not None and (
+        not isinstance(backup_generation_id, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", backup_generation_id)
+    ):
+        raise ExportError("Export journal has an invalid backup generation id")
+    if status in {"ready", "swapping", "aborted", "committed"}:
+        if value.get("tree_sha256") is None or value.get("manifest_sha256") is None:
+            raise ExportError("Complete export journal lacks generation hashes")
+        if value["had_output"] and value.get("backup_tree_sha256") is None:
+            raise ExportError("Export journal lacks the previous output hash")
+        if not value["had_output"] and any(
+            value.get(field) is not None
+            for field in (
+                "backup_tree_sha256",
+                "backup_manifest_sha256",
+                "backup_generation_id",
+            )
+        ):
+            raise ExportError("Export journal records a backup for a missing prior output")
+        if (
+            value.get("backup_generation_id") is not None
+            and value.get("backup_manifest_sha256") is None
+        ):
+            raise ExportError("Backup generation id requires a backup manifest hash")
+    if value["schema_version"] >= 2:
+        generation_inventory = value.get("generation_inventory")
+        backup_inventory = value.get("backup_inventory")
+        if status == "building":
+            if generation_inventory is not None or backup_inventory is not None:
+                raise ExportError("Building export journal cannot contain final inventories")
+        else:
+            generation_inventory = _validate_export_inventory(
+                generation_inventory, field="generation_inventory"
+            )
+            backup_inventory = _validate_export_inventory(
+                backup_inventory, field="backup_inventory"
+            )
+            if _inventory_tree_hash(generation_inventory) != value.get("tree_sha256"):
+                raise ExportError("Export generation inventory does not match its tree hash")
+            generation_manifest = generation_inventory.get(EXPORT_MANIFEST)
+            if (
+                generation_manifest is None
+                or generation_manifest["sha256"] != value.get("manifest_sha256")
+            ):
+                raise ExportError("Export generation inventory does not bind its manifest")
+            if value["had_output"]:
+                if _inventory_tree_hash(backup_inventory) != value.get(
+                    "backup_tree_sha256"
+                ):
+                    raise ExportError("Export backup inventory does not match its tree hash")
+                backup_manifest = backup_inventory.get(EXPORT_MANIFEST)
+                expected_manifest = value.get("backup_manifest_sha256")
+                if expected_manifest is None:
+                    if backup_manifest is not None:
+                        raise ExportError(
+                            "Export backup inventory has an unexpected manifest"
+                        )
+                elif (
+                    backup_manifest is None
+                    or backup_manifest["sha256"] != expected_manifest
+                ):
+                    raise ExportError("Export backup inventory does not bind its manifest")
+            elif backup_inventory:
+                raise ExportError("Export journal has backup inventory without prior output")
+            value["generation_inventory"] = generation_inventory
+            value["backup_inventory"] = backup_inventory
+    return value
+
+
+def _inspect_export_removal_tree(
+    path: Path,
+    *,
+    expected_inventory: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[tuple[Path, str, dict[str, Any]]], list[Path]]:
+    if _export_link_like(path):
+        raise ExportError(f"Refusing to remove link-like export artifact: {path}")
+    if not path.exists():
+        return [], []
+    if not path.is_dir():
+        raise ExportError(f"Export cleanup root is not a directory: {path}")
+
+    expected_directories: set[str] | None = None
+    if expected_inventory is not None:
+        expected_directories = set()
+        for relative in expected_inventory:
+            parts = relative.split("/")[:-1]
+            for index in range(1, len(parts) + 1):
+                expected_directories.add("/".join(parts[:index]))
+
+    files: list[tuple[Path, str, dict[str, Any]]] = []
+    directories: list[Path] = []
+
+    def inspect(directory: Path) -> None:
+        if _export_link_like(directory) or not directory.is_dir():
+            raise ExportError(
+                f"Export cleanup directory is link-like or invalid: {directory}"
+            )
+        for child in directory.iterdir():
+            if _export_link_like(child):
+                raise ExportError(f"Refusing to remove link-like export artifact: {child}")
+            relative = child.relative_to(path).as_posix()
+            if child.is_dir():
+                if expected_directories is not None and relative not in expected_directories:
+                    raise ExportError(
+                        f"Export cleanup found an unexpected directory: {relative}"
+                    )
+                inspect(child)
+                continue
+            if not child.is_file():
+                raise ExportError(f"Export cleanup found a non-file: {relative}")
+            content = novel_project.read_stable_bytes(
+                child, label=f"export cleanup artifact {relative}"
+            )
+            record = {
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "bytes": len(content),
+            }
+            if expected_inventory is not None:
+                expected = expected_inventory.get(relative)
+                if expected is None:
+                    raise ExportError(
+                        f"Export cleanup found an unexpected file: {relative}"
+                    )
+                if record != expected:
+                    raise ExportError(
+                        f"Export cleanup file changed before removal: {relative}"
+                    )
+            files.append((child, relative, record))
+        directories.append(directory)
+
+    try:
+        inspect(path)
+    except novel_project.ProjectError as exc:
+        raise ExportError(str(exc)) from exc
+    return files, directories
+
+
+def _cleanup_remainder_is_valid(
+    path: Path, inventory: dict[str, dict[str, Any]] | None
+) -> bool:
+    if inventory is None:
+        return False
+    try:
+        _inspect_export_removal_tree(path, expected_inventory=inventory)
+    except (ExportError, OSError):
+        return False
+    return True
+
+
+def _remove_export_artifact(
+    path: Path,
+    *,
+    expected_inventory: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    files, directories = _inspect_export_removal_tree(
+        path, expected_inventory=expected_inventory
+    )
+    for child, relative, expected in files:
+        if _export_link_like(child) or not child.is_file():
+            raise ExportError(f"Export cleanup artifact changed type: {relative}")
+        try:
+            content = novel_project.read_stable_bytes(
+                child, label=f"export cleanup artifact {relative}"
+            )
+        except novel_project.ProjectError as exc:
+            raise ExportError(str(exc)) from exc
+        current = {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "bytes": len(content),
+        }
+        if current != expected:
+            raise ExportError(f"Export cleanup artifact changed: {relative}")
+        child.unlink()
+    for directory in directories:
+        if _export_link_like(directory) or not directory.is_dir():
+            raise ExportError(f"Export cleanup directory changed: {directory}")
+        directory.rmdir()
+
+
+def _validate_export_artifact(
+    path: Path,
+    expected_tree_hash: str | None,
+    expected_manifest_hash: str | None,
+    generation_id: str | None,
+    *,
+    require_manifest: bool = True,
+) -> bool:
+    if (
+        not isinstance(expected_tree_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_tree_hash)
+        or (
+            expected_manifest_hash is not None
+            and (
+                not isinstance(expected_manifest_hash, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_manifest_hash)
+            )
+        )
+        or (
+            generation_id is not None
+            and (
+                not isinstance(generation_id, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", generation_id)
+            )
+        )
+        or not path.is_dir()
+        or _export_link_like(path)
+    ):
+        return False
+    try:
+        tree_hash, _ = _export_tree_fingerprint(path)
+        if tree_hash != expected_tree_hash:
+            return False
+        manifest_path = path / EXPORT_MANIFEST
+        if expected_manifest_hash is None:
+            return (
+                not require_manifest
+                and generation_id is None
+                and not manifest_path.exists()
+            )
+        if not manifest_path.is_file() or _export_link_like(manifest_path):
+            return False
+        if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != expected_manifest_hash:
+            return False
+        manifest = read_previous_manifest(path)
+    except (AttributeError, ExportError, OSError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    return generation_id is None or manifest.get("generation_id") == generation_id
+
+
+def _validate_previous_export(path: Path, journal: dict[str, Any]) -> bool:
+    if not journal["had_output"]:
+        return not path.exists()
+    return _validate_export_artifact(
+        path,
+        journal.get("backup_tree_sha256"),
+        journal.get("backup_manifest_sha256"),
+        journal.get("backup_generation_id"),
+        require_manifest=journal.get("backup_manifest_sha256") is not None,
+    )
+
+
+def _remove_empty_generation_parent(path: Path) -> None:
+    if not path.exists():
+        return
+    if _export_link_like(path) or not path.is_dir():
+        raise ExportError(f"Export generation parent is not a regular directory: {path}")
+    if any(path.iterdir()):
+        raise ExportError(f"Export generation parent contains unexpected artifacts: {path}")
+    path.rmdir()
+
+
+def recover_export_generations(root: Path, output_root: Path) -> list[str]:
+    """Recover only artifacts explicitly named by the durable export journal."""
+
+    raw_root = Path(root).expanduser()
+    _export_assert_no_links(raw_root)
+    root = raw_root.resolve()
+    expected_output = root / "exports"
+    _export_assert_no_links(Path(output_root).expanduser(), root=root)
+    if Path(output_root).expanduser().resolve() != expected_output:
+        raise ExportError("Export recovery output path does not match the project root")
+    _export_assert_no_links(root, root=root)
+    journal_path = root / EXPORT_JOURNAL_NAME
+    if not journal_path.exists():
+        # Never guess which unjournaled generation belongs to which run.
+        return []
+    journal = _read_export_journal(root)
+    generation_parent = root / journal["generation"]
+    generation = generation_parent / "exports"
+    backup = root / journal["backup"]
+    generation_id = journal["generation_id"]
+    tree_hash = journal.get("tree_sha256")
+    manifest_hash = journal.get("manifest_sha256")
+    generation_inventory = journal.get("generation_inventory")
+    backup_inventory = journal.get("backup_inventory")
+    status = journal["status"]
+    recovery_action: str | None = None
+    if status == "building":
+        if backup.exists():
+            raise ExportError("Building export journal has an unexpected backup directory")
+        if generation_parent.exists():
+            _remove_export_artifact(generation_parent)
+        journal_path.unlink(missing_ok=True)
+        return ["discarded incomplete export build"]
+
+    generation_valid = _validate_export_artifact(
+        generation, tree_hash, manifest_hash, generation_id
+    )
+    output_valid = _validate_export_artifact(
+        output_root, tree_hash, manifest_hash, generation_id
+    )
+    previous_output_valid = _validate_previous_export(output_root, journal)
+    backup_valid = _validate_previous_export(backup, journal)
+
+    if status == "ready":
+        if not generation_valid:
+            raise ExportError("Ready export generation failed integrity validation")
+        if backup.exists():
+            raise ExportError("Ready export journal has an unexpected backup directory")
+        if not previous_output_valid:
+            raise ExportError("Existing export package changed while a generation was prepared")
+        if journal["schema_version"] >= 2:
+            journal["status"] = "aborted"
+            _write_export_journal(root, journal)
+            status = "aborted"
+            recovery_action = "discarded uninstalled export generation"
+        else:
+            _remove_export_artifact(generation_parent)
+            journal_path.unlink(missing_ok=True)
+            return ["discarded uninstalled export generation"]
+
+    if status == "swapping":
+        # The process can die between the directory rename and the journal
+        # flag update. A fully validated new output is therefore sufficient
+        # evidence that the swap completed.
+        if output_valid:
+            if generation.exists():
+                raise ExportError(
+                    "Installed output and staged generation both exist; recovery is ambiguous"
+                )
+            if backup.exists():
+                if not journal["had_output"] or not backup_valid:
+                    raise ExportError(
+                        "Previous export backup changed before completed swap cleanup"
+                    )
+            elif journal["had_output"]:
+                raise ExportError(
+                    "Installed export has no recoverable previous-package backup"
+                )
+            journal["old_output_moved"] = journal["had_output"]
+            journal["new_output_installed"] = True
+            journal["status"] = "committed"
+            _write_export_journal(root, journal)
+            status = "committed"
+            recovery_action = "completed export swap"
+
+        elif output_root.exists():
+            # Directory installation is atomic. An installed directory that
+            # does not match either journaled package was changed externally;
+            # never delete or overwrite it during automatic recovery.
+            if previous_output_valid and not backup.exists() and generation_valid:
+                journal["new_output_installed"] = False
+                journal["status"] = "aborted"
+                _write_export_journal(root, journal)
+                status = "aborted"
+                recovery_action = "discarded uninstalled export generation"
+            else:
+                raise ExportError("Export output changed during swap recovery")
+
+        elif journal["had_output"] and backup.exists() and backup_valid:
+            _REAL_OS_REPLACE(backup, output_root)
+            if not _validate_previous_export(output_root, journal):
+                raise ExportError("Restored previous export failed integrity validation")
+            journal["old_output_moved"] = True
+            journal["new_output_installed"] = False
+            journal["status"] = "aborted"
+            _write_export_journal(root, journal)
+            status = "aborted"
+            recovery_action = "restored previous export package"
+
+        elif (
+            not journal["had_output"]
+            and not backup.exists()
+            and generation_valid
+        ):
+            journal["new_output_installed"] = False
+            journal["status"] = "aborted"
+            _write_export_journal(root, journal)
+            status = "aborted"
+            recovery_action = "discarded uninstalled export generation"
+        else:
+            raise ExportError("Export swap journal cannot be reconciled safely")
+
+    if status == "aborted":
+        if not _validate_previous_export(output_root, journal):
+            raise ExportError("Aborted export no longer matches the previous package")
+        if backup.exists():
+            raise ExportError("Aborted export unexpectedly retains a backup package")
+        if generation.exists():
+            if journal["schema_version"] < 2 or not _cleanup_remainder_is_valid(
+                generation, generation_inventory
+            ):
+                raise ExportError("Aborted export generation changed before cleanup")
+            _remove_export_artifact(
+                generation, expected_inventory=generation_inventory
+            )
+        _remove_empty_generation_parent(generation_parent)
+        journal_path.unlink(missing_ok=True)
+        return [recovery_action or "cleaned aborted export generation"]
+
+    if status == "committed":
+        if not output_valid:
+            raise ExportError("Committed export package failed integrity validation")
+        if backup.exists():
+            if not journal["had_output"]:
+                raise ExportError("Committed export has an unexpected backup package")
+            if journal["schema_version"] >= 2:
+                if not _cleanup_remainder_is_valid(backup, backup_inventory):
+                    raise ExportError(
+                        "Committed export backup changed before cleanup"
+                    )
+                _remove_export_artifact(
+                    backup, expected_inventory=backup_inventory
+                )
+            else:
+                if not backup_valid:
+                    raise ExportError("Committed export backup failed integrity validation")
+                _remove_export_artifact(backup)
+        if generation.exists():
+            raise ExportError("Committed export retains an unexpected staged package")
+        _remove_empty_generation_parent(generation_parent)
+        journal_path.unlink(missing_ok=True)
+        return [recovery_action or "cleaned committed export journal"]
+    raise ExportError("Unknown export journal status")
 
 
 @dataclass(frozen=True)
@@ -1892,16 +2660,29 @@ def output_path(output_root: Path, relative: str) -> Path:
     normalized = validate_managed_relative_path(relative)
     if not normalized or normalized == EXPORT_MANIFEST:
         raise ExportError(f"Invalid managed output path: {relative}")
-    target = (output_root / Path(normalized)).resolve()
+    raw_output = Path(output_root).expanduser()
+    _export_assert_no_links(raw_output)
+    raw_target = raw_output / Path(normalized)
+    _export_assert_no_links(raw_target)
+    output_resolved = raw_output.resolve()
+    target = raw_target.resolve()
+    # Check the original chain again after resolution to cover a replacement
+    # between the first inspection and the path calculation.
+    _export_assert_no_links(raw_target)
+    _export_assert_no_links(target, root=output_resolved.parent)
     try:
-        target.relative_to(output_root.resolve())
+        target.relative_to(output_resolved)
     except ValueError as exc:
         raise ExportError(f"Managed output leaves exports directory: {relative}") from exc
     return target
 
 
 def read_previous_manifest(output_root: Path) -> dict[str, Any] | None:
+    _export_assert_no_links(output_root)
+    if output_root.exists() and not output_root.is_dir():
+        raise ExportError("Exports path is not a directory")
     path = output_root / EXPORT_MANIFEST
+    _export_assert_no_links(path, root=output_root.parent)
     if not path.is_file():
         return None
     try:
@@ -1968,15 +2749,17 @@ def validate_output_record(output_root: Path, record: dict[str, Any]) -> str | N
         not isinstance(relative, str)
         or not isinstance(expected, str)
         or not isinstance(expected_bytes, int)
+        or isinstance(expected_bytes, bool)
         or expected_bytes < 0
+        or not re.fullmatch(r"[0-9a-f]{64}", expected)
     ):
         return "manifest output record is malformed"
     try:
         path = output_path(output_root, relative)
     except ExportError as exc:
         return str(exc)
-    if path.is_symlink():
-        return f"managed output is a symbolic link: {relative}"
+    if _export_link_like(path):
+        return f"managed output is a link or reparse point: {relative}"
     if not path.is_file():
         return f"managed output is missing: {relative}"
     if path.stat().st_size != expected_bytes:
@@ -2183,6 +2966,7 @@ def unmanaged_export_files(
 ) -> list[str]:
     if not output_root.is_dir():
         return []
+    _export_assert_no_links(output_root)
     managed = {EXPORT_MANIFEST}
     if manifest is not None:
         for record in manifest.get("outputs", []):
@@ -2190,9 +2974,17 @@ def unmanaged_export_files(
                 managed.add(record["path"].replace("\\", "/"))
     extras: list[str] = []
     for path in output_root.rglob("*"):
+        if _export_link_like(path):
+            raise ExportError(f"Exports directory contains a link or reparse point: {path}")
         if not path.is_file() and not path.is_symlink():
             continue
         relative = path.relative_to(output_root).as_posix()
+        if any(
+            part.startswith((EXPORT_BACKUP_PREFIX, EXPORT_GENERATION_PREFIX))
+            or part in {EXPORT_LOCK_NAME, EXPORT_JOURNAL_NAME}
+            for part in Path(relative).parts
+        ):
+            continue
         if relative not in managed:
             extras.append(relative)
     return sorted(extras)
@@ -2318,7 +3110,7 @@ def planned_outputs(
     return records
 
 
-def export_project(args: argparse.Namespace) -> dict[str, Any]:
+def _export_project_locked(args: argparse.Namespace) -> dict[str, Any]:
     try:
         novel_continuity.ensure_delivery_allowed(args.root)
     except novel_continuity.ContinuityError as exc:
@@ -2337,9 +3129,10 @@ def export_project(args: argparse.Namespace) -> dict[str, Any]:
         )
     formats = normalize_formats(args.format)
     output_root = snapshot.root / "exports"
-    if output_root.is_symlink():
-        raise ExportError("Project exports directory cannot be a symbolic link")
-    output_root.mkdir(parents=True, exist_ok=True)
+    if _export_link_like(output_root):
+        raise ExportError("Project exports directory cannot be a link or reparse point")
+    if output_root.exists() and not output_root.is_dir():
+        raise ExportError("Project exports path must be a directory")
     previous = read_previous_manifest(output_root)
     unmanaged = unmanaged_export_files(output_root, previous)
     if unmanaged:
@@ -2348,10 +3141,38 @@ def export_project(args: argparse.Namespace) -> dict[str, Any]:
             f"delivery package before exporting: {', '.join(unmanaged[:8])}"
         )
     generated_at = utc_now()
-
-    with tempfile.TemporaryDirectory(prefix=".novel-export-", dir=output_root) as temp:
-        staging = Path(temp)
-        new_records = planned_outputs(staging, snapshot, formats, generated_at)
+    generation_id = uuid.uuid4().hex
+    staging = snapshot.root / f"{EXPORT_GENERATION_PREFIX}{generation_id}"
+    generation = staging / "exports"
+    backup_root = snapshot.root / f"{EXPORT_BACKUP_PREFIX}{generation_id}"
+    if staging.exists() or backup_root.exists():
+        raise ExportError("An export generation with the same id already exists")
+    had_output = output_root.exists()
+    staging.mkdir()
+    generation.mkdir()
+    journal: dict[str, Any] = {
+        "schema_version": EXPORT_JOURNAL_SCHEMA_VERSION,
+        "project_root": str(snapshot.root),
+        "status": "building",
+        "generation_id": generation_id,
+        "generation": staging.name,
+        "backup": backup_root.name,
+        "output": "exports",
+        "had_output": had_output,
+        "old_output_moved": False,
+        "new_output_installed": False,
+        "tree_sha256": None,
+        "manifest_sha256": None,
+        "backup_tree_sha256": None,
+        "backup_manifest_sha256": None,
+        "backup_generation_id": None,
+        "generation_inventory": None,
+        "backup_inventory": None,
+        "created_at": generated_at,
+    }
+    _write_export_journal(snapshot.root, journal)
+    try:
+        new_records = planned_outputs(generation, snapshot, formats, generated_at)
         new_by_path = {record["path"]: record for record in new_records}
         previous_records = previous.get("outputs", []) if previous else []
         previous_source = (
@@ -2373,9 +3194,11 @@ def export_project(args: argparse.Namespace) -> dict[str, Any]:
                 continue
             issue = validate_output_record(output_root, record)
             if same_source and format_name not in formats and issue is None:
-                preserved.append(
-                    rebuild_record_from_existing(output_root, record, snapshot)
-                )
+                source = output_path(output_root, relative)
+                preserved.append(rebuild_record_from_existing(output_root, record, snapshot))
+                target = output_path(generation, relative)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
                 continue
             if issue is not None and not args.force:
                 raise ExportError(f"{issue}; use --force only if replacement is intended")
@@ -2454,6 +3277,7 @@ def export_project(args: argparse.Namespace) -> dict[str, Any]:
         )
         manifest = {
             "schema_version": EXPORT_SCHEMA_VERSION,
+            "generation_id": generation_id,
             "kind": (
                 "chinese-short-story-derived-exports"
                 if snapshot.work_type == "short_story"
@@ -2498,33 +3322,92 @@ def export_project(args: argparse.Namespace) -> dict[str, Any]:
         }
         if snapshot.work_type == "short_story":
             manifest["fanqie_publication_profile"] = "fanqie_short_story"
-        manifest_stage = staging / EXPORT_MANIFEST
+        manifest_stage = generation / EXPORT_MANIFEST
         write_utf8(
             manifest_stage,
             json.dumps(manifest, ensure_ascii=False, indent=2),
             context="export-manifest.json",
         )
 
-        for record in new_records:
-            relative = record["path"]
-            source = staging / Path(relative)
-            target = output_path(output_root, relative)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.is_symlink():
-                if not args.force:
-                    raise ExportError(f"Refusing to replace symbolic link: {relative}")
-                target.unlink()
-            os.replace(source, target)
-        for stale in sorted(stale_paths, key=lambda item: len(item.parts), reverse=True):
-            if stale.is_symlink() or stale.is_file():
-                stale.unlink()
-        fanqie_dir = output_root / "fanqie"
-        if fanqie_dir.is_dir() and not any(fanqie_dir.iterdir()):
-            fanqie_dir.rmdir()
-        short_story_dir = output_root / "fanqie-short-story"
-        if short_story_dir.is_dir() and not any(short_story_dir.iterdir()):
-            short_story_dir.rmdir()
-        os.replace(manifest_stage, output_root / EXPORT_MANIFEST)
+        # Validate the assembled generation before it can become visible.
+        for record in output_records:
+            issue = validate_output_record(generation, record)
+            if issue is not None:
+                raise ExportError(f"Generated output failed final validation: {issue}")
+        tree_hash, generation_inventory = _export_tree_fingerprint(generation)
+        manifest_hash = hashlib.sha256(manifest_stage.read_bytes()).hexdigest()
+        backup_tree_hash = None
+        backup_manifest_hash = None
+        backup_generation_id = None
+        backup_inventory: dict[str, dict[str, Any]] = {}
+        if had_output:
+            backup_tree_hash, backup_inventory = _export_tree_fingerprint(output_root)
+            old_manifest_path = output_root / EXPORT_MANIFEST
+            if old_manifest_path.is_file():
+                backup_manifest_hash = hashlib.sha256(old_manifest_path.read_bytes()).hexdigest()
+                try:
+                    old_manifest = read_previous_manifest(output_root)
+                except ExportError:
+                    old_manifest = None
+                if isinstance(old_manifest, dict):
+                    backup_generation_id = old_manifest.get("generation_id")
+        journal.update(
+            {
+                "status": "ready",
+                "tree_sha256": tree_hash,
+                "manifest_sha256": manifest_hash,
+                "backup_tree_sha256": backup_tree_hash,
+                "backup_manifest_sha256": backup_manifest_hash,
+                "backup_generation_id": backup_generation_id,
+                "generation_inventory": generation_inventory,
+                "backup_inventory": backup_inventory,
+            }
+        )
+        _write_export_journal(snapshot.root, journal)
+        journal["status"] = "swapping"
+        _write_export_journal(snapshot.root, journal)
+        if had_output:
+            if not _validate_previous_export(output_root, journal):
+                raise ExportError(
+                    "Existing export package changed immediately before installation"
+                )
+            os.replace(output_root, backup_root)
+            journal["old_output_moved"] = True
+            _write_export_journal(snapshot.root, journal)
+            if not _validate_previous_export(backup_root, journal):
+                raise ExportError(
+                    "Previous export package changed while it was moved to backup"
+                )
+        elif output_root.exists():
+            raise ExportError("An export package appeared immediately before installation")
+        os.replace(generation, output_root)
+        if not _validate_export_artifact(
+            output_root, tree_hash, manifest_hash, generation_id
+        ):
+            raise ExportError("Installed export package failed integrity validation")
+        journal["new_output_installed"] = True
+        _write_export_journal(snapshot.root, journal)
+        # The new output is now the authoritative derived package. Mark the
+        # swap committed before deleting backups so a crash during cleanup is
+        # recoverable without risking the valid package.
+        journal["status"] = "committed"
+        _write_export_journal(snapshot.root, journal)
+    except BaseException:
+        # Keep the durable journal and generation for the next invocation when
+        # interrupted by Ctrl+C, process termination, or a hard crash.
+        raise
+
+    try:
+        if backup_root.exists():
+            _remove_export_artifact(
+                backup_root, expected_inventory=backup_inventory
+            )
+        _remove_empty_generation_parent(staging)
+        (snapshot.root / EXPORT_JOURNAL_NAME).unlink(missing_ok=True)
+    except (OSError, ExportError):
+        # A committed package remains valid even if cleanup was interrupted;
+        # recover_export_generations will retry it on the next export/status.
+        pass
 
     result = {
         "status": "exported",
@@ -2542,6 +3425,17 @@ def export_project(args: argparse.Namespace) -> dict[str, Any]:
     if snapshot.work_type == "short_story":
         result["work_type"] = snapshot.work_type
     return result
+
+
+def export_project(args: argparse.Namespace) -> dict[str, Any]:
+    root = _resolve_export_project(args.root)
+    normalized_values = vars(args).copy()
+    normalized_values["root"] = str(root)
+    normalized_args = argparse.Namespace(**normalized_values)
+    with export_lock(root):
+        output_root = root / "exports"
+        recover_export_generations(root, output_root)
+        return _export_project_locked(normalized_args)
 
 
 def normalization_report_is_valid(value: Any) -> bool:
@@ -2631,7 +3525,14 @@ def validate_delivery_quality_manifest(
 
 
 def export_status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
-    continuity = novel_continuity.continuity_status(args.root)
+    status_root = _resolve_export_project(args.root)
+    if (status_root / EXPORT_JOURNAL_NAME).exists():
+        # Recovery is serialized with export installation. A status query may
+        # therefore finish an interrupted cleanup, but it never guesses at
+        # unjournaled artifacts.
+        with export_lock(status_root):
+            recover_export_generations(status_root, status_root / "exports")
+    continuity = novel_continuity.continuity_status(status_root)
     if continuity["delivery_blocked"]:
         return {
             "status": "blocked",
@@ -2645,7 +3546,7 @@ def export_status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 *(continuity.get("warnings") or []),
             ],
         }, 1
-    review = novel_review.review_status(args.root)
+    review = novel_review.review_status(status_root)
     if review["review_due"]:
         return {
             "status": "blocked",
@@ -2663,7 +3564,7 @@ def export_status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 )
             ],
         }, 1
-    snapshot = load_snapshot(args.root)
+    snapshot = load_snapshot(status_root)
     output_root = snapshot.root / "exports"
     manifest = read_previous_manifest(output_root)
     if manifest is None:
@@ -2824,7 +3725,9 @@ def main() -> int:
     def dispatch(args: argparse.Namespace) -> Any:
         if args.command == "export":
             return export_project(args)
-        return export_status(args)
+        if args.command == "status":
+            return export_status(args)
+        raise ExportError(f"Unsupported command: {args.command}")
 
     return novel_cli.run_cli(
         build_parser,

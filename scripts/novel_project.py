@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import shutil
+import stat
 import sys
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +22,9 @@ from typing import Any
 import novel_review
 import novel_continuity
 import novel_cli
+
+
+_REAL_OS_REPLACE = os.replace
 
 
 SCHEMA_VERSION = 1
@@ -36,6 +43,24 @@ FRAMEWORK_STAGES = frozenset(
     }
 )
 FRAMEWORK_CONFIRMATIONS = frozenset({"pending", "confirmed"})
+FRAMEWORK_CANONICAL_FILES = (
+    "story-bible/premise.md",
+    "story-bible/cast.md",
+    "story-bible/world.md",
+    "story-bible/style-guide.md",
+    "outlines/master-outline.md",
+)
+FRAMEWORK_MEMORY_FILES = (
+    "memory/decisions.md",
+    "memory/book-summary.md",
+)
+FRAMEWORK_SYNC_FILES = (
+    "planning/framework-session.md",
+    *FRAMEWORK_CANONICAL_FILES,
+    *FRAMEWORK_MEMORY_FILES,
+)
+FRAMEWORK_SETTINGS_FILE = "project-settings.json"
+FRAMEWORK_SYNC_SOURCE_FILES = (*FRAMEWORK_SYNC_FILES, FRAMEWORK_SETTINGS_FILE)
 CANDIDATE_APPROVALS = frozenset({"pending", "approved", "revision_requested"})
 DEEP_ANALYSIS_STAGES = frozenset({"not_started", "in_progress", "complete"})
 REQUIRED_DIRS = (
@@ -91,6 +116,11 @@ UPGRADE_FILES = (
 CHAPTER_NAME = re.compile(
     r"^(?P<number>\d{4})(?:-[^/\\]+)?\.md$", re.IGNORECASE
 )
+TRANSACTION_DIRNAME = ".novel-transaction"
+TRANSACTION_SCHEMA_VERSION = 1
+UPGRADE_TRANSACTION_DIRNAME = ".novel-upgrade-transaction"
+UPGRADE_TRANSACTION_SCHEMA_VERSION = 1
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MARKDOWN_LINK = re.compile(r"\]\((?P<target>[^)#]+\.md)(?:#[^)]+)?\)", re.IGNORECASE)
 INDEX_TITLE = re.compile(
     r"^\|\s*(?P<number>\d{4})\s*\|\s*(?P<title>(?:\\\||[^|])*)\|"
@@ -102,6 +132,29 @@ SERIAL_CHAPTER_HEADING = re.compile(
 
 class ProjectError(RuntimeError):
     pass
+
+
+def project_write_context(root: Path, args: argparse.Namespace):
+    """Return the shared function-level write authorization context."""
+
+    try:
+        import novel_workspace
+    except (ImportError, OSError) as exc:
+        raise ProjectError(f"Project write authorization module unavailable: {exc}") from exc
+    @contextlib.contextmanager
+    def _context():
+        try:
+            with novel_workspace.project_write_context(
+                root,
+                workspace=getattr(args, "workspace", None),
+                work_id=getattr(args, "work_id", None),
+                allow_bootstrap=bool(getattr(args, "allow_bootstrap", False)),
+            ) as context:
+                yield context
+        except novel_workspace.WorkspaceError as exc:
+            raise ProjectError(str(exc)) from exc
+
+    return _context()
 
 
 def work_type_for_manifest(manifest: dict[str, Any]) -> str:
@@ -119,7 +172,12 @@ def utc_now() -> str:
 
 
 def resolve_root(raw_root: str) -> Path:
-    root = Path(raw_root).expanduser().resolve()
+    raw = Path(raw_root).expanduser()
+    if _contains_symlink(raw):
+        raise ProjectError(
+            f"Project path cannot traverse a symbolic link or reparse point: {raw}"
+        )
+    root = raw.resolve()
     anchor = Path(root.anchor).resolve()
     home = Path.home().resolve()
     if root == anchor:
@@ -151,12 +209,10 @@ def dump_json(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
 
-def atomic_write_text(path: Path, content: str) -> None:
+def atomic_write_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        newline="\n",
+        "wb",
         delete=False,
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -185,12 +241,611 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def read_stable_bytes(path: Path, *, label: str = "file") -> bytes:
+    """Read bytes without following a link or accepting a replacement race."""
+
+    raw = Path(path).expanduser()
+    if _contains_symlink(raw):
+        raise ProjectError(
+            f"{label} cannot traverse a symbolic link or reparse point: {raw}"
+        )
+    try:
+        with raw.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            content = handle.read()
+            after = os.fstat(handle.fileno())
+        path_stat = raw.stat()
+    except OSError as exc:
+        raise ProjectError(f"Unable to read {label}: {raw}: {exc}") from exc
+    identity_before = (
+        getattr(before, "st_dev", None),
+        getattr(before, "st_ino", None),
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    identity_after = (
+        getattr(after, "st_dev", None),
+        getattr(after, "st_ino", None),
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    path_identity = (
+        getattr(path_stat, "st_dev", None),
+        getattr(path_stat, "st_ino", None),
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
+    )
+    if identity_before != identity_after or identity_after != path_identity:
+        raise ProjectError(f"{label} changed while being read: {raw}")
+    return content
+
+
 def is_within(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
     except ValueError:
         return False
     return True
+
+
+def _link_like(path: Path) -> bool:
+    """Detect symlinks, junctions and Windows reparse points without following them."""
+
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if is_junction and is_junction():
+            return True
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _contains_symlink(path: Path) -> bool:
+    current = path
+    while True:
+        if _link_like(current):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _assert_tree_has_no_links(root: Path) -> None:
+    """Refuse to copy or mutate a project tree containing link-like entries."""
+
+    if _contains_symlink(root):
+        raise ProjectError(f"Project path cannot traverse a symbolic link or junction: {root}")
+    try:
+        entries = list(root.rglob("*"))
+    except OSError as exc:
+        raise ProjectError(f"Unable to inspect project tree: {exc}") from exc
+    for entry in entries:
+        if _link_like(entry):
+            raise ProjectError(f"Project tree contains a symbolic link or junction: {entry}")
+
+
+def _validate_transaction_target(
+    target: Path, root: Path | None = None, *, require_regular_file: bool = True
+) -> Path:
+    raw = Path(target).expanduser()
+    if _contains_symlink(raw):
+        raise ProjectError(f"Transactional target cannot use a symbolic link: {target}")
+    resolved = raw.resolve()
+    if root is not None and not is_within(resolved, root):
+        raise ProjectError(f"Transactional target is outside journal root: {resolved}")
+    if require_regular_file and resolved.exists() and not resolved.is_file():
+        raise ProjectError(f"Transactional target is not a regular file: {resolved}")
+    return resolved
+
+
+def _atomic_write_bytes_unpatched(path: Path, content: bytes) -> None:
+    """Write transaction metadata without sharing the target replace hook."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "wb",
+        delete=False,
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(handle.name)
+    try:
+        with handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Use the import-time function so journal bookkeeping stays
+        # independent from the target-file replace hook used by tests.
+        _REAL_OS_REPLACE(temp_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort parent-directory durability for rename metadata.
+
+    Windows does not expose a portable stdlib directory handle that can be
+    fsynced.  POSIX filesystems generally do; failures there are deliberately
+    ignored because the file data itself has already been flushed and a
+    platform-specific directory fsync must not make the transaction unusable.
+    """
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        os.fsync(descriptor)
+    except OSError:
+        return
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _transaction_root(root: Path) -> Path:
+    return root / TRANSACTION_DIRNAME
+
+
+def _remove_transaction_directory(path: Path) -> None:
+    """Remove transaction metadata only after validating the complete tree."""
+
+    files: list[Path] = []
+    directories: list[Path] = []
+
+    def inspect(directory: Path) -> None:
+        if _link_like(directory):
+            raise ProjectError(
+                f"Refusing to remove link-like transaction artifact: {directory}"
+            )
+        if not directory.is_dir():
+            raise ProjectError(f"Transaction artifact is not a directory: {directory}")
+        for child in directory.iterdir():
+            if _link_like(child):
+                raise ProjectError(
+                    f"Refusing to remove link-like transaction artifact: {child}"
+                )
+            if child.is_dir():
+                inspect(child)
+            elif child.is_file():
+                files.append(child)
+            else:
+                raise ProjectError(f"Unexpected transaction artifact: {child}")
+        directories.append(directory)
+
+    if _link_like(path):
+        raise ProjectError(
+            f"Refusing to remove link-like transaction artifact: {path}"
+        )
+    if not path.exists():
+        return
+    inspect(path)
+    for child in files:
+        if _link_like(child) or not child.is_file():
+            raise ProjectError(
+                f"Transaction artifact changed during cleanup: {child}"
+            )
+        child.unlink()
+    for directory in directories:
+        if _link_like(directory) or not directory.is_dir():
+            raise ProjectError(
+                f"Transaction directory changed during cleanup: {directory}"
+            )
+        directory.rmdir()
+
+
+def _read_transaction_journal(path: Path) -> dict[str, Any]:
+    if _contains_symlink(path):
+        raise ProjectError(f"Transaction journal cannot use a symbolic link: {path}")
+    if not path.is_file():
+        raise ProjectError(f"Transaction journal is missing: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ProjectError(f"Unreadable transaction journal: {path}: {exc}") from exc
+    if (
+        not isinstance(data, dict)
+        or type(data.get("schema_version")) is not int
+        or data.get("schema_version") != TRANSACTION_SCHEMA_VERSION
+    ):
+        raise ProjectError(f"Unsupported transaction journal: {path}")
+    status = data.get("status")
+    if not isinstance(status, str) or status not in {
+        "prepared",
+        "applying",
+        "rolled_back",
+        "committed",
+    }:
+        raise ProjectError(f"Invalid transaction journal status: {path}")
+    files = data.get("files")
+    if not isinstance(files, list) or not files:
+        raise ProjectError(f"Transaction journal has no files: {path}")
+    preconditions = data.get("preconditions", [])
+    if not isinstance(preconditions, list):
+        raise ProjectError(f"Transaction journal has invalid preconditions: {path}")
+    for item in preconditions:
+        if not isinstance(item, dict):
+            raise ProjectError(f"Transaction journal has an invalid precondition: {path}")
+        target = item.get("target")
+        expected = item.get("expected_sha256")
+        if (
+            not isinstance(target, str)
+            or not target
+            or Path(target).is_absolute()
+            or "." in Path(target).parts
+            or ".." in Path(target).parts
+            or "\\" in target
+            or Path(target).as_posix() != target
+        ):
+            raise ProjectError(f"Transaction journal has an invalid precondition path: {path}")
+        if expected is not None and (
+            not isinstance(expected, str) or not SHA256_RE.fullmatch(expected)
+        ):
+            raise ProjectError(f"Transaction journal has an invalid precondition hash: {path}")
+    return data
+
+
+def _validate_transaction_preconditions(
+    root: Path,
+    journal: dict[str, Any],
+    transaction_targets: set[Path],
+) -> None:
+    """Verify files read but not replaced by a transaction are unchanged."""
+
+    preconditions = journal.get("preconditions", [])
+    if not isinstance(preconditions, list):  # defensive for in-memory callers
+        raise ProjectError("Transaction journal has invalid preconditions")
+    seen: set[str] = set()
+    for item in preconditions:
+        if not isinstance(item, dict):
+            raise ProjectError("Transaction journal has an invalid precondition")
+        relative = item.get("target")
+        expected = item.get("expected_sha256")
+        if not isinstance(relative, str):
+            raise ProjectError("Transaction journal precondition target must be a string")
+        target = _validate_transaction_target(root / Path(relative), root)
+        key = os.path.normcase(str(target))
+        if key in seen:
+            raise ProjectError(f"Transaction journal contains duplicate precondition: {relative}")
+        seen.add(key)
+        if key in {os.path.normcase(str(item_target)) for item_target in transaction_targets}:
+            raise ProjectError(
+                f"Transaction precondition overlaps a replaced target: {relative}"
+            )
+        current = _current_transaction_hash(target)
+        if current != expected:
+            raise ProjectError(
+                "Transactional precondition changed during recovery: " + relative
+            )
+
+
+def _validate_transaction_entries(
+    root: Path,
+    transaction_dir: Path,
+    journal: dict[str, Any],
+    *,
+    inspect_current: bool,
+    verify_backups: bool = True,
+    verify_preconditions: bool = True,
+) -> list[dict[str, Any]]:
+    """Validate a journal completely before changing any project file."""
+
+    raw_transaction_dir = transaction_dir.expanduser()
+    if _contains_symlink(raw_transaction_dir):
+        raise ProjectError(f"Transaction directory cannot use a symbolic link: {transaction_dir}")
+    transaction_dir = raw_transaction_dir.resolve()
+    transaction_root = transaction_dir.parent.resolve()
+    if _contains_symlink(transaction_dir) or not transaction_dir.is_dir():
+        raise ProjectError(f"Transaction directory is not a regular directory: {transaction_dir}")
+    if not is_within(transaction_dir, transaction_root):
+        raise ProjectError(f"Transaction directory escapes its transaction root: {transaction_dir}")
+    recorded_root = journal.get("project_root")
+    if not isinstance(recorded_root, str) or Path(recorded_root).expanduser().resolve() != root:
+        raise ProjectError("Transaction journal belongs to a different project root")
+    files = journal.get("files")
+    if not isinstance(files, list) or not files:
+        raise ProjectError("Transaction journal has no files")
+    seen_targets: set[str] = set()
+    seen_backups: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    for item in files:
+        if not isinstance(item, dict):
+            raise ProjectError("Transaction journal contains an invalid file entry")
+        relative = item.get("target")
+        if not isinstance(relative, str) or not relative:
+            raise ProjectError("Transaction journal target must be a relative path")
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ProjectError(
+                "Transaction journal target must stay relative to the project root"
+            )
+        target = _validate_transaction_target(
+            root / relative_path, root, require_regular_file=inspect_current
+        )
+        if not is_within(target, root):
+            raise ProjectError("Transaction journal target escapes the project root")
+        if is_within(target, transaction_root):
+            raise ProjectError("Transaction journal cannot target its transaction metadata")
+        target_key = os.path.normcase(str(target))
+        if target_key in seen_targets:
+            raise ProjectError(f"Transaction journal contains duplicate target: {relative}")
+        seen_targets.add(target_key)
+        prior_exists = item.get("prior_exists")
+        prior_hash = item.get("prior_sha256")
+        new_hash = item.get("new_sha256")
+        if not isinstance(prior_exists, bool) or not isinstance(new_hash, str) or not SHA256_RE.fullmatch(new_hash):
+            raise ProjectError("Transaction journal has invalid file hashes")
+        if prior_exists and (
+            not isinstance(prior_hash, str) or not SHA256_RE.fullmatch(prior_hash)
+        ):
+            raise ProjectError("Transaction journal has an invalid prior file hash")
+        if not prior_exists and prior_hash is not None:
+            raise ProjectError("Transaction journal has an unexpected prior file hash")
+        backup_name = item.get("backup")
+        backup: Path | None = None
+        prior_bytes: bytes | None = None
+        if prior_exists:
+            if not isinstance(backup_name, str) or Path(backup_name).name != backup_name:
+                raise ProjectError(f"Transaction journal is missing backup: {relative}")
+            backup_key = os.path.normcase(backup_name)
+            if backup_key in seen_backups:
+                raise ProjectError(f"Transaction journal contains duplicate backup: {backup_name}")
+            seen_backups.add(backup_key)
+            backup = (transaction_dir / backup_name).resolve()
+            if not is_within(backup, transaction_dir) or _contains_symlink(
+                transaction_dir / backup_name
+            ):
+                raise ProjectError(f"Transaction backup is outside its journal: {relative}")
+            if verify_backups:
+                if not backup.is_file():
+                    raise ProjectError(f"Transaction backup is missing: {relative}")
+                prior_bytes = backup.read_bytes()
+                if sha256_bytes(prior_bytes) != prior_hash:
+                    raise ProjectError(
+                        f"Transaction backup hash does not match journal: {relative}"
+                    )
+        else:
+            if backup_name is not None:
+                raise ProjectError(f"Transaction journal has an unexpected backup: {relative}")
+
+        current_hash: str | None = None
+        action = "skip"
+        if inspect_current:
+            current = target.read_bytes() if target.is_file() else None
+            current_hash = sha256_bytes(current) if current is not None else None
+            expected_prior_hash = prior_hash if prior_exists else None
+            if current_hash == expected_prior_hash:
+                action = "skip"
+            elif current_hash != new_hash:
+                if prior_exists:
+                    raise ProjectError(
+                        f"Transaction recovery found an unexpected change: {relative}"
+                    )
+                raise ProjectError(
+                    f"Transaction recovery found an unexpected new file change: {relative}"
+                )
+            action = "restore" if prior_exists else "delete"
+        entries.append(
+            {
+                "relative": relative,
+                "target": target,
+                "prior_exists": prior_exists,
+                "prior_hash": prior_hash,
+                "prior_bytes": prior_bytes,
+                "new_hash": new_hash,
+                "action": action,
+            }
+        )
+    if verify_preconditions:
+        _validate_transaction_preconditions(
+            root,
+            journal,
+            {entry["target"] for entry in entries},
+        )
+    return entries
+
+
+def _restore_transaction(root: Path, transaction_dir: Path, journal: dict[str, Any]) -> None:
+    entries = _validate_transaction_entries(
+        root,
+        transaction_dir,
+        journal,
+        inspect_current=True,
+        verify_preconditions=False,
+    )
+    for entry in entries:
+        target = entry["target"]
+        relative = entry["relative"]
+        prior_hash = entry["prior_hash"] if entry["prior_exists"] else None
+        current = target.read_bytes() if target.is_file() else None
+        current_hash = sha256_bytes(current) if current is not None else None
+        # Recheck immediately before each mutation so an external edit between
+        # prevalidation and the write is never silently overwritten.
+        if current_hash == prior_hash:
+            continue
+        if current_hash != entry["new_hash"]:
+            raise ProjectError(f"Transaction recovery found an unexpected change: {relative}")
+        if entry["action"] == "restore":
+            prior_bytes = entry["prior_bytes"]
+            if not isinstance(prior_bytes, bytes):
+                raise ProjectError(f"Transaction backup is missing: {relative}")
+            _atomic_write_bytes_unpatched(target, prior_bytes)
+            if not target.is_file() or sha256_file(target) != prior_hash:
+                raise ProjectError(f"Transaction recovery failed to restore: {relative}")
+        elif entry["action"] == "delete":
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            if target.exists():
+                raise ProjectError(f"Transaction recovery failed to remove: {relative}")
+
+
+def _current_transaction_hash(target: Path) -> str | None:
+    """Return a target hash while rejecting a type or link change."""
+
+    _validate_transaction_target(target)
+    if not target.is_file():
+        return None
+    return sha256_file(target)
+
+
+def _rollback_transaction_target(
+    target: Path, prior: bytes | None, new_hash: str
+) -> None:
+    """Restore one target only when it still contains this transaction's bytes."""
+
+    prior_hash = sha256_bytes(prior) if prior is not None else None
+    current_hash = _current_transaction_hash(target)
+    if current_hash == prior_hash:
+        return
+    if current_hash != new_hash:
+        raise ProjectError(
+            f"Transactional rollback found an unexpected change: {target}"
+        )
+    if prior is None:
+        target.unlink(missing_ok=True)
+        if target.exists():
+            raise ProjectError(f"Transactional rollback failed to remove: {target}")
+        return
+    atomic_write_bytes(target, prior)
+    if _current_transaction_hash(target) != prior_hash:
+        raise ProjectError(f"Transactional rollback failed to restore: {target}")
+
+
+def recover_pending_transactions(raw_root: str | Path) -> list[str]:
+    """Recover incomplete project file transactions after interruption."""
+
+    root = resolve_root(str(raw_root))
+    transaction_root = _transaction_root(root)
+    if not transaction_root.exists():
+        return []
+    if _link_like(transaction_root) or not transaction_root.is_dir():
+        raise ProjectError(f"Transaction recovery path is not a directory: {transaction_root}")
+    recovered: list[str] = []
+    for transaction_dir in sorted(transaction_root.iterdir(), key=lambda path: path.name):
+        if _link_like(transaction_dir) or not transaction_dir.is_dir():
+            raise ProjectError(f"Unexpected transaction artifact: {transaction_dir}")
+        if not is_within(transaction_dir.resolve(), transaction_root.resolve()):
+            raise ProjectError(f"Transaction directory escapes the project root: {transaction_dir}")
+        journal_path = transaction_dir / "journal.json"
+        if not journal_path.exists():
+            if any(transaction_dir.iterdir()):
+                raise ProjectError(
+                    "Transaction directory contains artifacts but no journal: "
+                    f"{transaction_dir}"
+                )
+            transaction_dir.rmdir()
+            _fsync_directory(transaction_root)
+            recovered.append(f"cleaned empty transaction {transaction_dir.name}")
+            continue
+        journal = _read_transaction_journal(journal_path)
+        if journal["status"] == "committed":
+            # The committed marker is authoritative only while every target
+            # still contains the bytes named by that marker.  An external
+            # edit after commit must leave the journal in place and fail
+            # closed instead of erasing the last durable transaction record.
+            entries = _validate_transaction_entries(
+                root,
+                transaction_dir,
+                journal,
+                inspect_current=False,
+                verify_backups=False,
+                verify_preconditions=False,
+            )
+            for entry in entries:
+                if _current_transaction_hash(entry["target"]) != entry["new_hash"]:
+                    raise ProjectError(
+                        "Committed transaction target changed before journal cleanup: "
+                        f"{entry['relative']}"
+                    )
+            _remove_transaction_directory(transaction_dir)
+            _fsync_directory(transaction_root)
+            recovered.append(f"cleaned committed transaction {transaction_dir.name}")
+            continue
+        if journal["status"] == "prepared":
+            entries = _validate_transaction_entries(
+                root,
+                transaction_dir,
+                journal,
+                inspect_current=False,
+                verify_backups=False,
+                verify_preconditions=False,
+            )
+            for entry in entries:
+                expected = entry["prior_hash"] if entry["prior_exists"] else None
+                if _current_transaction_hash(entry["target"]) != expected:
+                    raise ProjectError(
+                        "Prepared transaction target changed before cleanup: "
+                        f"{entry['relative']}"
+                    )
+            journal["status"] = "rolled_back"
+            _atomic_write_bytes_unpatched(
+                journal_path, dump_json(journal).encode("utf-8")
+            )
+            _remove_transaction_directory(transaction_dir)
+            _fsync_directory(transaction_root)
+            recovered.append(f"discarded prepared transaction {transaction_dir.name}")
+            continue
+        if journal["status"] == "rolled_back":
+            entries = _validate_transaction_entries(
+                root,
+                transaction_dir,
+                journal,
+                inspect_current=False,
+                verify_backups=False,
+                verify_preconditions=False,
+            )
+            for entry in entries:
+                expected = entry["prior_hash"] if entry["prior_exists"] else None
+                if _current_transaction_hash(entry["target"]) != expected:
+                    raise ProjectError(
+                        "Rolled-back transaction target changed before journal cleanup: "
+                        f"{entry['relative']}"
+                    )
+            _remove_transaction_directory(transaction_dir)
+            _fsync_directory(transaction_root)
+            recovered.append(f"cleaned rolled-back transaction {transaction_dir.name}")
+            continue
+        _restore_transaction(root, transaction_dir, journal)
+        journal["status"] = "rolled_back"
+        _atomic_write_bytes_unpatched(
+            journal_path, dump_json(journal).encode("utf-8")
+        )
+        _remove_transaction_directory(transaction_dir)
+        _fsync_directory(transaction_root)
+        recovered.append(f"rolled back transaction {transaction_dir.name}")
+    try:
+        transaction_root.rmdir()
+    except OSError:
+        pass
+    return recovered
+
+
+def assert_no_pending_transactions(raw_root: str | Path) -> None:
+    """Fail closed for read/write checks while a journal needs recovery."""
+
+    root = resolve_root(str(raw_root))
+    transaction_root = _transaction_root(root)
+    if not transaction_root.exists():
+        return
+    if (
+        _link_like(transaction_root)
+        or not transaction_root.is_dir()
+        or any(transaction_root.iterdir())
+    ):
+        raise ProjectError(
+            "An incomplete project transaction requires recovery before this operation"
+        )
 
 
 def replace_frontmatter(text: str, updates: dict[str, Any]) -> str:
@@ -216,16 +871,218 @@ def replace_frontmatter(text: str, updates: dict[str, Any]) -> str:
 
 
 def transactional_write(
-    files: list[tuple[Path, bytes]], validator: Any | None = None
+    files: list[tuple[Path, bytes]],
+    validator: Any | None = None,
+    *,
+    journal_root: str | Path | None = None,
+    expected_existing: dict[Path | str, str | None] | None = None,
+    expected_targets: dict[Path | str, str | None] | None = None,
 ) -> None:
-    """Replace a set of files and restore all prior bytes if any replace fails."""
+    """Replace files atomically, with optional durable crash recovery metadata.
+
+    ``expected_existing`` is a compare-and-swap receipt for files that are
+    inspected but not necessarily replaced by this transaction.  Each value is
+    the SHA-256 currently expected at the target (or ``None`` when the target
+    must not exist).  The receipt is checked both before the first replacement
+    and immediately before the commit marker, so provenance manifests cannot be
+    committed for an existing source that changed during preparation.
+
+    ``expected_targets`` is the corresponding receipt for files that this
+    transaction will replace.  It closes the preparation-to-commit race for
+    callers that build replacement bytes from an earlier read.  Unlike
+    ``expected_existing``, target receipts intentionally overlap replaced
+    targets and are checked before the transaction snapshot and again before
+    each replacement.
+    """
+    if not files:
+        return
+    normalized_files: list[tuple[Path, bytes]] = []
+    for raw_target, content in files:
+        if not isinstance(content, bytes):
+            raise ProjectError("Transactional file content must be bytes")
+        normalized_files.append((Path(raw_target), content))
+    targets = [_validate_transaction_target(target) for target, _ in normalized_files]
+    if len(set(targets)) != len(targets):
+        raise ProjectError("Transactional write cannot contain duplicate targets")
+
+    normalized_preconditions: dict[Path, str | None] = {}
+    if expected_existing:
+        for raw_target, expected in expected_existing.items():
+            target = _validate_transaction_target(Path(raw_target))
+            if expected is not None and not SHA256_RE.fullmatch(str(expected)):
+                raise ProjectError(
+                    f"Transactional precondition has an invalid SHA-256: {target}"
+                )
+            normalized_preconditions[target] = expected
+
+    normalized_target_preconditions: dict[Path, str | None] = {}
+    if expected_targets:
+        for raw_target, expected in expected_targets.items():
+            target = _validate_transaction_target(Path(raw_target))
+            if target not in targets:
+                raise ProjectError(
+                    "Transactional target precondition does not name a replaced target: "
+                    f"{target}"
+                )
+            if target in normalized_preconditions:
+                raise ProjectError(
+                    f"Transactional target has both target and existing preconditions: {target}"
+                )
+            if expected is not None and not SHA256_RE.fullmatch(str(expected)):
+                raise ProjectError(
+                    f"Transactional target precondition has an invalid SHA-256: {target}"
+                )
+            normalized_target_preconditions[target] = expected
+
+    def assert_preconditions() -> None:
+        for target, expected in normalized_preconditions.items():
+            current = _current_transaction_hash(target)
+            if current != expected:
+                raise ProjectError(
+                    "Transactional compare-and-swap precondition failed: "
+                    f"{target}"
+                )
+
+    def assert_target_preconditions() -> None:
+        for target, expected in normalized_target_preconditions.items():
+            current = _current_transaction_hash(target)
+            if current != expected:
+                raise ProjectError(
+                    "Transactional target compare-and-swap precondition failed: "
+                    f"{target}"
+                )
+
+    # Check receipts before creating any journal or temporary file.  This keeps
+    # a stale source from producing even a transient manifest update.
+    assert_preconditions()
+    assert_target_preconditions()
+
+    root: Path | None = None
+    transaction_root: Path | None = None
+    if journal_root is not None:
+        root = resolve_root(str(journal_root))
+        if not root.is_dir():
+            raise ProjectError(f"Journal root is not a project directory: {root}")
+        transaction_root = _transaction_root(root)
+        if _link_like(transaction_root) or (
+            transaction_root.exists() and not transaction_root.is_dir()
+        ):
+            raise ProjectError(
+                f"Transaction recovery path is not a directory: {transaction_root}"
+            )
+        for target in targets:
+            if not is_within(target, root):
+                raise ProjectError(
+                    f"Transactional target is outside journal root: {target}"
+                )
+            if is_within(target, transaction_root):
+                raise ProjectError("Transactional target cannot be transaction metadata")
+        for target in normalized_preconditions:
+            # Read-only compare-and-swap receipts may intentionally refer to
+            # an external source file.  They are checked in-process before
+            # and after replacement, but are never written into the project
+            # recovery journal because recovery cannot mutate external data.
+            if is_within(target, transaction_root):
+                raise ProjectError(
+                    "Transactional precondition cannot reference transaction metadata"
+                )
+            if target in targets:
+                raise ProjectError(
+                    f"Transactional precondition overlaps a replaced target: {target}"
+                )
+        for target in normalized_target_preconditions:
+            if not is_within(target, root):
+                raise ProjectError(
+                    f"Transactional target precondition is outside journal root: {target}"
+                )
+            if is_within(target, transaction_root):
+                raise ProjectError(
+                    "Transactional target precondition cannot reference transaction metadata"
+                )
+        # Recover any previous transaction before reading backups for this one.
+        # Otherwise a crashed prior write could be mistaken for the new
+        # transaction's original bytes and make a later rollback non-restorative.
+        recover_pending_transactions(root)
+
+    new_hashes = {
+        target: sha256_bytes(content)
+        for target, (_, content) in zip(targets, normalized_files)
+    }
     backups: dict[Path, bytes | None] = {
-        target: target.read_bytes() if target.exists() else None for target, _ in files
+        target: read_stable_bytes(target, label=f"transaction target {target}")
+        if target.is_file()
+        else None
+        for target in targets
+    }
+    # A target may have been replaced between the first receipt check and the
+    # byte snapshot.  Do not let that newer content become the rollback base.
+    assert_target_preconditions()
+    contents = {
+        target: content for target, (_, content) in zip(targets, normalized_files)
     }
     temp_paths: dict[Path, Path] = {}
-    applied: list[Path] = []
+    attempted: list[Path] = []
+    transaction_dir: Path | None = None
+    journal_path: Path | None = None
+    journal_committed = False
+
+    if root is not None:
+        if transaction_root is None:  # pragma: no cover - kept as an invariant guard
+            raise ProjectError("Transactional journal root was not initialized")
+        transaction_root.mkdir(parents=True, exist_ok=True)
+        transaction_dir = transaction_root / uuid.uuid4().hex
+        transaction_dir.mkdir()
+        journal_files: list[dict[str, Any]] = []
+        try:
+            for index, target in enumerate(targets):
+                prior = backups[target]
+                backup_name: str | None = None
+                if prior is not None:
+                    backup_name = f"backup-{index:04d}.bin"
+                    _atomic_write_bytes_unpatched(transaction_dir / backup_name, prior)
+                journal_files.append(
+                    {
+                        "target": target.relative_to(root).as_posix(),
+                        "prior_exists": prior is not None,
+                        "prior_sha256": sha256_bytes(prior) if prior is not None else None,
+                        "new_sha256": new_hashes[target],
+                        "backup": backup_name,
+                    }
+                )
+            journal_path = transaction_dir / "journal.json"
+            journal = {
+                "schema_version": TRANSACTION_SCHEMA_VERSION,
+                "status": "prepared",
+                "project_root": str(root),
+                "created_at": utc_now(),
+                "files": journal_files,
+                "preconditions": [
+                    {
+                        "target": target.relative_to(root).as_posix(),
+                        "expected_sha256": expected,
+                    }
+                    for target, expected in sorted(
+                        (
+                            item
+                            for item in normalized_preconditions.items()
+                            if is_within(item[0], root)
+                        ),
+                        key=lambda item: item[0].relative_to(root).as_posix(),
+                    )
+                ],
+            }
+            _atomic_write_bytes_unpatched(journal_path, dump_json(journal).encode("utf-8"))
+            journal["status"] = "applying"
+            _atomic_write_bytes_unpatched(journal_path, dump_json(journal).encode("utf-8"))
+        except BaseException:
+            if transaction_dir is not None:
+                try:
+                    _remove_transaction_directory(transaction_dir)
+                except OSError:
+                    pass
+            raise
     try:
-        for target, content in files:
+        for target in targets:
             target.parent.mkdir(parents=True, exist_ok=True)
             handle = tempfile.NamedTemporaryFile(
                 "wb",
@@ -236,35 +1093,394 @@ def transactional_write(
             )
             temp_path = Path(handle.name)
             with handle:
-                handle.write(content)
+                handle.write(contents[target])
                 handle.flush()
                 os.fsync(handle.fileno())
             temp_paths[target] = temp_path
-        for target, _ in files:
+        for target in targets:
+            # Record the attempt before calling the OS.  This covers both a
+            # signal after replace but before normal bookkeeping and a signal
+            # immediately before replace; rollback checks the target hash and
+            # therefore only touches bytes owned by this transaction.
+            prior = backups[target]
+            expected_hash = sha256_bytes(prior) if prior is not None else None
+            if _current_transaction_hash(target) != expected_hash:
+                raise ProjectError(
+                    "Transactional compare-and-swap detected a concurrent change: "
+                    f"{target}"
+                )
+            if target in normalized_target_preconditions:
+                expected_target = normalized_target_preconditions[target]
+                if _current_transaction_hash(target) != expected_target:
+                    raise ProjectError(
+                        "Transactional target compare-and-swap detected a concurrent change: "
+                        f"{target}"
+                    )
+            attempted.append(target)
             os.replace(temp_paths[target], target)
-            applied.append(target)
+            _fsync_directory(target.parent)
         if validator is not None:
             validator()
-    except Exception as exc:
-        rollback_errors: list[str] = []
-        for target in reversed(applied):
-            prior = backups[target]
+        assert_preconditions()
+        for target in targets:
+            if _current_transaction_hash(target) != new_hashes[target]:
+                raise ProjectError(
+                    "Transactional target changed before commit marker: "
+                    f"{target}"
+                )
+        if journal_path is not None:
+            journal = _read_transaction_journal(journal_path)
+            journal["status"] = "committed"
+            _atomic_write_bytes_unpatched(
+                journal_path, dump_json(journal).encode("utf-8")
+            )
+            journal_committed = True
+    except BaseException as exc:
+        # A signal can arrive immediately after the durable committed marker
+        # is replaced, before the assignment above or before the try block
+        # exits.  Once that marker exists, rolling bytes back would turn a
+        # committed transaction into a false rollback.
+        if journal_path is not None and not journal_committed:
             try:
-                if prior is None:
-                    target.unlink(missing_ok=True)
-                else:
-                    atomic_write_text(target, prior.decode("utf-8"))
-            except Exception as rollback_exc:  # pragma: no cover - catastrophic I/O
+                marker = _read_transaction_journal(journal_path)
+                journal_committed = marker.get("status") == "committed"
+            except BaseException:
+                pass
+        if journal_committed:
+            # Preserve the committed journal after an interrupted control
+            # path.  The next controlled operation validates every target and
+            # removes it.  Returning here lets the surrounding write guard
+            # commit the already-refreshed SQLite base hash.
+            return
+        rollback_errors: list[str] = []
+        for target in reversed(attempted):
+            try:
+                _rollback_transaction_target(
+                    target, backups[target], new_hashes[target]
+                )
+            except BaseException as rollback_exc:  # pragma: no cover - catastrophic I/O
                 rollback_errors.append(f"{target}: {rollback_exc}")
+        if not rollback_errors and transaction_dir is not None:
+            try:
+                if journal_path is None:
+                    raise ProjectError("Transaction journal path is unavailable")
+                rollback_journal = _read_transaction_journal(journal_path)
+                rollback_journal["status"] = "rolled_back"
+                _atomic_write_bytes_unpatched(
+                    journal_path, dump_json(rollback_journal).encode("utf-8")
+                )
+                _remove_transaction_directory(transaction_dir)
+                transaction_root = transaction_dir.parent
+                transaction_root.rmdir()
+            except BaseException as cleanup_exc:
+                rollback_errors.append(f"transaction journal cleanup: {cleanup_exc}")
         suffix = (
             "; rollback errors: " + "; ".join(rollback_errors)
             if rollback_errors
             else ""
         )
-        raise ProjectError(f"Transactional write failed and was rolled back: {exc}{suffix}") from exc
+        raise ProjectError(
+            f"Transactional write failed and was rolled back: {exc}{suffix}"
+        ) from exc
+    else:
+        if transaction_dir is not None:
+            # A committed journal is deliberately cleaned after the commit
+            # marker is durable.  If cleanup is interrupted, the next startup
+            # removes it without rolling back already committed bytes.
+            try:
+                _remove_transaction_directory(transaction_dir)
+                transaction_dir.parent.rmdir()
+            except BaseException:
+                # The durable committed marker is enough to make cleanup
+                # idempotent; a later command will remove the leftovers.
+                pass
     finally:
         for temp_path in temp_paths.values():
             temp_path.unlink(missing_ok=True)
+
+
+UPGRADE_IGNORED_PARTS = frozenset(
+    {
+        "exports",
+        "staging",
+        ".novel-cache",
+        ".novel-transaction",
+        ".novel-upgrade-transaction",
+        ".novel-export.lock",
+        ".novel-export-journal.json",
+        "__pycache__",
+    }
+)
+
+
+def _upgrade_transaction_root(root: Path) -> Path:
+    return root / UPGRADE_TRANSACTION_DIRNAME
+
+
+def _upgrade_transaction_path(root: Path) -> Path:
+    return _upgrade_transaction_root(root) / "journal.json"
+
+
+def _upgrade_relpath(value: Any, *, label: str = "upgrade path") -> str:
+    if not isinstance(value, str) or not value:
+        raise ProjectError(f"{label} must be a non-empty relative path")
+    if "\\" in value:
+        raise ProjectError(f"{label} must use POSIX separators")
+    pure = Path(value)
+    if pure.is_absolute() or "." in pure.parts or ".." in pure.parts:
+        raise ProjectError(f"{label} must be a normalized relative path")
+    normalized = pure.as_posix()
+    if normalized != value or not normalized:
+        raise ProjectError(f"{label} must be a normalized relative path")
+    return normalized
+
+
+def _upgrade_should_skip(relative: Path) -> bool:
+    return any(part in UPGRADE_IGNORED_PARTS for part in relative.parts)
+
+
+def _upgrade_file_snapshot(root: Path) -> dict[str, dict[str, Any]]:
+    """Capture regular project files without following link-like entries."""
+
+    _assert_tree_has_no_links(root)
+    snapshot: dict[str, dict[str, Any]] = {}
+    if not root.is_dir():
+        raise ProjectError(f"Project directory does not exist: {root}")
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if _upgrade_should_skip(relative):
+            continue
+        if _link_like(path):
+            raise ProjectError(f"Project tree contains a link-like entry: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ProjectError(f"Project tree contains a non-regular entry: {path}")
+        key = relative.as_posix()
+        content = path.read_bytes()
+        snapshot[key] = {
+            "sha256": sha256_bytes(content),
+            "size_bytes": len(content),
+        }
+    return snapshot
+
+
+def _upgrade_dir_snapshot(root: Path) -> set[str]:
+    _assert_tree_has_no_links(root)
+    directories: set[str] = set()
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if _upgrade_should_skip(relative) or not path.is_dir():
+            continue
+        if _link_like(path):
+            raise ProjectError(f"Project tree contains a link-like directory: {path}")
+        directories.add(relative.as_posix())
+    return directories
+
+
+def _upgrade_assert_existing_snapshot(
+    root: Path, snapshot: dict[str, dict[str, Any]]
+) -> None:
+    for relative, expected in snapshot.items():
+        path = root / relative
+        if _contains_symlink(path) or not path.is_file():
+            raise ProjectError(f"Existing project file changed during upgrade: {relative}")
+        content = path.read_bytes()
+        if (
+            len(content) != expected.get("size_bytes")
+            or sha256_bytes(content) != expected.get("sha256")
+        ):
+            raise ProjectError(f"Existing project file changed during upgrade: {relative}")
+
+
+def _upgrade_assert_expected_snapshot(
+    root: Path,
+    existing: dict[str, dict[str, Any]],
+    created: list[dict[str, Any]],
+    *,
+    require_all_created: bool,
+) -> None:
+    expected_created = {item["path"]: item for item in created}
+    current = _upgrade_file_snapshot(root)
+    unexpected = sorted(set(current) - set(existing) - set(expected_created))
+    if unexpected:
+        raise ProjectError(
+            "Unexpected project files appeared during upgrade: "
+            + ", ".join(unexpected[:8])
+        )
+    _upgrade_assert_existing_snapshot(root, existing)
+    for relative, item in expected_created.items():
+        actual = current.get(relative)
+        if actual is None:
+            if require_all_created:
+                raise ProjectError(f"Upgrade-created file is missing: {relative}")
+            continue
+        if (
+            actual.get("sha256") != item.get("sha256")
+            or actual.get("size_bytes") != item.get("size_bytes")
+        ):
+            raise ProjectError(f"Upgrade-created file changed unexpectedly: {relative}")
+
+
+def _write_upgrade_journal(root: Path, journal: dict[str, Any]) -> None:
+    directory = _upgrade_transaction_root(root)
+    if _contains_symlink(directory) or (directory.exists() and not directory.is_dir()):
+        raise ProjectError(f"Upgrade transaction path is not a directory: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
+    _atomic_write_bytes_unpatched(
+        directory / "journal.json",
+        dump_json(journal).encode("utf-8"),
+    )
+
+
+def _read_upgrade_journal(root: Path) -> dict[str, Any]:
+    directory = _upgrade_transaction_root(root)
+    journal_path = _upgrade_transaction_path(root)
+    if _contains_symlink(directory) or not directory.is_dir():
+        raise ProjectError(f"Upgrade transaction path is not a directory: {directory}")
+    if _contains_symlink(journal_path) or not journal_path.is_file():
+        raise ProjectError(f"Upgrade transaction journal is missing: {journal_path}")
+    try:
+        value = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ProjectError(f"Unreadable upgrade transaction journal: {exc}") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != UPGRADE_TRANSACTION_SCHEMA_VERSION:
+        raise ProjectError("Unsupported upgrade transaction journal schema")
+    recorded_root = value.get("project_root")
+    if not isinstance(recorded_root, str) or Path(recorded_root).expanduser().resolve() != root:
+        raise ProjectError("Upgrade transaction journal belongs to another project")
+    if value.get("status") not in {"prepared", "applying", "committed"}:
+        raise ProjectError("Invalid upgrade transaction journal status")
+    created_dirs = value.get("created_dirs")
+    files = value.get("files")
+    existing_files = value.get("existing_files")
+    if not isinstance(created_dirs, list) or not isinstance(files, list):
+        raise ProjectError("Upgrade transaction journal has invalid created entries")
+    if not isinstance(existing_files, list):
+        raise ProjectError("Upgrade transaction journal has no existing file snapshot")
+    seen_dirs: set[str] = set()
+    for item in created_dirs:
+        relative = _upgrade_relpath(item, label="created directory")
+        if relative in seen_dirs:
+            raise ProjectError("Upgrade transaction journal contains duplicate directories")
+        seen_dirs.add(relative)
+    seen_files: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise ProjectError("Upgrade transaction journal contains an invalid file")
+        relative = _upgrade_relpath(item.get("path"), label="created file")
+        digest = item.get("sha256")
+        size = item.get("size_bytes")
+        if relative in seen_files or not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise ProjectError("Upgrade transaction journal contains invalid file hashes")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ProjectError("Upgrade transaction journal contains invalid file sizes")
+        seen_files.add(relative)
+    seen_existing: set[str] = set()
+    for item in existing_files:
+        if not isinstance(item, dict):
+            raise ProjectError("Upgrade transaction journal contains an invalid existing snapshot")
+        relative = _upgrade_relpath(item.get("path"), label="existing file")
+        digest = item.get("sha256")
+        size = item.get("size_bytes")
+        if relative in seen_existing or not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise ProjectError("Upgrade transaction journal contains invalid existing hashes")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ProjectError("Upgrade transaction journal contains invalid existing sizes")
+        seen_existing.add(relative)
+    return value
+
+
+def _remove_upgrade_transaction(root: Path) -> None:
+    directory = _upgrade_transaction_root(root)
+    if not directory.exists():
+        return
+    if _contains_symlink(directory) or not directory.is_dir():
+        raise ProjectError(f"Upgrade transaction path is not a regular directory: {directory}")
+    _assert_tree_has_no_links(directory)
+    _remove_transaction_directory(directory)
+
+
+def recover_pending_upgrade(raw_root: str | Path) -> list[str]:
+    """Recover an interrupted add-only project upgrade fail-closed."""
+
+    root = resolve_root(str(raw_root))
+    directory = _upgrade_transaction_root(root)
+    if not directory.exists():
+        return []
+    if _contains_symlink(directory) or not directory.is_dir():
+        raise ProjectError(f"Upgrade transaction path is not a directory: {directory}")
+    # A nested canonical transaction may have been interrupted before the
+    # upgrade journal was advanced. Restore it first, then inspect the upgrade
+    # additions against their durable hashes.
+    recover_pending_transactions(root)
+    journal = _read_upgrade_journal(root)
+    existing = {
+        item["path"]: item
+        for item in journal["existing_files"]
+        if isinstance(item, dict)
+    }
+    created = [item for item in journal["files"] if isinstance(item, dict)]
+    _upgrade_assert_expected_snapshot(
+        root, existing, created, require_all_created=False
+    )
+    present = 0
+    for item in created:
+        relative = item["path"]
+        path = root / relative
+        if _contains_symlink(path):
+            raise ProjectError(f"Upgrade-created file became a link: {relative}")
+        if not path.exists():
+            continue
+        if not path.is_file():
+            raise ProjectError(f"Upgrade-created path is not a file: {relative}")
+        content = path.read_bytes()
+        if len(content) != item["size_bytes"] or sha256_bytes(content) != item["sha256"]:
+            raise ProjectError(f"Upgrade-created file changed unexpectedly: {relative}")
+        present += 1
+
+    if journal["status"] == "committed" or present == len(created):
+        # All additions are present. A committed marker (or a complete set
+        # after a crash before marker bookkeeping) is safe to retain; validate
+        # the resulting project before deleting the only recovery record.
+        errors, _ = collect_validation(root, check_transactions=False)
+        if errors:
+            raise ProjectError(
+                "Committed upgrade cannot be validated; recovery record retained: "
+                + "; ".join(errors[:8])
+            )
+        _remove_upgrade_transaction(root)
+        return [f"cleaned completed upgrade for {root}"]
+
+    # Partial application: only remove files whose exact bytes are still the
+    # bytes named by this journal. Anything changed or replaced above fails
+    # closed and remains available for manual recovery.
+    for item in reversed(created):
+        path = root / item["path"]
+        if not path.exists():
+            continue
+        content = path.read_bytes()
+        if len(content) != item["size_bytes"] or sha256_bytes(content) != item["sha256"]:
+            raise ProjectError(f"Cannot safely roll back upgrade file: {item['path']}")
+        path.unlink()
+    for relative in sorted(
+        (_upgrade_relpath(item, label="created directory") for item in journal["created_dirs"]),
+        key=lambda value: (value.count("/"), value),
+        reverse=True,
+    ):
+        path = root / relative
+        if not path.exists():
+            continue
+        if _contains_symlink(path) or not path.is_dir():
+            raise ProjectError(f"Cannot safely roll back upgrade directory: {relative}")
+        try:
+            path.rmdir()
+        except OSError as exc:
+            raise ProjectError(
+                f"Upgrade directory is no longer empty; recovery retained: {relative}"
+            ) from exc
+    _remove_upgrade_transaction(root)
+    return [f"rolled back incomplete upgrade for {root}"]
 
 
 def markdown_templates(
@@ -580,17 +1796,12 @@ def chapter_heading(path: Path, *, short_story: bool) -> tuple[int | None, str] 
     return chapter_number_value(match.group("number")), match.group("title").strip()
 
 
-def frontmatter_metadata(path: Path) -> dict[str, str]:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise ProjectError(f"Missing file: {path}") from exc
-
+def parse_frontmatter_metadata(text: str, *, label: str) -> dict[str, str]:
     if not text.startswith("---\n"):
-        raise ProjectError(f"Missing YAML frontmatter in {path}")
+        raise ProjectError(f"Missing YAML frontmatter in {label}")
     end = text.find("\n---\n", 4)
     if end == -1:
-        raise ProjectError(f"Unterminated YAML frontmatter in {path}")
+        raise ProjectError(f"Unterminated YAML frontmatter in {label}")
 
     metadata: dict[str, str] = {}
     for line in text[4:end].splitlines():
@@ -599,6 +1810,14 @@ def frontmatter_metadata(path: Path) -> dict[str, str]:
         key, value = line.split(":", 1)
         metadata[key.strip()] = value.strip()
     return metadata
+
+
+def frontmatter_metadata(path: Path) -> dict[str, str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ProjectError(f"Missing file: {path}") from exc
+    return parse_frontmatter_metadata(text, label=str(path))
 
 
 def init_project(args: argparse.Namespace) -> dict[str, Any]:
@@ -624,12 +1843,26 @@ def init_project(args: argparse.Namespace) -> dict[str, Any]:
             raise ProjectError(
                 "An initialized project already exists with a different title."
             )
+        existing_work_type = work_type_for_manifest(manifest)
+        if existing_work_type != work_type:
+            raise ProjectError(
+                "An initialized project already exists with a different work_type."
+            )
+        # A matching manifest is not enough to claim idempotent success.  An
+        # interrupted/hand-edited project must be routed to upgrade or repair,
+        # never silently treated as a complete initialization.
+        errors, _ = collect_validation(root)
+        if errors:
+            raise ProjectError(
+                "Project manifest exists but the project is incomplete or invalid; "
+                "run upgrade/repair instead of re-initializing: "
+                + "; ".join(errors[:8])
+            )
         result = {
             "status": "already_initialized",
             "project_root": str(root),
             "title": title,
         }
-        existing_work_type = work_type_for_manifest(manifest)
         if existing_work_type == "short_story":
             result["work_type"] = existing_work_type
         return result
@@ -638,10 +1871,6 @@ def init_project(args: argparse.Namespace) -> dict[str, Any]:
         raise ProjectError(
             "Refusing to initialize a non-empty directory without novel.json."
         )
-
-    root.mkdir(parents=True, exist_ok=True)
-    for relative_dir in REQUIRED_DIRS:
-        (root / relative_dir).mkdir(parents=True, exist_ok=True)
 
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -676,17 +1905,61 @@ def init_project(args: argparse.Namespace) -> dict[str, Any]:
         "open_threads": [],
     }
 
-    created: list[str] = []
-    write_new(manifest_path, dump_json(manifest))
-    created.append("novel.json")
-    write_new(root / "continuity/state.json", dump_json(continuity))
-    created.append("continuity/state.json")
-    for relative_path, content in markdown_templates(title, work_type).items():
-        write_new(root / relative_path, content)
-        created.append(relative_path)
+    # Build the complete scaffold in a sibling directory and publish it with
+    # one directory rename.  This keeps an injected failure, Ctrl+C, or a
+    # process crash from exposing a half-initialized project at the requested
+    # path.  A pre-existing empty directory is removed only immediately before
+    # the final rename; a non-empty directory is never touched.
+    parent = root.parent
+    if root.is_symlink():
+        raise ProjectError("Cannot initialize through a symbolic-link project path")
+    parent.mkdir(parents=True, exist_ok=True)
+    temp_root = Path(
+        tempfile.mkdtemp(prefix=f".{root.name}.init-", dir=str(parent))
+    )
+    published = False
+    try:
+        for relative_dir in REQUIRED_DIRS:
+            (temp_root / relative_dir).mkdir(parents=True, exist_ok=True)
 
-    continuity_install = novel_continuity.install_project(root)
-    created.extend(continuity_install["created_files"])
+        created: list[str] = []
+        write_new(temp_root / "novel.json", dump_json(manifest))
+        created.append("novel.json")
+        write_new(temp_root / "continuity/state.json", dump_json(continuity))
+        created.append("continuity/state.json")
+        for relative_path, content in markdown_templates(title, work_type).items():
+            write_new(temp_root / relative_path, content)
+            created.append(relative_path)
+
+        # Use the internal bootstrap builder so no registry identity is
+        # needed for a directory that has not been published yet.
+        continuity_install = novel_continuity._install_project(temp_root)
+        # The scaffold is built under a private sibling directory.  Do not
+        # expose that implementation path in the result after the directory
+        # is published at the caller-requested root.
+        continuity_install["project_root"] = str(root)
+        created.extend(continuity_install["created_files"])
+        validation_errors, _ = collect_validation(temp_root)
+        if validation_errors:
+            raise ProjectError(
+                "Generated project failed pre-publish validation: "
+                + "; ".join(validation_errors[:8])
+            )
+
+        if root.exists():
+            if not root.is_dir() or any(root.iterdir()):
+                raise ProjectError(
+                    "Project path became non-empty during initialization; refusing to replace it"
+                )
+            root.rmdir()
+        os.replace(temp_root, root)
+        _fsync_directory(parent)
+        published = True
+    except BaseException:
+        raise
+    finally:
+        if not published and temp_root.exists():
+            shutil.rmtree(temp_root, ignore_errors=True)
 
     result = {
         "status": "created",
@@ -702,35 +1975,216 @@ def init_project(args: argparse.Namespace) -> dict[str, Any]:
 
 def upgrade_project(args: argparse.Namespace) -> dict[str, Any]:
     root = resolve_root(args.root)
+    with project_write_context(root, args) as context:
+        result = _upgrade_project(args, root)
+        context.assert_live()
+        context.refresh_base_after_write("project upgrade")
+    # The committed marker remains until the SQLite base hash has committed.
+    # A crash before this point leaves enough evidence for write_guard to
+    # reconcile the completed upgrade on the next controlled operation.
+    if _upgrade_transaction_root(root).exists():
+        recover_pending_upgrade(root)
+    return result
+
+
+def _copy_project_for_upgrade(root: Path) -> Path:
+    _assert_tree_has_no_links(root)
+    temp_root = Path(
+        tempfile.mkdtemp(prefix=f".{root.name}.upgrade-", dir=str(root.parent))
+    )
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        current = Path(directory)
+        relative = current.relative_to(root) if current != root else Path()
+        ignored: set[str] = set()
+        for name in names:
+            candidate = relative / name
+            if _upgrade_should_skip(candidate):
+                ignored.add(name)
+        return ignored
+
+    try:
+        shutil.copytree(
+            root,
+            temp_root,
+            dirs_exist_ok=True,
+            symlinks=False,
+            ignore=ignore,
+        )
+    except BaseException:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+    return temp_root
+
+
+def _upgrade_project(args: argparse.Namespace, root: Path) -> dict[str, Any]:
+    recovery = recover_pending_upgrade(root)
+    recover_pending_transactions(root)
+    _assert_tree_has_no_links(root)
     manifest = read_json(root / "novel.json")
     title = manifest.get("title")
     if not isinstance(title, str) or not title.strip():
         raise ProjectError("novel.json title must be a non-empty string")
     work_type = work_type_for_manifest(manifest)
-
-    created_dirs: list[str] = []
-    for relative_dir in REQUIRED_DIRS:
-        path = root / relative_dir
-        if not path.exists():
-            path.mkdir(parents=True, exist_ok=False)
-            created_dirs.append(relative_dir)
-        elif not path.is_dir():
-            raise ProjectError(f"Expected a directory: {path}")
-
-    templates = markdown_templates(title, work_type)
-    created_files: list[str] = []
-    for relative_file in UPGRADE_FILES:
-        path = root / relative_file
-        if not path.exists():
-            write_new(path, templates[relative_file])
-            created_files.append(relative_file)
-        elif not path.is_file():
-            raise ProjectError(f"Expected a file: {path}")
-
+    existing_files = _upgrade_file_snapshot(root)
+    existing_dirs = _upgrade_dir_snapshot(root)
+    temp_root = _copy_project_for_upgrade(root)
     try:
-        continuity_install = novel_continuity.install_project(root)
-    except novel_continuity.ContinuityError as exc:
-        raise ProjectError(str(exc)) from exc
+        templates = markdown_templates(title, work_type)
+        for relative_dir in REQUIRED_DIRS:
+            path = temp_root / relative_dir
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=False)
+            elif _link_like(path) or not path.is_dir():
+                raise ProjectError(f"Expected a regular directory: {path}")
+        for relative_file, content in templates.items():
+            path = temp_root / relative_file
+            if not path.exists():
+                write_new(path, content)
+            elif _link_like(path) or not path.is_file():
+                raise ProjectError(f"Expected a regular file: {path}")
+
+        try:
+            continuity_install = novel_continuity._install_project(temp_root)
+        except novel_continuity.ContinuityError as exc:
+            raise ProjectError(str(exc)) from exc
+
+        validation_errors, _ = collect_validation(temp_root)
+        if validation_errors:
+            raise ProjectError(
+                "Upgraded project failed pre-install validation: "
+                + "; ".join(validation_errors[:8])
+            )
+        candidate_files = _upgrade_file_snapshot(temp_root)
+        candidate_dirs = _upgrade_dir_snapshot(temp_root)
+        changed_existing = [
+            relative
+            for relative, expected in existing_files.items()
+            if candidate_files.get(relative) != expected
+        ]
+        if changed_existing:
+            raise ProjectError(
+                "Upgrade attempted to modify existing files: "
+                + ", ".join(changed_existing[:8])
+            )
+        created_files = sorted(set(candidate_files) - set(existing_files))
+        created_dirs = sorted(
+            set(candidate_dirs) - set(existing_dirs),
+            key=lambda value: (value.count("/"), value),
+        )
+        # ``staging/`` is intentionally excluded from the state-file snapshot,
+        # but its required directory shape is still part of the project
+        # contract and must be restored by an upgrade.
+        required_missing_dirs = {
+            relative_dir
+            for relative_dir in REQUIRED_DIRS
+            if (temp_root / relative_dir).is_dir()
+            and not (root / relative_dir).exists()
+        }
+        expanded_missing_dirs = set(required_missing_dirs)
+        for relative_dir in tuple(required_missing_dirs):
+            parts = relative_dir.split("/")
+            for index in range(1, len(parts)):
+                parent_relative = "/".join(parts[:index])
+                if (
+                    (temp_root / parent_relative).is_dir()
+                    and not (root / parent_relative).exists()
+                ):
+                    expanded_missing_dirs.add(parent_relative)
+        created_dirs = sorted(
+            set(created_dirs) | expanded_missing_dirs,
+            key=lambda value: (value.count("/"), value),
+        )
+        writes = [
+            (root / relative, (temp_root / relative).read_bytes())
+            for relative in created_files
+        ]
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+    continuity_install["project_root"] = str(root)
+
+    if not created_dirs and not created_files:
+        chapters = chapter_files(root)
+        index_text = (root / "manuscript/index.md").read_text(encoding="utf-8")
+        index_targets = markdown_link_targets(index_text)
+        backfill = []
+        for chapter_path in chapters:
+            match = CHAPTER_NAME.fullmatch(chapter_path.name)
+            if match is None:
+                continue
+            relative = chapter_path.relative_to(root / "manuscript").as_posix()
+            card_path = root / "memory/chapters" / f"{match.group('number')}.md"
+            card_valid = (
+                card_path.is_file()
+                and chapter_path.name in card_path.read_text(encoding="utf-8")
+            )
+            if relative not in index_targets or not card_valid:
+                backfill.append(chapter_path.name)
+        return {
+            "status": "already_current",
+            "project_root": str(root),
+            "created_directories": [],
+            "created_files": [],
+            "chapters_requiring_memory_backfill": backfill,
+            "continuity": continuity_install,
+            "recovery": recovery,
+        }
+
+    _upgrade_assert_existing_snapshot(root, existing_files)
+    for relative in created_files:
+        target = root / relative
+        if target.exists() or _contains_symlink(target):
+            raise ProjectError(f"Upgrade target appeared concurrently: {relative}")
+    journal = {
+        "schema_version": UPGRADE_TRANSACTION_SCHEMA_VERSION,
+        "project_root": str(root),
+        "status": "prepared",
+        "created_at": utc_now(),
+        "created_dirs": created_dirs,
+        "files": [
+            {
+                "path": relative,
+                "sha256": candidate_files[relative]["sha256"],
+                "size_bytes": candidate_files[relative]["size_bytes"],
+            }
+            for relative in created_files
+        ],
+        "existing_files": [
+            {"path": relative, **metadata}
+            for relative, metadata in sorted(existing_files.items())
+        ],
+    }
+    _write_upgrade_journal(root, journal)
+    journal["status"] = "applying"
+    _write_upgrade_journal(root, journal)
+
+    for relative in created_dirs:
+        path = root / relative
+        if path.exists():
+            if _contains_symlink(path) or not path.is_dir():
+                raise ProjectError(f"Upgrade directory appeared with the wrong type: {relative}")
+            continue
+        path.mkdir(exist_ok=False)
+
+    def validate_upgrade() -> None:
+        _upgrade_assert_expected_snapshot(
+            root,
+            existing_files,
+            journal["files"],
+            require_all_created=True,
+        )
+        errors, _ = collect_validation(root, check_transactions=False)
+        if errors:
+            raise ProjectError("Post-upgrade validation failed: " + "; ".join(errors[:8]))
+
+    if writes:
+        transactional_write(writes, validator=validate_upgrade, journal_root=root)
+    else:
+        validate_upgrade()
+    journal["status"] = "committed"
+    journal["committed_at"] = utc_now()
+    _write_upgrade_journal(root, journal)
 
     chapters = chapter_files(root)
     index_text = (root / "manuscript/index.md").read_text(encoding="utf-8")
@@ -750,41 +2204,31 @@ def upgrade_project(args: argparse.Namespace) -> dict[str, Any]:
             backfill.append(chapter_path.name)
 
     return {
-        "status": (
-            "upgraded"
-            if created_dirs
-            or created_files
-            or continuity_install["status"] == "installed"
-            else "already_current"
-        ),
+        "status": "upgraded",
         "project_root": str(root),
         "created_directories": sorted(created_dirs),
         "created_files": sorted(created_files),
         "chapters_requiring_memory_backfill": backfill,
         "continuity": continuity_install,
+        "recovery": recovery,
     }
 
 
 def source_manifest_records(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
-    records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ProjectError(
-                f"Invalid JSONL in research/source-manifest.jsonl:{line_number}: {exc}"
-            ) from exc
-        if not isinstance(record, dict):
-            raise ProjectError(
-                "research/source-manifest.jsonl entries must be JSON objects: "
-                f"line {line_number}"
-            )
-        records.append(record)
-    return records
+    try:
+        import novel_research
+
+        return novel_research.read_manifest(path.parent.parent)
+    except (ImportError, OSError, UnicodeError) as exc:
+        raise ProjectError(f"Unable to read source manifest: {exc}") from exc
+    except Exception as exc:
+        # Keep the project validator's public error type stable while using
+        # the single strict source-manifest parser.
+        if exc.__class__.__name__ == "ResearchError":
+            raise ProjectError(str(exc)) from exc
+        raise
 
 
 def collect_v2_research_validation(root: Path) -> tuple[list[str], list[str]]:
@@ -824,51 +2268,33 @@ def collect_v2_research_validation(root: Path) -> tuple[list[str], list[str]]:
     except ProjectError as exc:
         errors.append(str(exc))
         records = []
-    source_ids: set[str] = set()
-    for index, record in enumerate(records, 1):
-        label = str(record.get("source_id") or f"line {index}")
-        if label in source_ids:
-            errors.append(f"Duplicate source manifest ID: {label}")
-        source_ids.add(label)
-        for key in (
-            "schema_version",
-            "source_id",
-            "path",
-            "sha256",
-            "origin",
-            "rights_status",
-            "authorization_scope",
-            "external_use",
-        ):
-            if record.get(key) in (None, ""):
-                errors.append(f"Source manifest {label} is missing {key}")
-        relative = record.get("path")
-        if not isinstance(relative, str):
-            continue
-        source_path = (root / relative).resolve()
-        if not is_within(source_path, root):
-            errors.append(f"Source manifest {label} path escapes the project root")
-        elif not source_path.is_file():
-            errors.append(f"Source manifest {label} file is missing: {relative}")
-        elif sha256_file(source_path) != record.get("sha256"):
-            errors.append(f"Source manifest {label} SHA-256 mismatch: {relative}")
-        if record.get("origin") == "user_local" and not record.get(
-            "authorization_reference"
-        ):
-            errors.append(
-                f"Source manifest {label} user_local entry lacks authorization_reference"
-            )
-        if record.get("rights_status") == "unknown":
-            warnings.append(f"Source manifest {label} has unknown rights status")
+    try:
+        import novel_research
+
+        source_errors, source_warnings = novel_research.validate_manifest_records(
+            root, records
+        )
+        errors.extend(source_errors)
+        warnings.extend(source_warnings)
+    except (ImportError, OSError) as exc:
+        errors.append(f"Unable to load source-manifest validator: {exc}")
     return errors, warnings
 
 
-def collect_validation(root: Path) -> tuple[list[str], list[str]]:
+def collect_validation(
+    root: Path, *, check_transactions: bool = True
+) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
 
     if not root.is_dir():
         return [f"Project directory does not exist: {root}"], warnings
+
+    if check_transactions:
+        try:
+            assert_no_pending_transactions(root)
+        except ProjectError as exc:
+            errors.append(str(exc))
 
     for relative_dir in REQUIRED_DIRS:
         if not (root / relative_dir).is_dir():
@@ -1138,8 +2564,7 @@ def clean_authorization_reference(value: str) -> str:
     return cleaned
 
 
-def research_state(args: argparse.Namespace) -> dict[str, Any]:
-    root = resolve_root(args.root)
+def _research_state(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     path = root / "research/comparable-works.md"
     current = frontmatter_metadata(path)
     approval = args.candidate_approval or current.get("candidate_approval")
@@ -1164,13 +2589,14 @@ def research_state(args: argparse.Namespace) -> dict[str, Any]:
         updates["analysis_authorization"] = authorization
     original = path.read_text(encoding="utf-8")
     updated = replace_frontmatter(original, updates)
-    atomic_write_text(path, updated)
     continuity_result: dict[str, Any] | None = None
     try:
         if read_json(root / "novel.json").get("current_chapter") == 0:
             continuity_result = novel_continuity.reseal_zero_baseline(
-                root, authorization
+                root, authorization, extra_writes=[(path, updated.encode("utf-8"))]
             )
+        else:
+            transactional_write([(path, updated.encode("utf-8"))], journal_root=root)
     except novel_continuity.ContinuityError as exc:
         raise ProjectError(str(exc)) from exc
     return {
@@ -1189,25 +2615,62 @@ def research_state(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def framework_state(args: argparse.Namespace) -> dict[str, Any]:
+def research_state(args: argparse.Namespace) -> dict[str, Any]:
     root = resolve_root(args.root)
-    path = root / "planning/framework-session.md"
-    current = frontmatter_metadata(path)
-    stage = args.stage or current.get("stage")
-    confirmation = args.confirmation or current.get("confirmation")
+    try:
+        with project_write_context(root, args) as context:
+            result = _research_state(args, root)
+            context.assert_live()
+            context.refresh_base_after_write("research state update")
+            return result
+    except (OSError, sqlite3.Error) as exc:
+        raise ProjectError(f"Project write authorization failed: {exc}") from exc
+
+
+def _framework_values(
+    args: argparse.Namespace,
+    current: dict[str, str],
+    *,
+    require_explicit_state: bool = True,
+) -> tuple[str | None, str | None, int, int]:
+    """Resolve a framework transition from CLI values and current metadata."""
+
+    stage_arg = getattr(args, "stage", None)
+    confirmation_arg = getattr(args, "confirmation", None)
+    requirements_arg = getattr(args, "requirements_confidence", None)
+    story_arg = getattr(args, "story_confidence", None)
+    if require_explicit_state and all(
+        value is None
+        for value in (stage_arg, confirmation_arg, requirements_arg, story_arg)
+    ):
+        raise ProjectError("Specify at least one framework state field")
+    stage = stage_arg or current.get("stage")
+    confirmation = confirmation_arg or current.get("confirmation")
     try:
         requirements_confidence = (
-            args.requirements_confidence
-            if args.requirements_confidence is not None
+            requirements_arg
+            if requirements_arg is not None
             else int(current.get("requirements_confidence", "-1"))
         )
         story_confidence = (
-            args.story_confidence
-            if args.story_confidence is not None
+            story_arg
+            if story_arg is not None
             else int(current.get("story_confidence", "-1"))
         )
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise ProjectError("Current framework confidence is not an integer") from exc
+    return stage, confirmation, requirements_confidence, story_confidence
+
+
+def _validate_framework_transition(
+    root: Path,
+    *,
+    stage: str | None,
+    confirmation: str | None,
+    requirements_confidence: int,
+    story_confidence: int,
+    canonical_texts: dict[str, str] | None = None,
+) -> None:
     if stage not in FRAMEWORK_STAGES:
         raise ProjectError("Invalid framework stage")
     if confirmation not in FRAMEWORK_CONFIRMATIONS:
@@ -1219,53 +2682,77 @@ def framework_state(args: argparse.Namespace) -> dict[str, Any]:
     if confirmation == "confirmed":
         if requirements_confidence < 95 or story_confidence < 95:
             raise ProjectError("Both confidence values must be at least 95 to confirm")
-        canonical_paths = (
-            "story-bible/premise.md",
-            "story-bible/cast.md",
-            "story-bible/world.md",
-            "story-bible/style-guide.md",
-            "outlines/master-outline.md",
-        )
+        if canonical_texts is None:
+            canonical_texts = {
+                relative: (root / relative).read_text(encoding="utf-8")
+                for relative in FRAMEWORK_CANONICAL_FILES
+            }
         unresolved: list[str] = []
-        for relative in canonical_paths:
-            text = (root / relative).read_text(encoding="utf-8")
-            if "[待作者确认]" in text or "[待确认]" in text:
+        for relative, text in canonical_texts.items():
+            if not text.strip() or any(
+                marker in text for marker in ("[待作者确认]", "[待确认]", "[待补充]")
+            ):
                 unresolved.append(relative)
         if unresolved:
             raise ProjectError(
                 "Cannot confirm before canonical files are synchronized: "
                 + ", ".join(unresolved)
             )
-    if all(
-        value is None
-        for value in (
-            args.stage,
-            args.confirmation,
-            args.requirements_confidence,
-            args.story_confidence,
-        )
-    ):
-        raise ProjectError("Specify at least one framework state field")
+
+
+def _framework_updates(
+    args: argparse.Namespace,
+    *,
+    stage: str,
+    confirmation: str,
+    requirements_confidence: int,
+    story_confidence: int,
+) -> tuple[dict[str, Any], str]:
     authorization = clean_authorization_reference(args.authorization_reference)
-    updates: dict[str, Any] = {
-        "stage": stage,
-        "confirmation": confirmation,
-        "requirements_confidence": requirements_confidence,
-        "story_confidence": story_confidence,
-        "updated_at": utc_now(),
-        "state_authorization": authorization,
-    }
+    return (
+        {
+            "stage": stage,
+            "confirmation": confirmation,
+            "requirements_confidence": requirements_confidence,
+            "story_confidence": story_confidence,
+            "updated_at": utc_now(),
+            "state_authorization": authorization,
+        },
+        authorization,
+    )
+
+
+def _framework_state(args: argparse.Namespace, root: Path) -> dict[str, Any]:
+    path = root / "planning/framework-session.md"
+    current = frontmatter_metadata(path)
+    stage, confirmation, requirements_confidence, story_confidence = _framework_values(
+        args, current
+    )
+    _validate_framework_transition(
+        root,
+        stage=stage,
+        confirmation=confirmation,
+        requirements_confidence=requirements_confidence,
+        story_confidence=story_confidence,
+    )
+    updates, authorization = _framework_updates(
+        args,
+        stage=stage,
+        confirmation=confirmation,
+        requirements_confidence=requirements_confidence,
+        story_confidence=story_confidence,
+    )
     original = path.read_text(encoding="utf-8")
     updated = replace_frontmatter(original, updates)
-    atomic_write_text(path, updated)
     continuity_result: dict[str, Any] | None = None
     try:
         if read_json(root / "novel.json").get("current_chapter") == 0:
             continuity_result = novel_continuity.reseal_zero_baseline(
-                root, authorization
+                root, authorization, extra_writes=[(path, updated.encode("utf-8"))]
             )
+        else:
+            transactional_write([(path, updated.encode("utf-8"))], journal_root=root)
     except novel_continuity.ContinuityError as exc:
-        atomic_write_text(path, original)
         raise ProjectError(str(exc)) from exc
     return {
         "status": "updated" if updated != original else "already_current",
@@ -1287,6 +2774,367 @@ def framework_state(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _resolve_framework_sync_root(
+    raw_source: str | Path,
+    project_root: Path,
+    work_root: Path,
+) -> Path:
+    raw = Path(raw_source).expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    if _contains_symlink(raw):
+        raise ProjectError(
+            "Framework sync source cannot traverse a symbolic link or reparse point"
+        )
+    source = raw.resolve()
+    if is_within(source, project_root):
+        raise ProjectError(
+            "Framework sync source must be outside the project tree; keep it in work-root"
+        )
+    if not is_within(source, work_root):
+        raise ProjectError(
+            "Framework sync source must be inside the active work directory"
+        )
+    if not source.is_dir():
+        raise ProjectError(f"Framework sync source is not a directory: {source}")
+    _assert_tree_has_no_links(source)
+    return source
+
+
+def _read_framework_sync_files(
+    source: Path,
+) -> tuple[dict[str, bytes], dict[Path, str]]:
+    contents: dict[str, bytes] = {}
+    preconditions: dict[Path, str] = {}
+    for relative in FRAMEWORK_SYNC_SOURCE_FILES:
+        path = source / relative
+        if _contains_symlink(path) or not path.is_file():
+            raise ProjectError(
+                f"Framework sync source is missing a regular file: {relative}"
+            )
+        content = read_stable_bytes(path, label=f"framework sync source {relative}")
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProjectError(
+                f"Framework sync source is not UTF-8: {relative}"
+            ) from exc
+        resolved = path.resolve()
+        contents[relative] = content
+        preconditions[resolved] = sha256_bytes(content)
+    return contents, preconditions
+
+
+def _framework_manifest_bytes(
+    raw_settings: bytes,
+    current_manifest: dict[str, Any],
+    *,
+    confirmation: str,
+) -> bytes:
+    try:
+        settings = json.loads(raw_settings.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProjectError(
+            f"Framework sync {FRAMEWORK_SETTINGS_FILE} must be valid UTF-8 JSON"
+        ) from exc
+    if not isinstance(settings, dict):
+        raise ProjectError(
+            f"Framework sync {FRAMEWORK_SETTINGS_FILE} must be a JSON object"
+        )
+    required = {"schema_version", "pov", "tense", "target_words"}
+    missing = sorted(required - set(settings))
+    unknown = sorted(set(settings) - required)
+    if missing:
+        raise ProjectError(
+            f"Framework sync {FRAMEWORK_SETTINGS_FILE} is missing: "
+            + ", ".join(missing)
+        )
+    if unknown:
+        raise ProjectError(
+            f"Framework sync {FRAMEWORK_SETTINGS_FILE} contains protected or unknown "
+            "fields: "
+            + ", ".join(unknown)
+        )
+    if type(settings.get("schema_version")) is not int or settings[
+        "schema_version"
+    ] != SCHEMA_VERSION:
+        raise ProjectError(
+            f"Framework sync {FRAMEWORK_SETTINGS_FILE} has an unsupported schema_version"
+        )
+    for key in ("pov", "tense"):
+        value = settings.get(key)
+        if (
+            not isinstance(value, str)
+            or value != value.strip()
+            or "\x00" in value
+            or "\r" in value
+            or "\n" in value
+            or len(value) > 200
+        ):
+            raise ProjectError(
+                f"Framework sync {FRAMEWORK_SETTINGS_FILE} {key} must be a concise string"
+            )
+        if confirmation == "confirmed" and not value:
+            raise ProjectError(
+                f"Confirmed framework requires a non-empty {key} in "
+                f"{FRAMEWORK_SETTINGS_FILE}"
+            )
+    target_words = settings.get("target_words")
+    if target_words is not None and (
+        type(target_words) is not int or target_words < 1
+    ):
+        raise ProjectError(
+            f"Framework sync {FRAMEWORK_SETTINGS_FILE} target_words must be null "
+            "or a positive integer"
+        )
+
+    updated = dict(current_manifest)
+    for key in ("pov", "tense", "target_words"):
+        updated[key] = settings[key]
+    if confirmation == "confirmed" and updated.get("status") == "planning":
+        updated["status"] = "drafting"
+    if updated != current_manifest:
+        updated["updated_at"] = utc_now()
+    return dump_json(updated).encode("utf-8")
+
+
+def _framework_sync(
+    args: argparse.Namespace,
+    root: Path,
+    work_root: Path,
+) -> dict[str, Any]:
+    source = _resolve_framework_sync_root(args.source_root, root, work_root)
+    source_contents, source_preconditions = _read_framework_sync_files(source)
+    source_session = source_contents["planning/framework-session.md"].decode("utf-8")
+    source_metadata = parse_frontmatter_metadata(
+        source_session, label=str(source / "planning/framework-session.md")
+    )
+    current_session_path = root / "planning/framework-session.md"
+    current_session = frontmatter_metadata(current_session_path)
+    # The package is the source of the complete session body; CLI values are
+    # optional overrides for the controlled state transition.
+    state_args = argparse.Namespace(
+        stage=getattr(args, "stage", None),
+        confirmation=getattr(args, "confirmation", None),
+        requirements_confidence=getattr(args, "requirements_confidence", None),
+        story_confidence=getattr(args, "story_confidence", None),
+    )
+    package_stage, package_confirmation, package_requirements, package_story = (
+        _framework_values(state_args, source_metadata, require_explicit_state=False)
+    )
+    # A package with no state metadata may inherit the currently recorded
+    # state, but it must still carry a valid frontmatter version and transition.
+    if source_metadata.get("schema_version") != str(SCHEMA_VERSION):
+        raise ProjectError(
+            "Framework sync source session has an unsupported schema_version"
+        )
+    if package_stage is None:
+        package_stage = current_session.get("stage")
+    if package_confirmation is None:
+        package_confirmation = current_session.get("confirmation")
+    if source_metadata.get("requirements_confidence") is None and getattr(
+        args, "requirements_confidence", None
+    ) is None:
+        package_requirements = int(current_session.get("requirements_confidence", "-1"))
+    if source_metadata.get("story_confidence") is None and getattr(
+        args, "story_confidence", None
+    ) is None:
+        package_story = int(current_session.get("story_confidence", "-1"))
+    _validate_framework_transition(
+        root,
+        stage=package_stage,
+        confirmation=package_confirmation,
+        requirements_confidence=package_requirements,
+        story_confidence=package_story,
+        canonical_texts={
+            relative: source_contents[relative].decode("utf-8")
+            for relative in FRAMEWORK_SYNC_FILES
+        },
+    )
+    updates, authorization = _framework_updates(
+        args,
+        stage=package_stage,
+        confirmation=package_confirmation,
+        requirements_confidence=package_requirements,
+        story_confidence=package_story,
+    )
+    updated_session = replace_frontmatter(source_session, updates).encode("utf-8")
+
+    writes: list[tuple[Path, bytes]] = []
+    target_preconditions: dict[Path, str | None] = {}
+    changed_targets = False
+    changed_semantic_paths: set[str] = set()
+    for relative in (*FRAMEWORK_CANONICAL_FILES, *FRAMEWORK_MEMORY_FILES):
+        target = root / relative
+        if _contains_symlink(target) or not target.is_file():
+            raise ProjectError(f"Project framework target is missing: {relative}")
+        previous = read_stable_bytes(target, label=f"framework target {relative}")
+        target_preconditions[target.resolve()] = sha256_bytes(previous)
+        if previous != source_contents[relative]:
+            changed_targets = True
+            changed_semantic_paths.add(relative)
+        writes.append((target, source_contents[relative]))
+    previous_session = read_stable_bytes(
+        current_session_path, label="current framework session"
+    )
+    comparison_updates = dict(updates)
+    comparison_updates["updated_at"] = current_session.get(
+        "updated_at", updates["updated_at"]
+    )
+    comparison_updates["state_authorization"] = current_session.get(
+        "state_authorization", authorization
+    )
+    comparison_session = replace_frontmatter(
+        source_session, comparison_updates
+    ).encode("utf-8")
+    if comparison_session == previous_session:
+        updated_session = previous_session
+    else:
+        changed_semantic_paths.add("planning/framework-session.md")
+    target_preconditions[current_session_path.resolve()] = sha256_bytes(previous_session)
+    changed_targets = changed_targets or previous_session != updated_session
+    writes.append((current_session_path, updated_session))
+
+    manifest_path = root / "novel.json"
+    previous_manifest = read_stable_bytes(manifest_path, label="current novel.json")
+    try:
+        current_manifest = json.loads(previous_manifest.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProjectError("Current novel.json must be valid UTF-8 JSON") from exc
+    if not isinstance(current_manifest, dict):
+        raise ProjectError("Current novel.json must be a JSON object")
+    current_chapter = current_manifest.get("current_chapter")
+    if (
+        type(current_chapter) is not int
+        or current_chapter < 0
+    ):
+        raise ProjectError("novel.json current_chapter must be a non-negative integer")
+    updated_manifest = _framework_manifest_bytes(
+        source_contents[FRAMEWORK_SETTINGS_FILE],
+        current_manifest,
+        confirmation=package_confirmation,
+    )
+    updated_manifest_data = json.loads(updated_manifest.decode("utf-8"))
+    manifest_semantic_changed = updated_manifest_data != current_manifest
+    if not manifest_semantic_changed:
+        updated_manifest = previous_manifest
+    else:
+        changed_semantic_paths.add("novel.json")
+    target_preconditions[manifest_path.resolve()] = sha256_bytes(previous_manifest)
+    changed_targets = changed_targets or previous_manifest != updated_manifest
+    writes.append((manifest_path, updated_manifest))
+    if current_chapter > 0 and changed_targets:
+        try:
+            open_invalidations = novel_continuity.unresolved_invalidations(root)
+        except novel_continuity.ContinuityError as exc:
+            raise ProjectError(str(exc)) from exc
+        covered_paths = {
+            str(path)
+            for item in open_invalidations
+            for path in item.get("changed_paths", [])
+            if isinstance(path, str)
+        }
+        uncovered_paths = sorted(changed_semantic_paths - covered_paths)
+        if not open_invalidations or uncovered_paths:
+            detail = (
+                "; missing changed_paths coverage: " + ", ".join(uncovered_paths)
+                if uncovered_paths
+                else ""
+            )
+            raise ProjectError(
+                "Framework content changes after the first chapter require an open "
+                "continuity invalidation that covers every changed canonical path; "
+                "run impact, then invalidate, before sync"
+                + detail
+            )
+
+    current_before = {
+        "stage": current_session.get("stage"),
+        "confirmation": current_session.get("confirmation"),
+        "requirements_confidence": current_session.get("requirements_confidence"),
+        "story_confidence": current_session.get("story_confidence"),
+    }
+    if not changed_targets:
+        return {
+            "status": "already_current",
+            "project_root": str(root),
+            "source_root": str(source),
+            "source_files": list(FRAMEWORK_SYNC_SOURCE_FILES),
+            "synced_files": [],
+            "before": current_before,
+            "after": dict(current_before),
+            "authorization_reference": authorization,
+            "continuity": None,
+        }
+
+    try:
+        if current_chapter == 0:
+            continuity_result = novel_continuity.reseal_zero_baseline(
+                root,
+                authorization,
+                extra_writes=writes,
+                expected_targets=target_preconditions,
+                expected_existing=source_preconditions,
+            )
+        else:
+            transactional_write(
+                writes,
+                journal_root=root,
+                expected_existing=source_preconditions,
+                expected_targets=target_preconditions,
+            )
+            continuity_result = None
+    except novel_continuity.ContinuityError as exc:
+        raise ProjectError(str(exc)) from exc
+    return {
+        "status": "synchronized",
+        "project_root": str(root),
+        "source_root": str(source),
+        "source_files": list(FRAMEWORK_SYNC_SOURCE_FILES),
+        "synced_files": [*FRAMEWORK_SYNC_FILES, "novel.json"],
+        "before": current_before,
+        "after": {
+            "stage": package_stage,
+            "confirmation": package_confirmation,
+            "requirements_confidence": package_requirements,
+            "story_confidence": package_story,
+        },
+        "authorization_reference": authorization,
+        "continuity": continuity_result,
+    }
+
+
+def framework_sync(args: argparse.Namespace) -> dict[str, Any]:
+    root = resolve_root(args.root)
+    try:
+        with project_write_context(root, args) as context:
+            if context.workspace_root is None or context.guard is None:
+                raise ProjectError(
+                    "framework-sync requires an active workspace work directory"
+                )
+            work_root = (
+                context.workspace_root / "workspaces" / context.guard.work_id
+            ).resolve()
+            result = _framework_sync(args, root, work_root)
+            context.assert_live()
+            context.refresh_base_after_write("framework content and state synchronization")
+            return result
+    except (OSError, sqlite3.Error) as exc:
+        raise ProjectError(f"Project write authorization failed: {exc}") from exc
+
+
+def framework_state(args: argparse.Namespace) -> dict[str, Any]:
+    root = resolve_root(args.root)
+    try:
+        with project_write_context(root, args) as context:
+            result = _framework_state(args, root)
+            context.assert_live()
+            context.refresh_base_after_write("framework state update")
+            return result
+    except (OSError, sqlite3.Error) as exc:
+        raise ProjectError(f"Project write authorization failed: {exc}") from exc
+
+
 def markdown_cell(value: Any) -> str:
     if isinstance(value, list):
         text = ",".join(str(item) for item in value)
@@ -1296,7 +3144,13 @@ def markdown_cell(value: Any) -> str:
 
 
 def resolve_package_file(package: Path, relative: str) -> Path:
-    path = (package / relative).resolve()
+    raw_package = Path(package).expanduser()
+    if _contains_symlink(raw_package):
+        raise ProjectError(f"Staging package cannot traverse a symbolic link: {package}")
+    raw_path = raw_package / relative
+    if _contains_symlink(raw_path):
+        raise ProjectError(f"Staged file cannot traverse a symbolic link: {relative}")
+    path = raw_path.resolve()
     if not is_within(path, package):
         raise ProjectError(f"Staging path escapes its package: {relative}")
     if not path.is_file():
@@ -1304,13 +3158,133 @@ def resolve_package_file(package: Path, relative: str) -> Path:
     return path
 
 
+def _package_entries(package: Path) -> tuple[tuple[str, bytes], ...]:
+    """Read a complete package tree as stable bytes, rejecting links/special files."""
+
+    if _link_like(package) or not package.is_dir():
+        raise ProjectError(f"Chapter package must be a regular directory: {package}")
+    entries: list[tuple[str, bytes]] = []
+    pending = [package]
+    while pending:
+        directory = pending.pop()
+        try:
+            children = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise ProjectError(f"Unable to enumerate chapter package: {directory}: {exc}") from exc
+        for child in children:
+            if _link_like(child):
+                raise ProjectError(f"Chapter package cannot contain a symbolic link: {child}")
+            if child.is_dir():
+                pending.append(child)
+                continue
+            if not child.is_file():
+                raise ProjectError(f"Chapter package contains a non-regular file: {child}")
+            relative = child.relative_to(package).as_posix()
+            try:
+                before = child.stat()
+                content = child.read_bytes()
+                after = child.stat()
+            except OSError as exc:
+                raise ProjectError(f"Unable to read chapter package file: {child}: {exc}") from exc
+            if (
+                before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+            ):
+                raise ProjectError(f"Chapter package file changed while being read: {relative}")
+            entries.append((relative, content))
+    if not entries:
+        raise ProjectError("Chapter package cannot be empty")
+    return tuple(sorted(entries, key=lambda item: item[0]))
+
+
+def _package_fingerprint(package: Path) -> tuple[tuple[str, str, int], ...]:
+    return tuple(
+        (relative, sha256_bytes(content), len(content))
+        for relative, content in _package_entries(package)
+    )
+
+
+def _materialize_package_snapshot(
+    package: Path,
+) -> tuple[Path, tuple[tuple[str, str, int], ...], tuple[tuple[str, str, int], ...]]:
+    """Copy a package to a private sibling directory and return both fingerprints."""
+
+    entries = _package_entries(package)
+    original_fingerprint = tuple(
+        (relative, sha256_bytes(content), len(content))
+        for relative, content in entries
+    )
+    snapshot = Path(
+        tempfile.mkdtemp(prefix=".novel-package-snapshot-", dir=str(package.parent))
+    )
+    try:
+        for relative, content in entries:
+            target = snapshot / Path(relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        snapshot_fingerprint = _package_fingerprint(snapshot)
+    except BaseException:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+    return snapshot, original_fingerprint, snapshot_fingerprint
+
+
+def _assert_package_snapshot_unchanged(
+    package: Path,
+    expected: tuple[tuple[str, str, int], ...],
+    snapshot: Path,
+    snapshot_expected: tuple[tuple[str, str, int], ...],
+) -> None:
+    if _package_fingerprint(package) != expected:
+        raise ProjectError(
+            "Staged chapter package changed during validation; refusing to commit"
+        )
+    if _package_fingerprint(snapshot) != snapshot_expected:
+        raise ProjectError(
+            "Private chapter package snapshot changed during validation; refusing to commit"
+        )
+
+
 def validate_originality_report(
     root: Path, report_relative: str, chapter_path: Path
-) -> dict[str, Any]:
-    report_path = (root / report_relative).resolve()
-    if not is_within(report_path, (root / "reviews").resolve()):
-        raise ProjectError("Originality report must be under the project's reviews directory")
-    report = read_json(report_path)
+) -> tuple[dict[str, Any], Path, Path, bytes]:
+    if not isinstance(report_relative, str) or not report_relative:
+        raise ProjectError("Originality report path in commit.json must not be empty")
+    if "\\" in report_relative:
+        raise ProjectError("Originality report path must use POSIX separators")
+    relative_path = Path(report_relative)
+    if (
+        relative_path.is_absolute()
+        or "." in relative_path.parts
+        or ".." in relative_path.parts
+        or relative_path.as_posix() != report_relative
+    ):
+        raise ProjectError(
+            "Originality report path in commit.json must be a normalized project-relative path"
+        )
+    raw_report_path = root / relative_path
+    if _contains_symlink(raw_report_path):
+        raise ProjectError(
+            "Originality report path cannot traverse a symbolic link or reparse point"
+        )
+    report_path = raw_report_path.resolve()
+    reviews_root = (root / "reviews").resolve()
+    staging_root = (root / "staging").resolve()
+    in_reviews = is_within(report_path, reviews_root)
+    if not in_reviews and not is_within(report_path, staging_root):
+        raise ProjectError(
+            "Originality report must be under the project's staging or reviews directory"
+        )
+    report_bytes = read_stable_bytes(report_path, label="Originality report")
+    try:
+        report = json.loads(report_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProjectError(f"Originality report is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(report, dict):
+        raise ProjectError("Originality report must be a JSON object")
     if report.get("schema_version") != SCHEMA_VERSION:
         raise ProjectError("Originality report has an unsupported schema_version")
     if report.get("decision") != "pass":
@@ -1332,7 +3306,9 @@ def validate_originality_report(
         raise ProjectError("Originality report does not cover the staged chapter hash")
     plan_path = root / "research/originality-plan.json"
     report_plan_hash = report.get("originality_plan_sha256")
-    if report_plan_hash != sha256_file(plan_path):
+    if report_plan_hash != sha256_bytes(
+        read_stable_bytes(plan_path, label="Originality plan")
+    ):
         raise ProjectError("Originality plan changed after the report was generated")
     references = report.get("reference_files")
     if not isinstance(references, list):
@@ -1340,12 +3316,55 @@ def validate_originality_report(
     for reference in references:
         if not isinstance(reference, dict) or not isinstance(reference.get("path"), str):
             raise ProjectError("Originality report contains an invalid reference entry")
-        reference_path = (root / reference["path"]).resolve()
+        reference_relative = reference["path"]
+        if "\\" in reference_relative:
+            raise ProjectError("Originality report reference path must use POSIX separators")
+        pure_reference = Path(reference_relative)
+        if (
+            pure_reference.is_absolute()
+            or "." in pure_reference.parts
+            or ".." in pure_reference.parts
+            or pure_reference.as_posix() != reference_relative
+        ):
+            raise ProjectError("Originality report reference path is not normalized")
+        raw_reference = root / pure_reference
+        if _contains_symlink(raw_reference):
+            raise ProjectError(
+                "Originality report reference cannot traverse a link or reparse point"
+            )
+        reference_path = raw_reference.resolve()
         if not is_within(reference_path, root) or not reference_path.is_file():
             raise ProjectError("Originality report reference is missing or out of scope")
-        if sha256_file(reference_path) != reference.get("sha256"):
+        if sha256_bytes(
+            read_stable_bytes(reference_path, label="Originality reference")
+        ) != reference.get("sha256"):
             raise ProjectError("An originality reference changed after audit")
-    return report
+    if in_reviews:
+        archive_path = report_path
+    else:
+        generated_at = report.get("generated_at")
+        if not isinstance(generated_at, str) or not generated_at.strip():
+            raise ProjectError("Originality report generated_at must not be empty")
+        try:
+            generated = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ProjectError("Originality report generated_at must be ISO-8601") from exc
+        if generated.tzinfo is None:
+            raise ProjectError("Originality report generated_at must include a timezone")
+        timestamp = generated.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        fingerprint = sha256_bytes(report_bytes)[:10]
+        archive_path = reviews_root / f"originality-audit-{timestamp}-{fingerprint}.json"
+        if _contains_symlink(archive_path):
+            raise ProjectError(
+                "Originality report archive path cannot traverse a link or reparse point"
+            )
+        if archive_path.exists() and read_stable_bytes(
+            archive_path, label="Originality report archive"
+        ) != report_bytes:
+            raise ProjectError(
+                f"Originality report archive target already exists with different bytes: {archive_path}"
+            )
+    return report, report_path, archive_path, report_bytes
 
 
 def validate_humanization_review(
@@ -1453,7 +3472,7 @@ def validate_humanization_review(
     return review
 
 
-def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
+def _commit_chapter_impl(args: argparse.Namespace) -> dict[str, Any]:
     root = resolve_root(args.root)
     workspace_raw = getattr(args, "workspace", None)
     work_id = getattr(args, "work_id", None)
@@ -1567,7 +3586,12 @@ def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
     report_relative = str(package_manifest.get("originality_report", ""))
     if not report_relative:
         raise ProjectError("commit.json must name a passing originality_report")
-    originality_report = validate_originality_report(
+    (
+        originality_report,
+        originality_source,
+        originality_archive,
+        originality_bytes,
+    ) = validate_originality_report(
         root, report_relative, chapter_source
     )
 
@@ -1638,6 +3662,8 @@ def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
             continuity_result["dependencies_bytes"],
         ),
     ]
+    if originality_archive != originality_source:
+        writes.append((originality_archive, originality_bytes))
     optional_replacements = (
         ("timeline_file", root / "continuity/timeline.md"),
         ("threads_file", root / "continuity/threads.md"),
@@ -1667,11 +3693,13 @@ def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
     writes.append((head_target, head_bytes))
 
     def validate_committed_state() -> None:
-        errors, _ = collect_validation(root)
+        assert_staging_snapshot()
+        errors, _ = collect_validation(root, check_transactions=False)
         if errors:
             raise ProjectError("Post-commit validation failed: " + "; ".join(errors))
         try:
             guard.assert_live()
+            guard.refresh_base_after_write("commit-chapter transaction")
         except (OSError, sqlite3.Error, novel_workspace.WorkspaceError) as exc:
             raise ProjectError(
                 f"Project write authorization expired during commit: {exc}"
@@ -1680,13 +3708,47 @@ def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
     # The guard acquires BEGIN IMMEDIATE and remains open for the complete
     # atomic file transaction.  A second writer therefore cannot reclaim the
     # lease between the final authorization check and rollback/replace.
+    package_snapshot_info = getattr(args, "_package_snapshot_info", None)
+
+    def assert_staging_snapshot() -> None:
+        if not package_snapshot_info:
+            return
+        _assert_package_snapshot_unchanged(
+            package_snapshot_info["original_package"],
+            package_snapshot_info["original_fingerprint"],
+            package_snapshot_info["snapshot_package"],
+            package_snapshot_info["snapshot_fingerprint"],
+        )
+        for item in package_snapshot_info.get("external_files", ()):
+            path, expected_hash, expected_size = item
+            if _link_like(path) or not path.is_file():
+                raise ProjectError(f"Commit evidence file disappeared or became a link: {path}")
+            content = path.read_bytes()
+            if (
+                len(content) != expected_size
+                or sha256_bytes(content) != expected_hash
+            ):
+                raise ProjectError(
+                    f"Commit evidence file changed during validation: {path}"
+                )
+
     try:
         with novel_workspace.write_guard(
             workspace_raw,
             work_id,
             expected_project_root=root,
         ) as guard:
-            transactional_write(writes, validator=validate_committed_state)
+            # Recheck the immutable package and external evidence immediately
+            # before replacing any canonical bytes.  If a writer changed them
+            # during validation, transactional_write rolls the canonical files
+            # back instead of committing a mixed evidence set.
+            assert_staging_snapshot()
+            transactional_write(
+                writes,
+                validator=validate_committed_state,
+                journal_root=root,
+                expected_targets={chapter_target: None, memory_target: None},
+            )
     except (OSError, sqlite3.Error, novel_workspace.WorkspaceError) as exc:
         raise ProjectError(f"Project write authorization expired: {exc}") from exc
     cache_result: dict[str, Any] | None = None
@@ -1718,7 +3780,7 @@ def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
         "memory_card": memory_target.relative_to(root).as_posix(),
         "humanization_review": str(package_manifest["humanization_review_file"]),
         "humanization_outcome": humanization_review.get("outcome"),
-        "originality_report": report_relative,
+        "originality_report": originality_archive.relative_to(root).as_posix(),
         "originality_decision": originality_report.get("decision"),
         "continuity_audit": continuity_result["audit_target"]
         .relative_to(root)
@@ -1737,6 +3799,72 @@ def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
     if work_type == "short_story":
         result["work_type"] = work_type
     return result
+
+
+def commit_chapter(args: argparse.Namespace) -> dict[str, Any]:
+    """Commit from one immutable staging snapshot.
+
+    The public entry point keeps the caller's package untouched while the
+    implementation validates a private byte-for-byte copy.  This closes the
+    check/use race where an editor could replace one evidence file between two
+    reads of the same package.
+    """
+
+    if not getattr(args, "workspace", None) or not getattr(args, "work_id", None):
+        raise ProjectError("commit-chapter requires --workspace and --work-id")
+    root = resolve_root(args.root)
+    raw_package = Path(args.package).expanduser()
+    if not raw_package.is_absolute():
+        raw_package = root / raw_package
+    if _contains_symlink(raw_package):
+        raise ProjectError("Chapter package cannot traverse a symbolic link")
+    original_package = raw_package.resolve()
+    staging_root = (root / "staging/chapters").resolve()
+    if (
+        not original_package.is_dir()
+        or not is_within(original_package, staging_root)
+    ):
+        raise ProjectError(
+            "Chapter package must be a directory under staging/chapters"
+        )
+
+    snapshot_package, original_fingerprint, snapshot_fingerprint = (
+        _materialize_package_snapshot(original_package)
+    )
+    external_files: list[tuple[Path, str, int]] = []
+    try:
+        # The originality report normally lives under staging/originality or
+        # reviews, outside the chapter package.  Capture it now so its bytes
+        # are tied to the package snapshot as well.
+        try:
+            staged_commit = read_json(snapshot_package / "commit.json")
+        except ProjectError:
+            staged_commit = {}
+        report_relative = staged_commit.get("originality_report")
+        if isinstance(report_relative, str) and report_relative.strip():
+            report_path = (root / report_relative).resolve()
+            if not is_within(report_path, original_package):
+                if _link_like(report_path) or not report_path.is_file():
+                    raise ProjectError(
+                        "Originality report must be a regular file before commit"
+                    )
+                report_bytes = report_path.read_bytes()
+                external_files.append(
+                    (report_path, sha256_bytes(report_bytes), len(report_bytes))
+                )
+
+        snapshot_args = argparse.Namespace(**vars(args))
+        snapshot_args.package = str(snapshot_package)
+        snapshot_args._package_snapshot_info = {
+            "original_package": original_package,
+            "original_fingerprint": original_fingerprint,
+            "snapshot_package": snapshot_package,
+            "snapshot_fingerprint": snapshot_fingerprint,
+            "external_files": tuple(external_files),
+        }
+        return _commit_chapter_impl(snapshot_args)
+    finally:
+        shutil.rmtree(snapshot_package, ignore_errors=True)
 
 
 def validate_project(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -1854,6 +3982,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     upgrade_parser.add_argument("root", help="Initialized project directory.")
+    upgrade_parser.add_argument(
+        "--workspace", help="Workspace root that owns the write lease."
+    )
+    upgrade_parser.add_argument("--work-id", help="Active work context that owns the lease.")
+    upgrade_parser.add_argument(
+        "--allow-bootstrap",
+        action="store_true",
+        help="Explicitly allow upgrading an unregistered standalone project.",
+    )
 
     validate_parser = subparsers.add_parser("validate", help="Validate a project.")
     validate_parser.add_argument("root", help="Project directory.")
@@ -1873,6 +4010,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--deep-analysis", choices=sorted(DEEP_ANALYSIS_STAGES)
     )
     research_parser.add_argument("--authorization-reference", required=True)
+    research_parser.add_argument("--workspace")
+    research_parser.add_argument("--work-id")
+    research_parser.add_argument("--allow-bootstrap", action="store_true")
 
     framework_parser = subparsers.add_parser(
         "framework-state",
@@ -1886,6 +4026,39 @@ def build_parser() -> argparse.ArgumentParser:
     framework_parser.add_argument("--requirements-confidence", type=int)
     framework_parser.add_argument("--story-confidence", type=int)
     framework_parser.add_argument("--authorization-reference", required=True)
+    framework_parser.add_argument("--workspace")
+    framework_parser.add_argument("--work-id")
+    framework_parser.add_argument("--allow-bootstrap", action="store_true")
+
+    framework_sync_parser = subparsers.add_parser(
+        "framework-sync",
+        help=(
+            "Atomically synchronize framework, memory, and allowlisted project "
+            "settings from an external work-root package, then record state."
+        ),
+    )
+    framework_sync_parser.add_argument("root", help="Project directory.")
+    framework_sync_parser.add_argument(
+        "source_root",
+        help=(
+            "External work-root directory containing planning/framework-session.md, "
+            "the four story-bible files, outlines/master-outline.md, two memory "
+            "files, and project-settings.json."
+        ),
+    )
+    framework_sync_parser.add_argument("--stage", choices=sorted(FRAMEWORK_STAGES))
+    framework_sync_parser.add_argument(
+        "--confirmation", choices=sorted(FRAMEWORK_CONFIRMATIONS)
+    )
+    framework_sync_parser.add_argument("--requirements-confidence", type=int)
+    framework_sync_parser.add_argument("--story-confidence", type=int)
+    framework_sync_parser.add_argument("--authorization-reference", required=True)
+    framework_sync_parser.add_argument(
+        "--workspace", required=True, help="Workspace root that owns the write lease."
+    )
+    framework_sync_parser.add_argument(
+        "--work-id", required=True, help="Active work context that owns the write lease."
+    )
 
     commit_parser = subparsers.add_parser(
         "commit-chapter",
@@ -1925,7 +4098,11 @@ def main() -> int:
             return research_state(args)
         if args.command == "framework-state":
             return framework_state(args)
-        return commit_chapter(args)
+        if args.command == "framework-sync":
+            return framework_sync(args)
+        if args.command == "commit-chapter":
+            return commit_chapter(args)
+        raise ProjectError(f"Unsupported command: {args.command}")
 
     return novel_cli.run_cli(
         build_parser,

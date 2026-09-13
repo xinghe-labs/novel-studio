@@ -8,6 +8,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +96,24 @@ class NovelExportTests(unittest.TestCase):
         return novel_export.export_project(
             SimpleNamespace(root=str(self.root), format=formats, force=force)
         )
+
+    def export_files(self) -> dict[str, bytes]:
+        exports = self.root / "exports"
+        if not exports.is_dir():
+            return {}
+        return {
+            path.relative_to(exports).as_posix(): path.read_bytes()
+            for path in exports.rglob("*")
+            if path.is_file()
+        }
+
+    def change_source_for_reexport(self) -> None:
+        chapter = self.root / "manuscript/chapters/0002-储物柜里的照片.md"
+        write_text(
+            chapter,
+            chapter.read_text(encoding="utf-8") + "\n她把照片收进了新证物袋。\n",
+        )
+        seal_full_baseline(self.root)
 
     def test_all_formats_are_derived_from_indexed_markdown(self) -> None:
         before_hash = novel_workspace.project_state_hash(self.root)
@@ -421,6 +440,297 @@ class NovelExportTests(unittest.TestCase):
         self.assertTrue(any("unmanaged files" in issue for issue in status["issues"]))
         with self.assertRaisesRegex(novel_export.ExportError, "unmanaged files"):
             self.export(["fanqie"])
+
+    def test_swap_failure_before_old_package_move_keeps_old_bytes(self) -> None:
+        self.export(["txt"])
+        before = self.export_files()
+        self.change_source_for_reexport()
+        output = self.root / "exports"
+        real_replace = novel_export._REAL_OS_REPLACE
+
+        def fail_before_move(source: Path, target: Path) -> None:
+            if Path(source) == output and Path(target).name.startswith(
+                novel_export.EXPORT_BACKUP_PREFIX
+            ):
+                raise OSError("injected failure before old output move")
+            real_replace(source, target)
+
+        with mock.patch.object(novel_export.os, "replace", side_effect=fail_before_move):
+            with self.assertRaises(OSError):
+                self.export(["txt"])
+        self.assertEqual(self.export_files(), before)
+        recovery = novel_export.recover_export_generations(self.root, output)
+        self.assertIn("discarded uninstalled export generation", recovery)
+        self.assertEqual(self.export_files(), before)
+        self.assertFalse((self.root / novel_export.EXPORT_JOURNAL_NAME).exists())
+
+    def test_swap_failure_after_old_package_move_restores_old_bytes(self) -> None:
+        self.export(["txt"])
+        before = self.export_files()
+        self.change_source_for_reexport()
+        output = self.root / "exports"
+        real_replace = novel_export._REAL_OS_REPLACE
+
+        def move_then_fail(source: Path, target: Path) -> None:
+            real_replace(source, target)
+            if Path(source) == output and Path(target).name.startswith(
+                novel_export.EXPORT_BACKUP_PREFIX
+            ):
+                raise KeyboardInterrupt()
+
+        with mock.patch.object(novel_export.os, "replace", side_effect=move_then_fail):
+            with self.assertRaises(KeyboardInterrupt):
+                self.export(["txt"])
+        self.assertFalse(output.exists())
+        recovery = novel_export.recover_export_generations(self.root, output)
+        self.assertIn("restored previous export package", recovery)
+        self.assertEqual(self.export_files(), before)
+
+    def test_first_export_install_failure_restores_absent_output(self) -> None:
+        output = self.root / "exports"
+        real_replace = novel_export._REAL_OS_REPLACE
+
+        def fail_install(source: Path, target: Path) -> None:
+            source_path = Path(source)
+            if (
+                Path(target) == output
+                and source_path.name == "exports"
+                and source_path.parent.name.startswith(
+                    novel_export.EXPORT_GENERATION_PREFIX
+                )
+            ):
+                raise OSError("injected first-install failure")
+            real_replace(source, target)
+
+        with mock.patch.object(novel_export.os, "replace", side_effect=fail_install):
+            with self.assertRaises(OSError):
+                self.export(["txt"])
+        self.assertFalse(output.exists())
+        recovery = novel_export.recover_export_generations(self.root, output)
+        self.assertIn("discarded uninstalled export generation", recovery)
+        self.assertFalse(output.exists())
+        self.assertFalse((self.root / novel_export.EXPORT_JOURNAL_NAME).exists())
+
+    def test_installed_package_is_completed_when_flag_write_was_not_reached(self) -> None:
+        self.export(["txt"])
+        before = self.export_files()
+        self.change_source_for_reexport()
+        output = self.root / "exports"
+        real_replace = novel_export._REAL_OS_REPLACE
+
+        def install_then_interrupt(source: Path, target: Path) -> None:
+            source_path = Path(source)
+            real_replace(source, target)
+            if (
+                Path(target) == output
+                and source_path.name == "exports"
+                and source_path.parent.name.startswith(
+                    novel_export.EXPORT_GENERATION_PREFIX
+                )
+            ):
+                raise KeyboardInterrupt()
+
+        with mock.patch.object(
+            novel_export.os, "replace", side_effect=install_then_interrupt
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.export(["txt"])
+        journal = read_json(self.root / novel_export.EXPORT_JOURNAL_NAME)
+        self.assertFalse(journal["new_output_installed"])
+        recovery = novel_export.recover_export_generations(self.root, output)
+        self.assertIn("completed export swap", recovery)
+        self.assertNotEqual(self.export_files(), before)
+        self.assertIn(
+            "新证物袋",
+            (output / "《长夜余烬》-全书合并稿.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_committed_cleanup_is_retried_from_journal(self) -> None:
+        self.export(["txt"])
+        self.change_source_for_reexport()
+        original_remove = novel_export._remove_export_artifact
+
+        def fail_backup_cleanup(path: Path, **kwargs) -> None:
+            if Path(path).name.startswith(novel_export.EXPORT_BACKUP_PREFIX):
+                raise OSError("injected committed cleanup interruption")
+            original_remove(path, **kwargs)
+
+        with mock.patch.object(
+            novel_export, "_remove_export_artifact", side_effect=fail_backup_cleanup
+        ):
+            result = self.export(["txt"])
+        self.assertEqual(result["status"], "exported")
+        journal_path = self.root / novel_export.EXPORT_JOURNAL_NAME
+        self.assertEqual(read_json(journal_path)["status"], "committed")
+        recovery = novel_export.recover_export_generations(
+            self.root, self.root / "exports"
+        )
+        self.assertIn("cleaned committed export journal", recovery)
+        self.assertFalse(journal_path.exists())
+
+    def test_partially_cleaned_committed_backup_is_recovered_from_inventory(self) -> None:
+        self.export(["txt", "fanqie"])
+        self.change_source_for_reexport()
+        original_remove = novel_export._remove_export_artifact
+
+        def leave_committed_backup(path: Path, **kwargs) -> None:
+            if Path(path).name.startswith(novel_export.EXPORT_BACKUP_PREFIX):
+                raise OSError("leave committed backup for partial cleanup test")
+            original_remove(path, **kwargs)
+
+        with mock.patch.object(
+            novel_export,
+            "_remove_export_artifact",
+            side_effect=leave_committed_backup,
+        ):
+            result = self.export(["txt"])
+        self.assertEqual(result["status"], "exported")
+
+        journal_path = self.root / novel_export.EXPORT_JOURNAL_NAME
+        journal = read_json(journal_path)
+        self.assertEqual(journal["schema_version"], 2)
+        self.assertEqual(journal["status"], "committed")
+        backup = self.root / journal["backup"]
+        known_files = sorted(path for path in backup.rglob("*") if path.is_file())
+        self.assertGreater(len(known_files), 1)
+        known_files[0].unlink()
+
+        recovery = novel_export.recover_export_generations(
+            self.root, self.root / "exports"
+        )
+        self.assertIn("cleaned committed export journal", recovery)
+        self.assertFalse(backup.exists())
+        self.assertFalse(journal_path.exists())
+
+    def test_committed_backup_cleanup_rejects_unknown_or_changed_remainder(self) -> None:
+        for mutation in ("unknown", "changed"):
+            with self.subTest(mutation=mutation):
+                self.tearDown()
+                self.setUp()
+                self.export(["txt", "fanqie"])
+                self.change_source_for_reexport()
+                original_remove = novel_export._remove_export_artifact
+
+                def leave_backup(path: Path, **kwargs) -> None:
+                    if Path(path).name.startswith(novel_export.EXPORT_BACKUP_PREFIX):
+                        raise OSError("leave backup")
+                    original_remove(path, **kwargs)
+
+                with mock.patch.object(
+                    novel_export,
+                    "_remove_export_artifact",
+                    side_effect=leave_backup,
+                ):
+                    self.export(["txt"])
+                journal_path = self.root / novel_export.EXPORT_JOURNAL_NAME
+                journal = read_json(journal_path)
+                backup = self.root / journal["backup"]
+                if mutation == "unknown":
+                    write_text(backup / "unexpected.txt", "unexpected\n")
+                else:
+                    target = next(path for path in backup.rglob("*") if path.is_file())
+                    target.write_bytes(b"changed")
+
+                with self.assertRaisesRegex(novel_export.ExportError, "backup changed"):
+                    novel_export.recover_export_generations(
+                        self.root, self.root / "exports"
+                    )
+                self.assertTrue(journal_path.is_file())
+
+    def test_export_journal_rejects_string_boolean(self) -> None:
+        output = self.root / "exports"
+        real_replace = novel_export._REAL_OS_REPLACE
+
+        def fail_install(source: Path, target: Path) -> None:
+            if Path(target) == output and Path(source).name == "exports":
+                raise OSError("leave a swapping journal")
+            real_replace(source, target)
+
+        with mock.patch.object(novel_export.os, "replace", side_effect=fail_install):
+            with self.assertRaises(OSError):
+                self.export(["txt"])
+        journal_path = self.root / novel_export.EXPORT_JOURNAL_NAME
+        journal = read_json(journal_path)
+        journal["old_output_moved"] = "false"
+        write_text(
+            journal_path,
+            json.dumps(journal, ensure_ascii=False, indent=2) + "\n",
+        )
+        with self.assertRaisesRegex(novel_export.ExportError, "must be boolean"):
+            novel_export.recover_export_generations(self.root, output)
+
+    def leave_swapping_journal(self) -> tuple[Path, Path]:
+        output = self.root / "exports"
+        real_replace = novel_export._REAL_OS_REPLACE
+
+        def fail_install(source: Path, target: Path) -> None:
+            if Path(target) == output and Path(source).name == "exports":
+                raise OSError("leave a swapping journal for validation")
+            real_replace(source, target)
+
+        with mock.patch.object(novel_export.os, "replace", side_effect=fail_install):
+            with self.assertRaises(OSError):
+                self.export(["txt"])
+        journal_path = self.root / novel_export.EXPORT_JOURNAL_NAME
+        self.assertTrue(journal_path.is_file())
+        return output, journal_path
+
+    def test_export_journal_generation_name_must_match_generation_id(self) -> None:
+        output, journal_path = self.leave_swapping_journal()
+        journal = read_json(journal_path)
+        replacement_id = "0" * 32
+        if replacement_id == journal["generation_id"]:
+            replacement_id = "f" * 32
+        journal["generation"] = (
+            novel_export.EXPORT_GENERATION_PREFIX + replacement_id
+        )
+        write_text(
+            journal_path,
+            json.dumps(journal, ensure_ascii=False, indent=2) + "\n",
+        )
+
+        with self.assertRaisesRegex(
+            novel_export.ExportError, "generation path does not match"
+        ):
+            novel_export.recover_export_generations(self.root, output)
+
+    def test_export_journal_backup_name_must_match_generation_id(self) -> None:
+        output, journal_path = self.leave_swapping_journal()
+        journal = read_json(journal_path)
+        replacement_id = "0" * 32
+        if replacement_id == journal["generation_id"]:
+            replacement_id = "f" * 32
+        journal["backup"] = novel_export.EXPORT_BACKUP_PREFIX + replacement_id
+        write_text(
+            journal_path,
+            json.dumps(journal, ensure_ascii=False, indent=2) + "\n",
+        )
+
+        with self.assertRaisesRegex(
+            novel_export.ExportError, "backup path does not match"
+        ):
+            novel_export.recover_export_generations(self.root, output)
+
+    def test_export_journal_rejects_project_root_through_symlink(self) -> None:
+        output, journal_path = self.leave_swapping_journal()
+        linked_root = self.root.parent / "linked-project-root"
+        try:
+            linked_root.symlink_to(self.root, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory symbolic links are unavailable: {exc}")
+        try:
+            journal = read_json(journal_path)
+            journal["project_root"] = str(linked_root.absolute())
+            write_text(
+                journal_path,
+                json.dumps(journal, ensure_ascii=False, indent=2) + "\n",
+            )
+            with self.assertRaisesRegex(
+                novel_export.ExportError, "link or reparse point"
+            ):
+                novel_export.recover_export_generations(self.root, output)
+        finally:
+            linked_root.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

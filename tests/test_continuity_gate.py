@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,7 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SKILL_ROOT / "tests"))
 
 import novel_continuity  # noqa: E402
+import novel_cli  # noqa: E402
 import novel_export  # noqa: E402
 import novel_originality  # noqa: E402
 import novel_project  # noqa: E402
@@ -76,6 +78,7 @@ class ContinuityGateTests(unittest.TestCase):
                     requirements_confidence=97,
                     story_confidence=97,
                     authorization_reference="unit test author framework confirmation",
+                    allow_bootstrap=True,
                 )
             )
             self.write_originality_plan(root)
@@ -197,6 +200,8 @@ class ContinuityGateTests(unittest.TestCase):
                 near_threshold=0.72,
                 max_findings=30,
                 no_report=False,
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
         self.assertEqual(code, 0)
@@ -225,6 +230,8 @@ class ContinuityGateTests(unittest.TestCase):
             risk_triggers=risk_triggers,
             chapter_class=chapter_class,
             fact_changes=fact_changes,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
         )
         return package
 
@@ -254,7 +261,11 @@ class ContinuityGateTests(unittest.TestCase):
         state = read_json(root / "continuity/state.json")
         state.update({"through_chapter": through, "story_time": f"第{through}日"})
         write_json(root / "continuity/state.json", state)
-        seal_full_baseline(root)
+        seal_full_baseline(
+            root,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
 
     def audit_path(self, package: Path) -> Path:
         commit = read_json(package / "commit.json")
@@ -296,6 +307,75 @@ class ContinuityGateTests(unittest.TestCase):
             )
         self.assertFalse(facts_path.exists())
 
+    def test_baseline_record_rejects_project_inputs_and_report_replacement(self) -> None:
+        root = self.init_project("baseline-input-boundary")
+        project_packet = root / "staging/baseline-packet.json"
+        write_json(project_packet, {})
+        with self.assertRaisesRegex(novel_continuity.ContinuityError, "outside the project"):
+            novel_continuity.record_baseline(
+                SimpleNamespace(
+                    root=str(root),
+                    packet=str(project_packet),
+                    report=str(self.base / "unused-baseline-report.json"),
+                    authorization_reference="测试基准输入边界",
+                    workspace=str(self.workspace),
+                    work_id=self.work_contexts[root.resolve()],
+                )
+            )
+
+        packet = novel_continuity.build_baseline_packet(root)
+        packet_path = self.base / "stable-baseline-packet.json"
+        report_path = self.base / "stable-baseline-report.json"
+        write_json(packet_path, packet)
+        report = novel_continuity.baseline_report_template(
+            packet, novel_continuity.sha256_file(packet_path)
+        )
+        report.update(
+            {
+                "status": "complete",
+                "reviewed_chapters": [],
+                "reviewer": {
+                    "mode": "deterministic",
+                    "reviewer_id": "test-zero-baseline-reviewer",
+                    "independent_context": False,
+                },
+                "summary": "空项目基准已完成确定性核验。",
+                "reviewed_at": "2026-09-13T00:00:00+00:00",
+            }
+        )
+        write_json(report_path, report)
+        args = SimpleNamespace(
+            root=str(root),
+            packet=str(packet_path),
+            report=str(report_path),
+            authorization_reference="测试基准输入稳定绑定",
+            workspace=str(self.workspace),
+            work_id=self.work_contexts[root.resolve()],
+        )
+        before = set((root / novel_continuity.BASELINES_DIR).glob("*.json"))
+        original_transaction = novel_project.transactional_write
+
+        def replace_report_before_commit(*transaction_args, **transaction_kwargs):
+            write_json(report_path, {})
+            return original_transaction(*transaction_args, **transaction_kwargs)
+
+        with mock.patch.object(
+            novel_project,
+            "transactional_write",
+            side_effect=replace_report_before_commit,
+        ):
+            with self.assertRaisesRegex(novel_continuity.ContinuityError, "precondition failed"):
+                novel_continuity.record_baseline(args)
+        self.assertEqual(set((root / novel_continuity.BASELINES_DIR).glob("*.json")), before)
+
+    def test_continuity_root_rejects_link_like_parent_chain(self) -> None:
+        root = self.init_project("continuity-link-root")
+        with mock.patch.object(
+            novel_continuity, "_path_chain_has_link", return_value=True
+        ):
+            with self.assertRaisesRegex(novel_continuity.ContinuityError, "cannot traverse"):
+                novel_continuity.continuity_status(root)
+
     def test_repeated_zero_chapter_reseal_remains_valid(self) -> None:
         root = self.init_project("zero-reseal", ready=False)
         novel_project.research_state(
@@ -304,6 +384,8 @@ class ContinuityGateTests(unittest.TestCase):
                 candidate_approval="approved",
                 deep_analysis=None,
                 authorization_reference="unit test candidate approval",
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
         novel_project.research_state(
@@ -312,6 +394,8 @@ class ContinuityGateTests(unittest.TestCase):
                 candidate_approval=None,
                 deep_analysis="in_progress",
                 authorization_reference="unit test deep analysis start",
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
         status = novel_continuity.continuity_status(root)
@@ -572,13 +656,159 @@ class ContinuityGateTests(unittest.TestCase):
                 SimpleNamespace(root=str(root), format=["txt"], force=False)
             )
 
-        baseline = seal_full_baseline(root)
+        baseline = seal_full_baseline(
+            root,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
         self.assertEqual(baseline["through_chapter"], 5)
         self.assertEqual(novel_continuity.continuity_status(root)["status"], "current")
         with self.assertRaisesRegex(novel_export.ExportError, "periodic quality review"):
             novel_export.export_project(
                 SimpleNamespace(root=str(root), format=["txt"], force=False)
             )
+
+    def test_prepare_context_writes_only_outside_project_tree(self) -> None:
+        root = self.init_project("context-output-boundary")
+        with self.assertRaisesRegex(
+            novel_continuity.ContinuityError, "outside the project tree"
+        ):
+            novel_continuity.prepare_context(
+                SimpleNamespace(
+                    root=str(root),
+                    chapter=1,
+                    output=str(
+                        root
+                        / "staging/chapters/0001-test/continuity-context.json"
+                    ),
+                )
+            )
+
+        work_output = self.base / "work-context" / "continuity-context.json"
+        prepared = novel_continuity.prepare_context(
+            SimpleNamespace(root=str(root), chapter=1, output=str(work_output))
+        )
+        self.assertEqual(prepared["status"], "prepared")
+        self.assertTrue(work_output.is_file())
+
+        existing = self.base / "existing-context.json"
+        existing.write_bytes(b"concurrent context")
+        with self.assertRaisesRegex(
+            novel_continuity.ContinuityError, "Refusing to overwrite"
+        ):
+            novel_continuity.prepare_context(
+                SimpleNamespace(root=str(root), chapter=1, output=str(existing))
+            )
+        self.assertEqual(existing.read_bytes(), b"concurrent context")
+
+    def test_prepare_context_interrupt_leaves_no_partial_output(self) -> None:
+        root = self.init_project("context-interrupt")
+        output = self.base / "interrupted-context" / "continuity-context.json"
+
+        with mock.patch.object(
+            novel_cli.os, "fsync", side_effect=KeyboardInterrupt()
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                novel_continuity.prepare_context(
+                    SimpleNamespace(root=str(root), chapter=1, output=str(output))
+                )
+
+        self.assertFalse(output.exists())
+        self.assertEqual(list(output.parent.iterdir()), [])
+
+    def test_install_interrupt_rolls_back_all_missing_scaffold_files(self) -> None:
+        root = self.init_project("install-transaction")
+        missing = (
+            root / novel_continuity.POLICY_PATH,
+            root / novel_continuity.DEPENDENCIES_PATH,
+        )
+        for path in missing:
+            path.unlink()
+        work_id = self.work_contexts[root.resolve()]
+        current_hash = novel_workspace.project_state_hash(root)
+        validation_report = self.base / "install-state-validation.json"
+        validation_report.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "project_root": str(root.resolve()),
+                    "previous_state_hash": self._work_base_hash(work_id),
+                    "validated_state_hash": current_hash,
+                    "result": "pass",
+                    "validation_reference": "unit-test missing scaffold setup",
+                    "checked_at": "2026-09-12T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        novel_workspace.refresh_base(
+            self.workspace,
+            work_id,
+            "unit-test missing scaffold setup",
+            accept_external_change=True,
+            validation_report=validation_report,
+        )
+        real_replace = novel_project.os.replace
+        target_replacements = 0
+
+        def replace_then_interrupt(source: Path, target: Path) -> None:
+            nonlocal target_replacements
+            real_replace(source, target)
+            target_replacements += 1
+            if target_replacements == 1:
+                raise KeyboardInterrupt()
+
+        with mock.patch.object(
+            novel_project.os, "replace", side_effect=replace_then_interrupt
+        ):
+            with self.assertRaises(novel_continuity.ContinuityError):
+                novel_continuity.install_project(
+                    root,
+                    workspace=self.workspace,
+                    work_id=work_id,
+                )
+
+        self.assertTrue(all(not path.exists() for path in missing))
+        self.assertEqual(novel_workspace.project_state_hash(root), current_hash)
+
+    def _work_base_hash(self, work_id: str) -> str:
+        context = json.loads(
+            (self.workspace / "workspaces" / work_id / "work.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        return str(context["base_state_hash"])
+
+    def test_continuity_transaction_interrupt_after_replace_rolls_back(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        try:
+            first = Path(temp_dir.name) / "first.bin"
+            second = Path(temp_dir.name) / "second.bin"
+            first.write_bytes(b"\xffold-a")
+            second.write_bytes(b"\xfeold-b")
+            real_replace = novel_project.os.replace
+            calls = 0
+
+            def replace_then_interrupt(source: Path, target: Path) -> None:
+                nonlocal calls
+                real_replace(source, target)
+                calls += 1
+                if calls == 1 and Path(target).name == "first.bin":
+                    raise KeyboardInterrupt()
+
+            with mock.patch.object(
+                novel_project.os,
+                "replace",
+                side_effect=replace_then_interrupt,
+            ):
+                with self.assertRaises(novel_continuity.ContinuityError):
+                    novel_continuity.transactional_write(
+                        [(first, b"new-a"), (second, b"new-b")]
+                    )
+            self.assertEqual(first.read_bytes(), b"\xffold-a")
+            self.assertEqual(second.read_bytes(), b"\xfeold-b")
+        finally:
+            temp_dir.cleanup()
 
     def test_revision_impact_propagates_and_invalidation_blocks_until_rebaseline(self) -> None:
         root = self.init_project("revision-impact")
@@ -600,6 +830,8 @@ class ContinuityGateTests(unittest.TestCase):
                 change_type="local_fact",
                 reason="unit test old chapter correction",
                 authorization_reference="unit test author approved local revision",
+                workspace=str(self.workspace),
+                work_id=self.work_contexts[root.resolve()],
             )
         )
         self.assertTrue(invalidated["delivery_blocked"])
@@ -609,7 +841,11 @@ class ContinuityGateTests(unittest.TestCase):
         with self.assertRaises(novel_continuity.ContinuityError):
             novel_continuity.ensure_delivery_allowed(root)
 
-        seal_full_baseline(root)
+        seal_full_baseline(
+            root,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
         recovered = novel_continuity.continuity_status(root)
         self.assertEqual(recovered["status"], "current")
         self.assertEqual(recovered["open_invalidations"], 0)
@@ -635,7 +871,12 @@ class ContinuityGateTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(novel_continuity.ContinuityError, "escapes staging"):
             novel_continuity.prepare_audit(
-                SimpleNamespace(root=str(path_root), package=str(package))
+                SimpleNamespace(
+                    root=str(path_root),
+                    package=str(package),
+                    workspace=str(self.workspace),
+                    work_id=self.work_contexts[path_root.resolve()],
+                )
             )
 
 

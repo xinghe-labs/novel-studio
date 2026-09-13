@@ -108,14 +108,18 @@ B. 记忆争夺
 
 1. 新短故事先复核参考候选为 `approved`、深度分析基于获批候选、原创方向已由作者选择、完整确认单没有阻断项。Agent 从最终标题选择 1-3 个英文小写语义词，使用 `project-create --work-type short_story --short-story-slug <slug>` 创建项目，再把原工作绑定到脚本实际返回的项目 ID。不要在确认之前预留空项目。
 2. 已有项目或刚绑定的新项目取得单写者租约并执行 `write-check`。新短故事把工作目录中获批的来源记录、市场扫描、参考机制、原创性计划和会话记录同步到项目合同对应路径；未获批材料继续留在工作目录。
-3. 把确认内容分别写入 `story-bible/premise.md`、`cast.md`、`world.md`、`style-guide.md` 和 `outlines/master-outline.md`。
-4. 在 `memory/decisions.md` 记录本次框架确认、适用范围、市场方向选择和同步文件。
-5. 更新 `memory/book-summary.md` 的稳定故事承诺与起始正典。
-6. 清除已经解决的“下一轮”问题，再按 [controlled-automation.md](controlled-automation.md) 使用 `framework-state` 将项目会话 frontmatter 更新为 `stage: complete`、`confirmation: confirmed`；状态命令不能替代正典同步。
-7. 更新 `novel.json` 的 `status`、POV、时态、目标篇幅和 `updated_at`；没有确认的字段保持空值或 `null`。运行项目与长期记忆验证，刷新工作基准并释放租约。
-8. 建立当前写作单位合同。长篇建立第一章合同；短故事建立全篇合同和首个场景合同。用户已经要求“开始写”时，在同一任务继续读取 [drafting.md](drafting.md)、[long-term-memory.md](long-term-memory.md) 和 [continuity.md](continuity.md)，进入对应正文流程，不再重复请求总框架确认。
+3. 按 [controlled-automation.md](controlled-automation.md) 组装项目外 `framework-sync/` 包：框架文件清除已解决的“下一轮”问题，`memory/decisions.md` 记录确认、适用范围、市场方向与同步文件，`memory/book-summary.md` 记录稳定故事承诺，`project-settings.json` 提供 POV、时态与目标篇幅。
+4. 运行 `framework-sync` 一次性写入八份 Markdown，并受控合并 `novel.json`。命令在同一事务中将会话 frontmatter 更新为 `stage: complete`、`confirmation: confirmed`，在首次确认时把项目状态推进为 `drafting`，且不会覆盖章节进度、作品类型或审核配置。不要先直接编辑这些项目文件；`framework-state` 只用于正典已经稳定后的单独状态变更，不能替代正典同步。
+5. 运行项目与长期记忆验证；命令已经刷新当前工作的状态基准，验证后释放租约。
+6. 建立当前写作单位合同。长篇建立第一章合同；短故事建立全篇合同和首个场景合同。用户已经要求“开始写”时，在同一任务继续读取 [drafting.md](drafting.md)、[long-term-memory.md](long-term-memory.md) 和 [continuity.md](continuity.md)，进入对应正文流程，不再重复请求总框架确认。
 
 新短故事项目创建成功但绑定、同步或验证失败时停止，报告项目 ID、工作 ID 和失败步骤；不生成正文，不自动删除项目，也不换一个工作上下文绕过失败。
+
+### 已有正文时的连续性处理
+
+- `novel.json` 的 `current_chapter == 0` 时，`framework-sync` 会把全部框架正典和会话状态放进同一事务，并重新封存零章 baseline；同步后仍要运行项目与长期记忆验证。
+- `current_chapter > 0` 时，先用 `novel_continuity.py impact` 对包内每个实际变化的正典路径计算影响范围；取得租约后用同一组 `--changed-path` 运行 `invalidate`，再用 `framework-sync` 同步框架包。不相关的开放失效项不能放行同步。随后在项目外生成新的 `prepare-baseline` 包，由独立审稿上下文精读受影响范围（核心规则、人物命运或无法界定范围时覆盖全部后续章节），通过后才用 `record-baseline` 封存。
+- 普通 `base-refresh` 只更新工作上下文的状态哈希，不能替代连续性 baseline、独立审核或失效登记。正典同步后不要假定旧 `continuity/head.json` 仍有效；在新基线记录完成前，续写、导出和上传保持阻断。
 
 用户只是说“先看看框架”时停在确认单，不创建正文。用户要求探索式写作时，可以在确认前写明确标记为试写、且不进入章节索引的样章；样章不能自动成为已提交第一章。
 

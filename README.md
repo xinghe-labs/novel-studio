@@ -36,6 +36,11 @@ python -X utf8 .\scripts\novel_workspace.py doctor "<workspace-root>"
    python -X utf8 .\scripts\novel_workspace.py write-check "<workspace-root>" "<work-id>"
    ```
 
+   框架确认时先按 `references/controlled-automation.md` 把框架、作者决策、
+   全书摘要和受控项目设置放在项目外的工作目录，再用
+   `novel_project.py framework-sync` 在同一租约事务中同步；不要直接改项目正典后
+   再运行 `framework-state`。
+
 3. 在隔离工作目录完成草稿、自然化、连续性和原创性审阅。暂存包可以位于项目的 `staging/`，该目录不计入正典状态哈希。
 
 4. 提交时必须显式提供同一工作区和工作身份：
@@ -70,7 +75,7 @@ python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<proj
 
 ## 版本与 schema
 
-工具版本在 `scripts/novel_cli.py` 的 `TOOL_VERSION` 中维护。当前版本是 `2.1.0`。工作区 JSON 的 `schema_version` 仍为 `1`；本版本对旧注册表采用只增不删的 SQLite 迁移，为租约补充 `lease_seconds`、`heartbeat_enforced` 和 `lease_events`。只读 `doctor` 不迁移 legacy registry，需由可写命令完成迁移后再检查；打开注册表不会改写小说正典。
+工具版本在 `scripts/novel_cli.py` 的 `TOOL_VERSION` 中维护。当前版本是 `2.2.0`。工作区 JSON 的 `schema_version` 仍为 `1`；本版本对旧注册表采用只增不删的 SQLite 迁移，为租约补充 `lease_seconds`、`heartbeat_enforced` 和 `lease_events`。只读 `doctor` 不迁移 legacy registry，需由可写命令完成迁移后再检查；打开注册表不会改写小说正典。
 
 升级前先复制工作区并运行：
 
@@ -80,6 +85,20 @@ python -X utf8 .\scripts\novel_workspace.py status "<workspace-root>"
 ```
 
 若将来出现不支持的 `schema_version`，不要手工修改 JSON；先阅读 `CHANGELOG.md` 中对应版本的迁移说明，再使用该版本提供的迁移命令。未知版本会保持硬失败。
+
+## 受控分发
+
+Skill 的发布物只包含版本控制中已经提交的受控文件。工作区运行时产生的 `.agent-handoff/`、根目录 `AGENTS.md`、`__pycache__/` 和 `.pytest_cache/` 都不是 Skill 内容；它们即使存在于本机目录，也不得复制进分发包。发布前先检查 `git status --short` 和 `git ls-files --others --exclude-standard`，确认没有把本地状态或代理指令误当成 Skill 文件。
+
+发布某个已提交版本时，从 Skill 根目录使用 Git 归档，而不是直接把整个目录压缩：
+
+```powershell
+git archive --format=zip --output="novel-studio-2.2.0.zip" HEAD
+```
+
+`git archive` 只读取提交中的受控路径，不会带入未跟踪的交接状态、缓存或本机临时文件。若要发布标签或其他已核对的提交，把 `HEAD` 替换为该提交引用，并在归档后重新列出压缩包内容做一次只读检查。
+
+每个通过验证的完成节点保存为一个本地 Git commit；会改变工具能力、契约或兼容性的节点同时更新 `TOOL_VERSION`、本文件和 `CHANGELOG.md`，并创建 `v<version>` 本地标签。远端推送、发布和归档分发仍需单独授权。
 
 ## 导出视觉检查
 

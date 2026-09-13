@@ -4,26 +4,9 @@
 
 ## 记录位置与字段
 
-先把原始截图、导出表或人工抄录放在当前工作目录，再在项目 `research/publication-feedback.jsonl` 追加一条经过核对的记录。每条记录至少包含：
+先把原始截图、导出表或人工抄录放在当前工作目录，再在项目 `research/publication-feedback.jsonl` 追加一条经过核对的记录。每行一个 JSON 对象；字段、类型、必填项和稳定枚举只在 [schemas-and-cli.md 的 `publication-feedback.jsonl` schema](schemas-and-cli.md#publication-feedbackjsonl) 中维护，本文件不重复定义字段。
 
-```json
-{
-  "schema_version": 1,
-  "observed_at": "2026-09-12T12:00:00+08:00",
-  "platform": "fanqie",
-  "work_id": "平台作品 ID",
-  "scope": {"chapters": [1, 5], "window": "发布后 7 天"},
-  "metrics": {
-    "reads": {"value": 1234, "definition": "平台原字段", "source": "截图或页面位置"},
-    "retention": {"value": 0.42, "definition": "平台原字段", "source": "截图或页面位置"}
-  },
-  "source_sha256": "原始证据文件哈希",
-  "interpretation": "仅说明观察到的变化，不推断因果",
-  "next_decision": "下一次质量审核重点检查开篇承诺和第 3-5 章转折",
-  "authorization_reference": "作者确认记录本次数据用于项目研究",
-  "status": "recorded"
-}
-```
+记录必须同时区分本地项目和平台对象：`project_id` 是本地项目标识，`platform_work_id` 只填写平台作品 ID，不能再使用含义不明确的 `work_id`。证据使用相对当前工作目录的 `evidence_path` 及其 `evidence_sha256`；不要写本机绝对路径、账号凭据、Cookie 或读者可识别个人信息。章节范围使用 `scope.chapter_from` 与 `scope.chapter_through`，不能用未说明端点含义的数组。
 
 不要保存账号凭据、Cookie、读者可识别个人信息或未授权的私有数据。平台字段含义、统计窗口和时区必须原样记录；缺定义时标为 `unknown`，不能与其他作品直接比较。
 
@@ -33,4 +16,4 @@
 2. 把“观察事实”和“可能解释”分开，至少列出一个反例或未验证因素。数据不足时不改正典。
 3. 在下一次选题/质量审核或改稿合同中引用记录 ID，提出最小可验证调整，例如改变下一章开场信息量或检查某类标题，而不是批量重写旧章。
 4. 调整后重新跑连续性、原创性、自然化和平台交付门禁；平台数据不能替代作者确认，也不能解除 `humanizer-zh` 或质量审核阻断。
-5. 记录结果是“支持/不支持/尚无结论”，避免把一次短窗口波动写成永久规则。
+5. 用 schema 规定的 `conclusion` 记录“支持/不支持/尚无结论”，避免把一次短窗口波动写成永久规则；`record_id` 是后续研究、审核或改稿合同引用的稳定 ID。

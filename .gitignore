@@ -16,3 +16,8 @@ venv/
 *.log
 .DS_Store
 Thumbs.db
+
+# Local Codex handoff state and repository-level agent instructions are not
+# part of the distributable skill. Keep them out of accidental git adds.
+/.agent-handoff/
+/AGENTS.md

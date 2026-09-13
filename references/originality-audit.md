@@ -57,11 +57,11 @@
 来源登记时只有明确标记 `originality_compare: true` 的文件会被默认读取：
 
 ```powershell
-python -X utf8 .\scripts\novel_originality.py audit "<project-root>"
-python -X utf8 .\scripts\novel_originality.py audit "<project-root>" --candidate "staging/chapters/0001/chapter.md"
+python -X utf8 .\scripts\novel_originality.py audit "<project-root>" --workspace "<workspace-root>" --work-id "<work-id>"
+python -X utf8 .\scripts\novel_originality.py audit "<project-root>" --candidate "staging/chapters/0001/chapter.md" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
-报告写入 `reviews/originality-audit-<timestamp>-<hash>.json`，记录候选和来源 SHA-256、计划哈希、两层发现及方法限制。整个命令只在本地处理；`local_only` 来源不会上传。
+报告默认先写入 `staging/originality/originality-audit-<timestamp>-<hash>.json`，记录候选和来源 SHA-256、计划哈希、两层发现及方法限制；成功执行 `commit-chapter` 时才以原始字节归档到 `reviews/`。整个命令只在本地处理；`local_only` 来源不会上传。
 
 默认措辞阈值用于发现较长且有信息量的重合：规范化后 18 字开始复核，24 字以上或高近似度会阻断。阈值不是版权结论；常用成语、类型术语、法规原文、作品名和必要引用可能误报，必须查看上下文。为了让报告通过而缩短同一句、替换同义词或拆句，仍属于未解决风险。
 

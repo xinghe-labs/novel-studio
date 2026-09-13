@@ -21,6 +21,7 @@ import novel_workspace  # noqa: E402
 import novel_continuity  # noqa: E402
 from continuity_test_utils import (  # noqa: E402
     complete_staged_continuity,
+    refresh_fixture_base,
     seal_full_baseline,
 )
 
@@ -51,7 +52,13 @@ class ShortStoryWorkflowTests(unittest.TestCase):
         )
         self.root = Path(created["project_root"])
         self.project_id = created["project_id"]
-        self.work_id: str | None = None
+        work = novel_workspace.create_work(
+            self.workspace,
+            project_id=self.project_id,
+            purpose="短故事测试",
+        )
+        self.work_id: str | None = work["work_id"]
+        novel_workspace.acquire_lock(self.workspace, self.work_id)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -93,6 +100,12 @@ class ShortStoryWorkflowTests(unittest.TestCase):
         }
         for relative, content in replacements.items():
             write_text(self.root / relative, content)
+        refresh_fixture_base(
+            self.root,
+            self.workspace,
+            self.work_id,
+            reference="测试夹具已回读并确认短故事框架字段",
+        )
         novel_project.framework_state(
             SimpleNamespace(
                 root=str(self.root),
@@ -101,6 +114,8 @@ class ShortStoryWorkflowTests(unittest.TestCase):
                 requirements_confidence=97,
                 story_confidence=97,
                 authorization_reference="测试模拟作者确认短故事完整框架",
+                workspace=str(self.workspace),
+                work_id=self.work_id,
             )
         )
 
@@ -189,6 +204,12 @@ class ShortStoryWorkflowTests(unittest.TestCase):
             json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         )
         self.prepare_originality_plan()
+        refresh_fixture_base(
+            self.root,
+            self.workspace,
+            self.work_id,
+            reference="测试夹具已回读并确认短故事原创性计划",
+        )
         report, code = novel_originality.audit_project(
             SimpleNamespace(
                 root=str(self.root),
@@ -198,6 +219,8 @@ class ShortStoryWorkflowTests(unittest.TestCase):
                 near_threshold=0.72,
                 max_findings=30,
                 no_report=False,
+                workspace=str(self.workspace),
+                work_id=self.work_id,
             )
         )
         self.assertEqual(code, 0)
@@ -223,7 +246,12 @@ class ShortStoryWorkflowTests(unittest.TestCase):
             package / "commit.json",
             json.dumps(commit, ensure_ascii=False, indent=2) + "\n",
         )
-        complete_staged_continuity(self.root, package)
+        complete_staged_continuity(
+            self.root,
+            package,
+            workspace=self.workspace,
+            work_id=self.work_id,
+        )
         return package
 
     def test_short_story_end_to_end(self) -> None:
@@ -266,7 +294,11 @@ class ShortStoryWorkflowTests(unittest.TestCase):
             novel_export.export_project(
                 SimpleNamespace(root=str(self.root), format=None, force=False)
             )
-        baseline = seal_full_baseline(self.root)
+        baseline = seal_full_baseline(
+            self.root,
+            workspace=self.workspace,
+            work_id=self.work_id,
+        )
         self.assertEqual(baseline["through_chapter"], 1)
         with self.assertRaisesRegex(novel_export.ExportError, "completion review"):
             novel_export.export_project(
@@ -311,6 +343,8 @@ class ShortStoryWorkflowTests(unittest.TestCase):
                 packet=str(packet_path),
                 report=str(report_path),
                 authorization_reference="测试完成短故事全篇审核",
+                workspace=str(self.workspace),
+                work_id=self.work_id,
             )
         )
         self.assertEqual(recorded["review_mode"], "completion")

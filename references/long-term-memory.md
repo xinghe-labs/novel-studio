@@ -49,7 +49,9 @@ python -X utf8 .\scripts\novel_memory.py search "<project-root>" "旧邮局 铜�
 ```markdown
 # 第0001章记忆卡：雾港来信
 
-- 正文：[0001-雾港来信](../../manuscript/chapters/<chapter-file>)
+- 正文路径：`manuscript/chapters/0001-雾港来信.md`
+
+> 上面的文件名是可读示例，不是仓库中必须存在的固定章节；实际记忆卡应替换为当前 `manuscript/chapters/` 中的真实文件名。
 - 状态：committed
 - POV：林某D
 - 故事时间：第一日凌晨
@@ -102,21 +104,11 @@ python -X utf8 .\scripts\novel_memory.py search "<project-root>" "旧邮局 铜�
 
 ## 写后原子提交
 
-一章的持久化顺序固定为：
-
-```text
-章节正文
-  -> 连续性检查
-  -> 章节记忆卡
-  -> 章节索引
-  -> 当前状态、时间线与线索账本
-  -> 必要时更新全书压缩记忆
-  -> 最后推进 novel.json
-```
+执行顺序和暂存包清单只以 [commit-protocol.md](commit-protocol.md) 为准，本文件不维护第二套顺序。长期记忆层的要求是：章节正文、同章记忆卡、章节索引、当前状态、必要的时间线/线索/全书摘要与 `novel.json` 必须由同一次受控事务形成一致快照，不能人工逐个写入并把中间状态当作成功。
 
 验证器发现正文没有索引条目、索引链接失效或缺少同章记忆卡时，该章视为未完整提交。修复文件之间的对应关系后才能继续下一章。
 
-正式章节使用 [controlled-automation.md](controlled-automation.md) 的暂存包和事务提交。提交成功后如果 SQLite 已存在，脚本执行增量更新；缓存更新失败时章节仍以文件为准，并明确要求运行 `rebuild`，不得把缓存失败伪装成正文提交失败或用旧缓存继续宣称一致。
+正式章节使用 [commit-protocol.md](commit-protocol.md) 的暂存包和事务提交。提交成功后如果 SQLite 已存在，脚本执行增量更新；缓存更新失败时章节仍以文件为准，并明确要求运行 `rebuild`，不得把缓存失败伪装成正文提交失败或用旧缓存继续宣称一致。
 
 ## 长篇检索原则
 
