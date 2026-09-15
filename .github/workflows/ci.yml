@@ -113,3 +113,25 @@ jobs:
               sys.exit(1)
           print("doctor:", payload["status"], "read_only:", payload["read_only"])
           PY
+
+  diagnose:
+    name: canonical scope diagnostic (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    # Temporary: instrumented run of one failing fixture test so the Windows
+    # disagreement can be read directly instead of inferred. Always
+    # non-blocking, and removed once the cause is understood.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Trace canonical scope decisions
+        run: python -X utf8 ci/diagnose_scope.py
