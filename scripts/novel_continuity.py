@@ -472,6 +472,11 @@ def canonical_snapshot(
     root: Path, overrides: dict[str, bytes] | None = None
 ) -> tuple[list[dict[str, str]], str]:
     normalized = {key.replace("\\", "/"): value for key, value in (overrides or {}).items()}
+    # Scope has to be judged between canonical forms.  Path.resolve() rewrites
+    # 8.3 short names and other non-canonical components, so comparing a
+    # resolved child against the root argument as given reports existing
+    # sources as missing whenever the two forms differ.
+    resolved_root = root.resolve()
     entries: list[dict[str, str]] = []
     for relative in canonical_relative_paths(root, normalized):
         content = normalized.get(relative)
@@ -482,7 +487,7 @@ def canonical_snapshot(
                     f"Canonical source traverses a symbolic link or reparse point: {relative}"
                 )
             path = raw_path.resolve()
-            if not is_within(path, root) or not path.is_file():
+            if not is_within(path, resolved_root) or not path.is_file():
                 raise ContinuityError(f"Canonical source is missing or out of scope: {relative}")
             content = _read_stable_bytes(raw_path, label=f"canonical source {relative}")
         entries.append({"path": relative, "sha256": sha256_bytes(content)})
@@ -621,11 +626,12 @@ def reseal_zero_baseline(
     if current_chapter(root) != 0:
         raise ContinuityError("Only an empty project can use the zero-chapter baseline")
     overrides: dict[str, bytes] = {}
+    resolved_root = root.resolve()
     for path, content in extra_writes or []:
         resolved = path.resolve()
-        if not is_within(resolved, root):
+        if not is_within(resolved, resolved_root):
             raise ContinuityError("Zero-baseline write escapes the project root")
-        overrides[resolved.relative_to(root).as_posix()] = content
+        overrides[resolved.relative_to(resolved_root).as_posix()] = content
     snapshot, canon_hash = canonical_snapshot(root, overrides)
     baseline = build_baseline_record(
         root=root,
@@ -772,7 +778,7 @@ def validate_baseline_anchor(root: Path, head: dict[str, Any]) -> list[str]:
             errors.append("continuity baseline contains an invalid sealed source")
             continue
         source = (root / entry["path"]).resolve()
-        if not is_within(source, root) or not source.is_file():
+        if not is_within(source, root.resolve()) or not source.is_file():
             errors.append(f"sealed continuity source is missing: {entry['path']}")
         elif sha256_file(source) != entry.get("sha256"):
             errors.append(f"sealed continuity source changed: {entry['path']}")
@@ -1118,7 +1124,7 @@ def evidence_text(root: Path, context: dict[str, Any], candidate: Path, relative
     if relative not in snapshot_paths:
         raise ContinuityError(f"Evidence path is not in the bound context snapshot: {relative}")
     path = (root / relative).resolve()
-    if not is_within(path, root) or not path.is_file():
+    if not is_within(path, root.resolve()) or not path.is_file():
         raise ContinuityError(f"Evidence path is missing or out of scope: {relative}")
     return path.read_text(encoding="utf-8")
 
