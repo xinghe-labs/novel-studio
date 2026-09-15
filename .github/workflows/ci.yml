@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # novel-studio blocks formal work unless it can resolve a humanizer-zh skill.
+  # CI has no installed skills, so point the resolver at the checked-in stub.
+  NOVEL_HUMANIZER_PATH: ${{ github.workspace }}/ci/humanizer-zh-stub
+  PYTHONUTF8: "1"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.13"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Confirm the stdlib-only dependency claim
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+
+          lines = pathlib.Path("requirements.txt").read_text(encoding="utf-8").splitlines()
+          installable = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+          if installable:
+              print("requirements.txt must stay free of installable dependencies, found:", installable)
+              sys.exit(1)
+          print("requirements.txt declares no installable dependencies")
+          PY
+
+      - name: Verify CLI version contract
+        run: python -X utf8 scripts/novel_workspace.py --version
+
+      - name: Run test suite
+        run: python -X utf8 -m unittest discover -s tests -t tests
+
+  doctor:
+    name: environment self-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: doctor must stay read-only and report pass
+        run: |
+          python -X utf8 scripts/novel_workspace.py doctor
+          python - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          result = subprocess.run(
+              [sys.executable, "-X", "utf8", "scripts/novel_workspace.py", "doctor"],
+              capture_output=True,
+              check=True,
+          )
+          payload = json.loads(result.stdout.decode("utf-8"))
+          if payload["status"] != "pass":
+              print("doctor reported", payload["status"])
+              sys.exit(1)
+          if not payload.get("read_only"):
+              print("doctor must not mutate state")
+              sys.exit(1)
+          print("doctor:", payload["status"], "read_only:", payload["read_only"])
+          PY

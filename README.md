@@ -1,113 +1,130 @@
 # novel-studio
 
-`novel-studio` 是一个只使用 Python 标准库的中文长篇小说与完整短故事工作流 Skill。它把草稿、研究、正典、连续性、原创性、自然化审阅和导出交付分开保存，并用项目状态哈希与单写者租约阻止并发覆盖。
+[![CI](https://github.com/xinghe-labs/novel-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/xinghe-labs/novel-studio/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](requirements.txt)
 
-## 环境
+**A zero-dependency Python workflow engine for writing long-form fiction with an AI agent — built around transactional canonical writes, single-writer leases, and content-hash quality gates.**
 
-- Python 3.10 或更高版本。
-- 不需要 `pip install`；脚本只依赖 Python 标准库。
-- `requirements.txt` 仅用于明确记录这一点，不包含第三方依赖。
-- Windows PowerShell 建议使用 `python -X utf8`。脚本本身也会把 stdout/stderr 重新配置为 UTF-8，并把参数错误和异常输出为 JSON。
-- 长篇每章和短故事全文正式提交前都必须实际调用 `humanizer-zh`。该 Skill 不可用时只能保留工作目录草稿，不能用人工声明、导出时检查或 `--force` 绕过。
+[中文说明](README.zh-CN.md)
 
-查看工具版本和运行环境：
+---
 
-```powershell
-python -X utf8 .\scripts\novel_workspace.py --version
-python -X utf8 .\scripts\novel_workspace.py doctor
-python -X utf8 .\scripts\novel_workspace.py doctor "<workspace-root>"
+## The problem
+
+Writing a 100+ chapter novel with an agent is not a "generate text" problem, it is a **state management** problem:
+
+- The story bible, continuity facts, foreshadowing state, and outline no longer fit in a single context window, so the agent must read and write durable state across sessions.
+- Drafting, review, and export run as **continuous, restartable, occasionally concurrent** processes. A naive file write silently clobbers whatever another session just committed.
+- Review results are only meaningful if they describe the *current* text. A continuity audit that was run against chapter 40 says nothing about chapter 41, yet nothing about a filename suggests it went stale.
+- A "pass" from a script is easy to overstate. An agent that reports success on contradictory output is worse than one that fails.
+
+`novel-studio` treats the manuscript as a database with a transaction log rather than a folder of files.
+
+## What it does
+
+It provides nine standard-library CLI tools that an agent host drives through a single documented JSON contract:
+
+| Tool | Responsibility |
+|---|---|
+| `novel_workspace.py` | Workspace lifecycle, leases, write checks, environment `doctor` |
+| `novel_project.py` | Project contracts, framework sync, transactional `commit-chapter` |
+| `novel_continuity.py` | Continuity baselines and gate evaluation |
+| `novel_review.py` | Periodic quality review and gate status |
+| `novel_originality.py` | Originality audit (wording overlap + structural mapping) |
+| `novel_research.py` | Source registration, rights scope, access-control boundaries |
+| `novel_memory.py` | Long-term memory retrieval and index caching |
+| `novel_export.py` | DOCX / EPUB export with structural verification |
+| `novel_cli.py` | Shared CLI contract, atomic file primitives, version source |
+
+**18,577 lines** of runtime Python, **7,246 lines** of tests, and **22 progressive-disclosure reference documents**, with no third-party runtime dependency.
+
+## Engineering highlights
+
+These are the parts worth reading if you are evaluating the code rather than the novel.
+
+**Transactional canonical writes with byte-fidelity rollback.** `commit-chapter` writes a persistent journal, verifies a compare-and-swap checksum, and rolls back on any failure. Keyboard interrupt or process exit mid-commit cannot leave an unrecoverable half-written chapter. Fault-injection tests assert byte-exact restoration.
+
+**Single-writer leases with heartbeat liveness.** Formal writes require a lease bound to a workspace and work identity. `lock-break` refuses to force a live lease and requires an explicit expected owner plus a non-empty reason; every reclaim is recorded in an append-only `lease_events` audit table along with the pre-reclaim project hash.
+
+**Content-hash gated review artifacts.** Changing text, context, or state invalidates the prior continuity, originality, and quality reports. Staleness is detected by hash, so an agent cannot revive a stale approval by editing a report's metadata field.
+
+**Fail-closed CLI contract.** Every tool emits exactly one JSON document on stdout, keeps stderr empty, and uses defined exit codes: `0` success, `1` business gate not passed, `2` usage or domain error, `3` unexpected exception or serialization failure. A blocked gate stops downstream work instead of degrading into a warning.
+
+**Windows-first portability.** The suite runs on a Chinese-locale Windows console: scripts reconfigure stdout/stderr to UTF-8 (verified under `PYTHONIOENCODING=cp936`), and path handling treats symbolic links, junctions, and reparse points as boundary conditions rather than assumptions.
+
+**Concurrency and authorization tests.** Separate suites cover workspace isolation, concurrent write attempts, lease expiry and recovery, framework sync, research safety, and export link closure.
+
+## Repository layout
+
+```
+SKILL.md          entry router — task-to-reference index and non-negotiable boundaries
+references/       22 domain documents loaded on demand (commit protocol, continuity, ...)
+scripts/          9 CLI tools, standard library only
+tests/            164 tests (unittest, no third-party test runner)
+ci/               CI-only stub for the declared humanizer-zh dependency
 ```
 
-`doctor` 完全只读。省略工作区时只检查 Python、SQLite、脚本导入、stdout 编码和 `humanizer-zh`；传入工作区后还会用只读 SQLite 连接检查目录、schema、注册表表名和必需列。`humanizer-zh` 必须能在当前 skill 根目录的相邻安装、`%USERPROFILE%\.agents\skills` 或 `%USERPROFILE%\.codex\skills` 中找到可读的 `SKILL.md`，且其 frontmatter 要声明 `name: humanizer-zh`；也可以用 `NOVEL_HUMANIZER_PATH` 指向该目录或文件。`status: blocked` 表示正式工作不应继续。
+`SKILL.md` is the agent-facing entry point; it routes to `references/` per task instead of inlining every rule, so an agent loads only the contract it needs.
 
-## 最小写入流程
+## Quickstart
 
-1. 初始化或复用工作区：
+Requires Python 3.10+. There is nothing to install.
 
-   ```powershell
-   python -X utf8 .\scripts\novel_workspace.py work-ensure "<workspace-root>" --client "generic"
-   ```
+```bash
+git clone https://github.com/xinghe-labs/novel-studio.git
+cd novel-studio
 
-2. 绑定已有项目并取得租约：
-
-   ```powershell
-   python -X utf8 .\scripts\novel_workspace.py work-bind "<workspace-root>" "<work-id>" --project-id "<project-id>"
-   python -X utf8 .\scripts\novel_workspace.py lock-acquire "<workspace-root>" "<work-id>"
-   python -X utf8 .\scripts\novel_workspace.py write-check "<workspace-root>" "<work-id>"
-   ```
-
-   框架确认时先按 `references/controlled-automation.md` 把框架、作者决策、
-   全书摘要和受控项目设置放在项目外的工作目录，再用
-   `novel_project.py framework-sync` 在同一租约事务中同步；不要直接改项目正典后
-   再运行 `framework-state`。
-
-3. 在隔离工作目录完成草稿、自然化、连续性和原创性审阅。暂存包可以位于项目的 `staging/`，该目录不计入正典状态哈希。
-
-4. 提交时必须显式提供同一工作区和工作身份：
-
-   ```powershell
-   python -X utf8 .\scripts\novel_project.py commit-chapter "<project-root>" "staging/chapters/<package>" --workspace "<workspace-root>" --work-id "<work-id>"
-   ```
-
-   提交器会在检查开始和事务写入前各验证一次租约、项目归属和基准哈希。缺少参数、租约过期、心跳失效或项目变化都会 fail closed。
-
-5. 项目验证通过后刷新基准并释放租约：
-
-   ```powershell
-   python -X utf8 .\scripts\novel_project.py validate "<project-root>"
-   python -X utf8 .\scripts\novel_workspace.py base-refresh "<workspace-root>" "<work-id>" --validation-reference "已完成项目与长期记忆复核"
-   python -X utf8 .\scripts\novel_workspace.py lock-release "<workspace-root>" "<work-id>"
-   ```
-
-长时间运行的写作任务应在租约有效期内定期续租：
-
-```powershell
-python -X utf8 .\scripts\novel_workspace.py lock-renew "<workspace-root>" "<work-id>"
+python -X utf8 scripts/novel_workspace.py --version
+python -X utf8 scripts/novel_workspace.py doctor
 ```
 
-`lock-break` 只接受明确的项目 ID、预期 owner 和非空原因，并且只能回收已过期或心跳失效的租约：
+`doctor` is strictly read-only. It checks the Python runtime, SQLite availability, module imports, stdout encoding, the resolved `humanizer-zh` dependency, and — when given a workspace — the directory layout and registry schema.
 
-```powershell
-python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<project-id>" --expected-owner "<work-id>" --reason "原进程已退出，已核对没有活动写入者"
+A minimal write cycle, from the repository root:
+
+```bash
+python -X utf8 scripts/novel_workspace.py work-ensure "<workspace-root>" --client "generic"
+python -X utf8 scripts/novel_workspace.py work-bind "<workspace-root>" "<work-id>" --project-id "<project-id>"
+python -X utf8 scripts/novel_workspace.py lock-acquire "<workspace-root>" "<work-id>"
+python -X utf8 scripts/novel_workspace.py write-check "<workspace-root>" "<work-id>"
+
+python -X utf8 scripts/novel_project.py commit-chapter "<project-root>" \
+    "staging/chapters/<package>" --workspace "<workspace-root>" --work-id "<work-id>"
+
+python -X utf8 scripts/novel_project.py validate "<project-root>"
+python -X utf8 scripts/novel_workspace.py base-refresh "<workspace-root>" "<work-id>" \
+    --validation-reference "project and long-term memory recheck complete"
+python -X utf8 scripts/novel_workspace.py lock-release "<workspace-root>" "<work-id>"
 ```
 
-每次回收都会写入注册表的 `lease_events` 审计表，包含原 owner、过期时间、原因和回收时的项目哈希。有效租约不能被强制释放。
+`commit-chapter` re-verifies the lease, project ownership, and baseline hash at the start of the check and again immediately before the transactional write. Missing arguments, an expired lease, a failed heartbeat, or a changed project all fail closed.
 
-## 版本与 schema
+## Testing
 
-工具版本在 `scripts/novel_cli.py` 的 `TOOL_VERSION` 中维护。当前版本是 `2.2.0`。工作区 JSON 的 `schema_version` 仍为 `1`；本版本对旧注册表采用只增不删的 SQLite 迁移，为租约补充 `lease_seconds`、`heartbeat_enforced` 和 `lease_events`。只读 `doctor` 不迁移 legacy registry，需由可写命令完成迁移后再检查；打开注册表不会改写小说正典。
+The suite uses only `unittest`, so it needs no test runner and no `pip install`:
 
-升级前先复制工作区并运行：
-
-```powershell
-python -X utf8 .\scripts\novel_workspace.py doctor "<workspace-root>"
-python -X utf8 .\scripts\novel_workspace.py status "<workspace-root>"
+```bash
+python -X utf8 -m unittest discover -s tests -t tests
+# Ran 164 tests in 490s
+# OK (skipped=3)
 ```
 
-若将来出现不支持的 `schema_version`，不要手工修改 JSON；先阅读 `CHANGELOG.md` 中对应版本的迁移说明，再使用该版本提供的迁移命令。未知版本会保持硬失败。
+Three tests skip when the environment cannot create directory symbolic links; they execute on Linux CI. The suite takes several minutes because the CLI contract is exercised through real subprocess invocations rather than in-process mocks.
 
-## 受控分发
+`novel-studio` declares `humanizer-zh` as a dependency and blocks formal work when it cannot resolve one. CI satisfies that contract with the checked-in stub at `ci/humanizer-zh-stub`, selected via `NOVEL_HUMANIZER_PATH`. The stub performs no rewriting and is never used for real manuscripts.
 
-Skill 的发布物只包含版本控制中已经提交的受控文件。工作区运行时产生的 `.agent-handoff/`、根目录 `AGENTS.md`、`__pycache__/` 和 `.pytest_cache/` 都不是 Skill 内容；它们即使存在于本机目录，也不得复制进分发包。发布前先检查 `git status --short` 和 `git ls-files --others --exclude-standard`，确认没有把本地状态或代理指令误当成 Skill 文件。
+CI runs on Linux (Python 3.10, 3.12, 3.13) and Windows (3.13), plus a dedicated job asserting that `doctor` reports `pass` and stays read-only.
 
-发布某个已提交版本时，从 Skill 根目录使用 Git 归档，而不是直接把整个目录压缩：
+## Design notes
 
-```powershell
-git archive --format=zip --output="novel-studio-2.2.0.zip" HEAD
-```
+The commit protocol, lease model, hash gate semantics, and the reasoning behind fail-closed defaults are documented in [DESIGN.md](DESIGN.md). Domain contracts live in [`references/`](references/) and are written in Chinese, matching the tool's primary user base.
 
-`git archive` 只读取提交中的受控路径，不会带入未跟踪的交接状态、缓存或本机临时文件。若要发布标签或其他已核对的提交，把 `HEAD` 替换为该提交引用，并在归档后重新列出压缩包内容做一次只读检查。
+## Scope and honesty
 
-每个通过验证的完成节点保存为一个本地 Git commit；会改变工具能力、契约或兼容性的节点同时更新 `TOOL_VERSION`、本文件和 `CHANGELOG.md`，并创建 `v<version>` 本地标签。远端推送、发布和归档分发仍需单独授权。
+This is a workflow and state-integrity tool, not a text generator, and not a detector-evasion tool. It does not claim to defeat AI-text detection, and its naturalness review is a local editorial check for mechanical repetition and voice consistency — not a platform-compliance guarantee. The tooling does not use pirated full texts and does not bypass access controls; research sources carry provenance, a SHA-256, a rights status, and an authorization scope.
 
-## 导出视觉检查
+## License
 
-自动校验不能代替逐页阅读。生成 DOCX 后，若系统有 LibreOffice，可在临时目录渲染为 PDF：
-
-```powershell
-soffice --headless --convert-to pdf --outdir "<temporary-output>" "<project-root>\exports\《书名》-审阅稿.docx"
-```
-
-再用可用的 PDF 阅读器或渲染工具逐页检查缺字、重叠、裁切、异常分页和页码。`soffice` 不存在或转换失败时，交付状态应记为未完成，不能把 DOCX 结构通过当成视觉通过。
-
-EPUB 的本地校验还会检查 `container.xml`、OPF manifest/spine、导航、NCX 和所有章节 XHTML 的引用闭包；有 EPUBCheck 时再运行标准校验。
+[MIT](LICENSE)
