@@ -6,3 +6,7 @@
 *.yaml text eol=lf
 *.yml text eol=lf
 .gitignore text eol=lf
+
+# continuity-eval 是评测基准/研究 harness，与 skill 同仓维护但不是运行时
+# 内容：保留在版本控制里（CI 跑它的测试），但不进 skill 分发归档。
+/continuity-eval/ export-ignore

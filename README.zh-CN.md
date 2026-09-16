@@ -90,6 +90,8 @@ python -X utf8 .\scripts\novel_workspace.py status "<workspace-root>"
 
 Skill 的发布物只包含版本控制中已经提交的受控文件。工作区运行时产生的 `.agent-handoff/`、根目录 `AGENTS.md`、`__pycache__/` 和 `.pytest_cache/` 都不是 Skill 内容；它们即使存在于本机目录，也不得复制进分发包。发布前先检查 `git status --short` 和 `git ls-files --others --exclude-standard`，确认没有把本地状态或代理指令误当成 Skill 文件。
 
+`continuity-eval/`（连续性评测基准）与 Skill 同仓维护、由 CI 测试，但它不是 Skill 运行时内容，已通过 `.gitattributes` 的 `export-ignore` 排除在归档之外：Skill 用户拿到的是引擎与门禁，评测 harness 留在源码仓库里供开发与复现研究使用。
+
 发布某个已提交版本时，从 Skill 根目录使用 Git 归档，而不是直接把整个目录压缩：
 
 ```powershell
