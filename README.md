@@ -24,53 +24,36 @@ Writing a 100+ chapter novel with an agent is not a "generate text" problem, it 
 
 ## What it does
 
-It provides nine standard-library CLI tools that an agent host drives through a single documented JSON contract:
+Nine standard-library CLI tools with a documented JSON contract:
 
-| Tool | Responsibility |
-|---|---|
-| `novel_workspace.py` | Workspace lifecycle, leases, write checks, environment `doctor` |
-| `novel_project.py` | Project contracts, framework sync, transactional `commit-chapter` |
-| `novel_continuity.py` | Continuity baselines and gate evaluation |
-| `novel_review.py` | Periodic quality review and gate status |
-| `novel_originality.py` | Originality audit (wording overlap + structural mapping) |
-| `novel_research.py` | Source registration, rights scope, access-control boundaries |
-| `novel_memory.py` | Long-term memory retrieval and index caching |
-| `novel_export.py` | DOCX / EPUB export with structural verification |
-| `novel_cli.py` | Shared CLI contract, atomic file primitives, version source |
+| Tool | Commands | Responsibility |
+|---|---|---|
+| `novel_workspace.py` | `doctor` `init` `status` `project-register` `project-create` `project-list` `work-start` `work-ensure` `work-bind` `work-resume` `work-reconcile` `work-list` `work-close` `lock-acquire` `lock-renew` `write-check` `base-refresh` `lock-release` `lock-break` | Workspace lifecycle, project registry, single-writer leases, environment `doctor` |
+| `novel_project.py` | `init` `upgrade` `validate` `status` `research-state` `framework-state` `framework-sync` `commit-chapter` | Project contract, framework sync, transactional `commit-chapter` |
+| `novel_continuity.py` | `install` `status` `prepare-context` `prepare-audit` `bind-audit` `check-package` `prepare-baseline` `record-baseline` `impact` `invalidate` | Continuity baselines and gate evaluation |
+| `novel_review.py` | `status` `prepare` `record` `configure` | Periodic quality review and gate status |
+| `novel_originality.py` | `audit` | Originality audit (wording overlap + structural mapping) |
+| `novel_research.py` | `adapters` `collect` `register` `verify` | Source registration, rights scope, access-control boundaries |
+| `novel_memory.py` | `rebuild` `update` `status` `search` | Long-term memory retrieval and index caching |
+| `novel_export.py` | `export` `status` | DOCX / EPUB export with structural verification |
+| `novel_cli.py` | — | Shared CLI contract, atomic file primitives, version source |
 
-**18,577 lines** of runtime Python, **7,246 lines** of tests, and **22 progressive-disclosure reference documents**, with no third-party runtime dependency.
+**18,583 lines** of runtime Python, **7,348 lines** of tests, and **22 progressive-disclosure reference documents**, with no third-party runtime dependency.
 
-## Engineering highlights
+## How the pieces fit
 
-These are the parts worth reading if you are evaluating the code rather than the novel.
+Six terms cover the whole system:
 
-**Transactional canonical writes with byte-fidelity rollback.** `commit-chapter` writes a persistent journal, verifies a compare-and-swap checksum, and rolls back on any failure. Keyboard interrupt or process exit mid-commit cannot leave an unrecoverable half-written chapter. Fault-injection tests assert byte-exact restoration.
+- **Workspace** — the operational root. Holds the SQLite registry, one directory per *work*, and the lease bookkeeping. One workspace can host several projects.
+- **Project** — the canonical manuscript: story bible, outline, chapters, continuity facts, long-term memory, review artifacts. This is the "database"; SQLite only holds a rebuildable retrieval cache.
+- **Work** — an isolated scratch directory (drafts, research, reports) outside the canonical tree. Every formal write is bound to a work identity.
+- **Lease** — the single-writer lock. Formal writes require a live lease bound to the workspace and work; expired leases can only be reclaimed through an audited `lock-break`.
+- **Staging** — packages assembled for commit under the project's `staging/`. Not counted in the canonical state hash, but still lease-gated.
+- **Gates** — continuity baselines, periodic quality reviews, and originality audits, each bound to a content hash. Changing text, context, or state invalidates the prior reports; a stale approval cannot be revived by editing metadata.
 
-**Single-writer leases with heartbeat liveness.** Formal writes require a lease bound to a workspace and work identity. `lock-break` refuses to force a live lease and requires an explicit expected owner plus a non-empty reason; every reclaim is recorded in an append-only `lease_events` audit table along with the pre-reclaim project hash.
+## Installation
 
-**Content-hash gated review artifacts.** Changing text, context, or state invalidates the prior continuity, originality, and quality reports. Staleness is detected by hash, so an agent cannot revive a stale approval by editing a report's metadata field.
-
-**Fail-closed CLI contract.** Every tool emits exactly one JSON document on stdout, keeps stderr empty, and uses defined exit codes: `0` success, `1` business gate not passed, `2` usage or domain error, `3` unexpected exception or serialization failure. A blocked gate stops downstream work instead of degrading into a warning.
-
-**Windows-first portability.** The suite runs on a Chinese-locale Windows console: scripts reconfigure stdout/stderr to UTF-8 (verified under `PYTHONIOENCODING=cp936`), and path handling treats symbolic links, junctions, and reparse points as boundary conditions rather than assumptions.
-
-**Concurrency and authorization tests.** Separate suites cover workspace isolation, concurrent write attempts, lease expiry and recovery, framework sync, research safety, and export link closure.
-
-## Repository layout
-
-```
-SKILL.md          entry router — task-to-reference index and non-negotiable boundaries
-references/       22 domain documents loaded on demand (commit protocol, continuity, ...)
-scripts/          9 CLI tools, standard library only
-tests/            164 tests (unittest, no third-party test runner)
-ci/               CI-only stub for the declared humanizer-zh dependency
-```
-
-`SKILL.md` is the agent-facing entry point; it routes to `references/` per task instead of inlining every rule, so an agent loads only the contract it needs.
-
-## Quickstart
-
-Requires Python 3.10+. There is nothing to install.
+Requires Python 3.10+. There is nothing to install and no `pip` step.
 
 ```bash
 git clone https://github.com/xinghe-labs/novel-studio.git
@@ -80,26 +63,107 @@ python -X utf8 scripts/novel_workspace.py --version
 python -X utf8 scripts/novel_workspace.py doctor
 ```
 
-`doctor` is strictly read-only. It checks the Python runtime, SQLite availability, module imports, stdout encoding, the resolved `humanizer-zh` dependency, and — when given a workspace — the directory layout and registry schema.
+`doctor` is strictly read-only. Without arguments it checks the Python runtime, SQLite availability, module imports, stdout encoding, and the resolved `humanizer-zh` dependency; given a workspace root it also validates the directory layout and registry schema through a read-only connection.
 
-A minimal write cycle, from the repository root:
+**The `humanizer-zh` dependency.** Formal commits (every long-form chapter, every complete short story) must actually invoke the companion `humanizer-zh` skill. It is resolved from, in order: the `NOVEL_HUMANIZER_PATH` environment variable (a directory or file), a sibling `humanizer-zh/` directory next to the skill root, `~/.agents/skills/humanizer-zh`, or `~/.codex/skills/humanizer-zh`. The target must contain a readable `SKILL.md` whose frontmatter declares `name: humanizer-zh`. When it cannot be resolved, `doctor` reports `status: blocked` and formal work must not proceed — there is no `--force` and no bypass. CI satisfies the contract with the checked-in stub at `ci/humanizer-zh-stub`, selected via `NOVEL_HUMANIZER_PATH`; the stub performs no rewriting and is never used for real manuscripts.
+
+## Usage
+
+There are two ways to use the engine. They share the same CLI and the same contracts.
+
+### As an agent skill (the intended use)
+
+`novel-studio` is designed to be operated by an AI coding agent. Install it where your agent host looks for skills — for example `~/.agents/skills/novel-studio` or `~/.codex/skills/novel-studio` — or simply point the agent at a clone of this repository. [`SKILL.md`](SKILL.md) is the agent-facing entry point: a task-to-reference router plus the non-negotiable boundaries. The agent loads only the contract it needs:
+
+| Task | Reference documents (in `references/`) |
+|---|---|
+| Interactive planning / framework confirmation | `interactive-planning`, `planning`, `controlled-automation` |
+| Market research / source registration | `market-research`, `platform-adapters`, `source-ingestion` |
+| Create or upgrade a project | `project-contract` |
+| Drafting / continuation / memory retrieval | `drafting`, `long-term-memory`, `continuity` |
+| Canonical staging & commit | `commit-protocol`, `controlled-automation`, `schemas-and-cli` |
+| Originality audit | `originality-audit` |
+| Review cycles / short-story finalization | `revision`, `periodic-review`, `short-story-mode` |
+| Batch revision | `batch-revision` |
+| Export & platform delivery | `publishing-exports`, `platform-delivery-quality` |
+| Live platform publishing | `fanqie-live-publishing` — only with explicit per-action authorization |
+| Post-publication feedback | `publication-feedback`, `market-research`, `periodic-review` |
+
+The reference documents are written in Chinese, matching the tool's primary user base. `DESIGN.md` explains the commit protocol, lease model, hash-gate semantics, and the reasoning behind fail-closed defaults for readers evaluating the code rather than writing the novel.
+
+### Directly from the shell
+
+A complete cycle for a brand-new project. Set `python -X utf8` first on Windows (the scripts also reconfigure stdout/stderr to UTF-8 themselves); on Linux/macOS plain `python3` works.
 
 ```bash
+# 0) Environment check (strictly read-only, no arguments needed)
+python -X utf8 scripts/novel_workspace.py doctor
+
+# 1) One-time setup: create a workspace, then a registered project inside it.
+#    The command prints the project id; the canonical tree is created at
+#    <workspace-root>/projects/<project-id>
+python -X utf8 scripts/novel_workspace.py init "<workspace-root>"
+python -X utf8 scripts/novel_workspace.py project-create "<workspace-root>" \
+    --title "书名" --work-type serial_novel --genre "都市脑洞"
+
+# 2) Open an isolated work context and take the single-writer lease
 python -X utf8 scripts/novel_workspace.py work-ensure "<workspace-root>" --client "generic"
 python -X utf8 scripts/novel_workspace.py work-bind "<workspace-root>" "<work-id>" --project-id "<project-id>"
 python -X utf8 scripts/novel_workspace.py lock-acquire "<workspace-root>" "<work-id>"
 python -X utf8 scripts/novel_workspace.py write-check "<workspace-root>" "<work-id>"
 
+# 3) Draft, humanize, and audit inside the work directory. When the chapter is
+#    ready, assemble a staged package under the project's
+#    staging/chapters/<package>/  — staging is outside the canonical hash, but
+#    canonical writes only ever happen through commit-chapter.
+
+# 4) Transactional canonical commit
 python -X utf8 scripts/novel_project.py commit-chapter "<project-root>" \
     "staging/chapters/<package>" --workspace "<workspace-root>" --work-id "<work-id>"
 
+# 5) Validate, refresh the baseline, release the lease
 python -X utf8 scripts/novel_project.py validate "<project-root>"
 python -X utf8 scripts/novel_workspace.py base-refresh "<workspace-root>" "<work-id>" \
     --validation-reference "project and long-term memory recheck complete"
 python -X utf8 scripts/novel_workspace.py lock-release "<workspace-root>" "<work-id>"
 ```
 
-`commit-chapter` re-verifies the lease, project ownership, and baseline hash at the start of the check and again immediately before the transactional write. Missing arguments, an expired lease, a failed heartbeat, or a changed project all fail closed.
+`commit-chapter` re-verifies the lease, project ownership, and baseline hash at the start of the check and again immediately before the transactional write. Missing arguments, an expired lease, a failed heartbeat, or a changed project all fail closed. Long-running tasks renew the lease with `lock-renew`; a dead lease is reclaimed with `lock-break`, which refuses live leases and records every reclaim in an append-only audit table.
+
+Read-only queries never need a work context or a lease:
+
+```bash
+python -X utf8 scripts/novel_workspace.py status "<workspace-root>"
+python -X utf8 scripts/novel_project.py status "<project-root>"
+python -X utf8 scripts/novel_project.py validate "<project-root>"
+python -X utf8 scripts/novel_continuity.py status "<project-root>"
+python -X utf8 scripts/novel_review.py status "<project-root>"
+```
+
+## The output contract
+
+Every tool emits exactly one JSON document on stdout, keeps stderr empty, and uses defined exit codes:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | A business gate, validation, or audit did not pass — the JSON is still a parseable business result |
+| `2` | Usage or domain error |
+| `3` | Unexpected exception or serialization failure |
+
+A blocked gate stops downstream work instead of degrading into a warning. `--help` is the only human-readable path; the machine-readable object shapes are documented in [`references/schemas-and-cli.md`](references/schemas-and-cli.md).
+
+## Repository layout
+
+```
+SKILL.md          entry router — task-to-reference index and non-negotiable boundaries
+references/       22 domain documents loaded on demand (commit protocol, continuity, ...)
+scripts/          9 CLI tools, standard library only
+tests/            engine test suite (unittest, no third-party runner)
+continuity-eval/  seeded-contradiction benchmark for the continuity layer (dev-only)
+agents/           agent-host integration metadata
+ci/               CI-only stub for the declared humanizer-zh dependency
+```
 
 ## Testing
 
@@ -107,19 +171,17 @@ The suite uses only `unittest`, so it needs no test runner and no `pip install`:
 
 ```bash
 python -X utf8 -m unittest discover -s tests -t tests
-# Ran 164 tests in 490s
+# Ran 167 tests in 343s
 # OK (skipped=3)
 ```
 
 Three tests skip when the environment cannot create directory symbolic links; they execute on Linux CI. The suite takes several minutes because the CLI contract is exercised through real subprocess invocations rather than in-process mocks.
 
-`novel-studio` declares `humanizer-zh` as a dependency and blocks formal work when it cannot resolve one. CI satisfies that contract with the checked-in stub at `ci/humanizer-zh-stub`, selected via `NOVEL_HUMANIZER_PATH`. The stub performs no rewriting and is never used for real manuscripts.
-
 CI runs on Linux (Python 3.10, 3.12, 3.13) and Windows (3.13), plus a dedicated job asserting that `doctor` reports `pass` and stays read-only.
 
-## Design notes
+## Continuity evaluation benchmark
 
-The commit protocol, lease model, hash gate semantics, and the reasoning behind fail-closed defaults are documented in [DESIGN.md](DESIGN.md). Domain contracts live in [`references/`](references/) and are written in Chinese, matching the tool's primary user base.
+[`continuity-eval/`](continuity-eval/) is a read-only, advisory measurement harness for the continuity layer: a deterministic, seeded contradiction injector, a zero-LLM contradiction detector scored against those labels, and a dev/held-out sweep protocol that picks thresholds without leaking held-out books into the choice. It never writes to a canonical project and is deliberately not wired into the commit gate. It is maintained in this repository and exercised by CI, but excluded from skill distribution archives via `.gitattributes` (`export-ignore`) — skill users get the engine and gates; the benchmark stays in the source repository for development and reproducibility research.
 
 ## Scope and honesty
 
