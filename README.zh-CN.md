@@ -19,6 +19,31 @@
 
 需要 Python 3.10 或更高版本。不需要 `pip install`，脚本只依赖标准库；`requirements.txt` 仅用于明确记录这一点。
 
+### 标准安装（推荐）
+
+skills CLI 会检测本机已装的 Agent（Claude Code、Codex、Cursor 等），并把 skill 装到各宿主读取的目录：
+
+```powershell
+npx skills add xinghe-labs/novel-studio                # 交互式选择宿主
+npx skills add xinghe-labs/novel-studio -g --copy -y   # 免交互：用户级、复制安装
+```
+
+它安装整个 skill 目录，内置的 `humanizer-zh/` 副本、`references/` 与 `scripts/` 一并到位，`doctor` 开箱即过。更新 = 重跑同一命令或 `npx skills update`。
+
+### 无 Node 回退
+
+在克隆或解压的发布物根目录：
+
+```powershell
+python install.py              # 装入第一个检测到的技能根目录（~\.agents\skills 或 ~\.codex\skills）
+python install.py --root "<其他技能根目录>"   # 显式指定目标
+python install.py --all        # 安装到所有检测到的技能根目录
+```
+
+安装器只复制受控文件（自动排除 `continuity-eval/`），校验目标目录身份后原子替换既有安装（外来目录需 `--force`），装完自动运行 `--version` 与 `doctor` 体检；`doctor` 未通过时安装器以退出码 1 结束。更新安装 = 在克隆目录 `git pull` 后重跑 `python install.py`。安装器输出人类可读文本，不属于 CLI JSON 契约。
+
+### 克隆直跑
+
 ```powershell
 git clone https://github.com/xinghe-labs/novel-studio.git
 cd novel-studio
@@ -29,16 +54,6 @@ python -X utf8 .\scripts\novel_workspace.py doctor
 
 Windows PowerShell 建议统一使用 `python -X utf8`（脚本自身也会把 stdout/stderr 重配置为 UTF-8，并把参数错误和异常输出为 JSON）。
 
-一键安装为 Agent Skill（推荐）：
-
-```powershell
-python install.py              # 装入第一个检测到的技能根目录（~\.agents\skills 或 ~\.codex\skills）
-python install.py --root "<其他技能根目录>"   # 显式指定目标
-python install.py --all        # 安装到所有检测到的技能根目录
-```
-
-安装器只复制受控文件（自动排除 `continuity-eval/`），校验目标目录身份后原子替换既有安装（外来目录需 `--force`），装完自动运行 `--version` 与 `doctor` 体检；`doctor` 未通过时安装器以退出码 1 结束。更新安装 = 在克隆目录 `git pull` 后重跑 `python install.py`。安装器输出人类可读文本，不属于 CLI JSON 契约。
-
 `doctor` 完全只读。省略工作区时检查 Python、SQLite、脚本导入、stdout 编码和 `humanizer-zh`；传入工作区后还会用只读 SQLite 连接检查目录、schema、注册表表名和必需列。
 
 **`humanizer-zh` 依赖（已内置）。** 长篇每章和短故事全文的正式提交都必须实际调用 `humanizer-zh`。仓库在 Skill 根目录内置了 `humanizer-zh/` 副本（第三方 MIT Skill，译自 blader/humanizer，版权与来源标注见该目录内的 LICENSE 与 SKILL.md frontmatter），因此一次安装即自包含。解析顺序：`NOVEL_HUMANIZER_PATH` 环境变量（可指向目录或文件）→ Skill 根目录内置副本 → 相邻安装的 `humanizer-zh/` → `%USERPROFILE%\.agents\skills\humanizer-zh` → `%USERPROFILE%\.codex\skills\humanizer-zh`。目标必须含可读的 `SKILL.md`，且 frontmatter 声明 `name: humanizer-zh`。无法解析时 `doctor` 报告 `status: blocked`，正式工作不得继续——只能保留工作目录草稿，不能用人工声明、导出时检查或 `--force` 绕过。宿主未把 humanizer-zh 注册为独立技能时，按内置副本的 SKILL.md 执行同样的自然化流程即可。CI 用仓库内 stub（`ci/humanizer-zh-stub`，经 `NOVEL_HUMANIZER_PATH` 选用）满足该契约；stub 不做任何改写，也不用于真实稿件。
@@ -47,7 +62,7 @@ python install.py --all        # 安装到所有检测到的技能根目录
 
 ### 作为 Agent Skill（推荐）
 
-本引擎设计为由 AI 编码代理驱动。在仓库根目录运行 `python install.py` 一键安装（见「安装」一节），或直接让代理指向本仓库的克隆。[`SKILL.md`](SKILL.md) 是代理入口：任务到参考文档的路由表加不可绕过的边界。代理按任务只加载所需契约，路由表见 SKILL.md 的「按任务加载参考」一节；提交协议、租约模型、哈希门禁语义与 fail-closed 默认值的推理见 [DESIGN.md](DESIGN.md)。
+本引擎设计为由 AI 编码代理驱动。用 `npx skills add xinghe-labs/novel-studio` 一键安装（见「安装」一节），或直接让代理指向本仓库的克隆。[`SKILL.md`](SKILL.md) 是代理入口：任务到参考文档的路由表加不可绕过的边界。代理按任务只加载所需契约，路由表见 SKILL.md 的「按任务加载参考」一节；提交协议、租约模型、哈希门禁语义与 fail-closed 默认值的推理见 [DESIGN.md](DESIGN.md)。
 
 ### 直接驱动 CLI
 

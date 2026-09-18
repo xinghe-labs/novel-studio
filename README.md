@@ -55,6 +55,31 @@ Six terms cover the whole system:
 
 Requires Python 3.10+. There is nothing to install and no `pip` step.
 
+### Standard install (recommended)
+
+The skills CLI detects the agents installed on the machine (Claude Code, Codex, Cursor, ...) and installs the skill where each one looks for it:
+
+```bash
+npx skills add xinghe-labs/novel-studio                 # interactive: pick agents
+npx skills add xinghe-labs/novel-studio -g --copy -y    # non-interactive: user-level, copy
+```
+
+It installs the whole skill directory, so the bundled `humanizer-zh/` copy, `references/`, and `scripts/` all come along — `doctor` passes out of the box. To update, re-run the same command or `npx skills update`.
+
+### No-Node fallback
+
+From a clone or an extracted release archive:
+
+```bash
+python install.py              # installs into the first detected skill root (~/.agents/skills or ~/.codex/skills)
+python install.py --root "<other-skill-root>"   # explicit target
+python install.py --all        # every detected skill root
+```
+
+The installer copies only controlled files (export-ignoring `continuity-eval/`), verifies the target directory's identity before atomically replacing an existing install (`--force` for a foreign directory), and finishes by running `--version` and `doctor` on the installed copy; a blocked `doctor` exits the installer with code 1. To update an install, `git pull` in the clone and re-run `python install.py`. The installer prints plain text — it is not part of the JSON CLI contract.
+
+### Run from a clone
+
 ```bash
 git clone https://github.com/xinghe-labs/novel-studio.git
 cd novel-studio
@@ -65,16 +90,6 @@ python -X utf8 scripts/novel_workspace.py doctor
 
 `doctor` is strictly read-only. Without arguments it checks the Python runtime, SQLite availability, module imports, stdout encoding, and the resolved `humanizer-zh` dependency; given a workspace root it also validates the directory layout and registry schema through a read-only connection.
 
-To install it as an agent skill, run the bundled installer:
-
-```bash
-python install.py              # installs into the first detected skill root (~/.agents/skills or ~/.codex/skills)
-python install.py --root "<other-skill-root>"   # explicit target
-python install.py --all        # every detected skill root
-```
-
-The installer copies only controlled files (export-ignoring `continuity-eval/`), verifies the target directory's identity before atomically replacing an existing install (`--force` for a foreign directory), and finishes by running `--version` and `doctor` on the installed copy; a blocked `doctor` exits the installer with code 1. To update an install, `git pull` in the clone and re-run `python install.py`. The installer prints plain text — it is not part of the JSON CLI contract.
-
 **The `humanizer-zh` dependency (bundled).** Formal commits (every long-form chapter, every complete short story) must actually invoke the `humanizer-zh` skill. The repository vendors a `humanizer-zh/` copy inside the skill root — a third-party MIT skill (a Chinese translation of blader/humanizer; copyright and provenance live in that directory's `LICENSE` and `SKILL.md` frontmatter) — so a single install is self-contained. Resolution order: the `NOVEL_HUMANIZER_PATH` environment variable (a directory or file), the bundled copy, a sibling `humanizer-zh/` directory next to the skill root, `~/.agents/skills/humanizer-zh`, or `~/.codex/skills/humanizer-zh`. The target must contain a readable `SKILL.md` whose frontmatter declares `name: humanizer-zh`. When nothing resolves, `doctor` reports `status: blocked` and formal work must not proceed — there is no `--force` and no bypass. If the host has not registered a separate humanizer skill, the agent follows the bundled copy's `SKILL.md` to run the same naturalization pass. CI satisfies the contract with the checked-in stub at `ci/humanizer-zh-stub`, selected via `NOVEL_HUMANIZER_PATH`; the stub performs no rewriting and is never used for real manuscripts.
 
 ## Usage
@@ -83,7 +98,7 @@ There are two ways to use the engine. They share the same CLI and the same contr
 
 ### As an agent skill (the intended use)
 
-`novel-studio` is designed to be operated by an AI coding agent. Install it with `python install.py` (see Installation), or simply point the agent at a clone of this repository. [`SKILL.md`](SKILL.md) is the agent-facing entry point: a task-to-reference router plus the non-negotiable boundaries. The agent loads only the contract it needs:
+`novel-studio` is designed to be operated by an AI coding agent. Install it with `npx skills add xinghe-labs/novel-studio` (see Installation), or simply point the agent at a clone of this repository. [`SKILL.md`](SKILL.md) is the agent-facing entry point: a task-to-reference router plus the non-negotiable boundaries. The agent loads only the contract it needs:
 
 | Task | Reference documents (in `references/`) |
 |---|---|
