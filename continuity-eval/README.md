@@ -28,6 +28,10 @@ These are not style preferences; violating one invalidates the measurement.
    property that makes the gate trustworthy.
 3. **Inputs are pinned.** Every run records the corpus snapshot hash it ran
    against. An evaluation whose inputs are not pinned is not an evaluation.
+   The real-corpus manifest itself is kept out of version control (its local
+   paths and chapter filenames would disclose unpublished work); the published
+   pin is the corpus digest, recorded in
+   [`snapshots/README.md`](snapshots/README.md).
 4. **Zero third-party dependencies**, like the rest of the repository. Charts are
    rendered as SVG by hand rather than pulling in a plotting library.
 5. **Ground truth is labelled twice.** Injections are machine-labelled. Real

@@ -21,3 +21,6 @@ Thumbs.db
 # part of the distributable skill. Keep them out of accidental git adds.
 /.agent-handoff/
 /AGENTS.md
+
+# The real-corpus snapshot manifest stays local (see continuity-eval/snapshots/README.md).
+continuity-eval/snapshots/corpus-snapshot.json
