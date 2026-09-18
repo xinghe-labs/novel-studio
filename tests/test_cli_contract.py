@@ -441,6 +441,43 @@ class LeaseAndDoctorTests(unittest.TestCase):
             else:
                 os.environ["NOVEL_HUMANIZER_PATH"] = old_value
 
+    def test_humanizer_resolution_prefers_bundled_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            scripts_root = base / "novel-studio" / "scripts"
+            scripts_root.mkdir(parents=True)
+            bundled = base / "novel-studio" / "humanizer-zh"
+            bundled.mkdir()
+            (bundled / "SKILL.md").write_text(
+                "---\nname: humanizer-zh\n---\n内置副本。", encoding="utf-8"
+            )
+            stale_sibling = base / "humanizer-zh"
+            stale_sibling.mkdir()
+            (stale_sibling / "SKILL.md").write_text(
+                "没有 frontmatter 的旧副本。", encoding="utf-8"
+            )
+
+            old_value = os.environ.get("NOVEL_HUMANIZER_PATH")
+            os.environ.pop("NOVEL_HUMANIZER_PATH", None)
+            try:
+                candidates = novel_workspace._humanizer_candidates(scripts_root)
+                self.assertEqual(candidates[0], bundled)
+                self.assertEqual(candidates[1], stale_sibling)
+                _, valid, detail = novel_workspace._check_humanizer_candidate(
+                    candidates[0]
+                )
+                self.assertTrue(valid, detail)
+                resolved_file, resolved_valid, _ = (
+                    novel_workspace.resolve_humanizer_skill(scripts_root)
+                )
+                self.assertTrue(resolved_valid)
+                self.assertEqual(resolved_file, bundled / "SKILL.md")
+            finally:
+                if old_value is None:
+                    os.environ.pop("NOVEL_HUMANIZER_PATH", None)
+                else:
+                    os.environ["NOVEL_HUMANIZER_PATH"] = old_value
+
     def test_unknown_registry_schema_fails_closed_without_overwrite(self) -> None:
         connection = sqlite3.connect(self.workspace / "registry.sqlite3")
         try:

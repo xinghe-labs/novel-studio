@@ -2558,11 +2558,15 @@ def _humanizer_candidates(scripts_root: Path) -> list[Path]:
             configured_path = configured_path.absolute()
         return [configured_path]
 
-    candidates = [scripts_root.parent.parent / "humanizer-zh"]
-    # Skills can be installed under either supported user skill root.  The
-    # local sibling comes first, then the alternate root for cross-install
-    # portability (for example novel-studio in .codex and humanizer-zh in
-    # .agents).
+    # The vendored copy inside the skill root wins first so a self-contained
+    # install resolves without any separate skill registration.  The local
+    # sibling covers users who track the two skills independently, and the
+    # alternate user skill root covers cross-install portability (for example
+    # novel-studio in .codex and humanizer-zh in .agents).
+    candidates = [
+        scripts_root.parent / "humanizer-zh",
+        scripts_root.parent.parent / "humanizer-zh",
+    ]
     home = Path.home()
     candidates.extend(
         [

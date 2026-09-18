@@ -29,15 +29,25 @@ python -X utf8 .\scripts\novel_workspace.py doctor
 
 Windows PowerShell 建议统一使用 `python -X utf8`（脚本自身也会把 stdout/stderr 重配置为 UTF-8，并把参数错误和异常输出为 JSON）。
 
+一键安装为 Agent Skill（推荐）：
+
+```powershell
+python install.py              # 装入第一个检测到的技能根目录（~\.agents\skills 或 ~\.codex\skills）
+python install.py --root "<其他技能根目录>"   # 显式指定目标
+python install.py --all        # 安装到所有检测到的技能根目录
+```
+
+安装器只复制受控文件（自动排除 `continuity-eval/`），校验目标目录身份后原子替换既有安装（外来目录需 `--force`），装完自动运行 `--version` 与 `doctor` 体检；`doctor` 未通过时安装器以退出码 1 结束。更新安装 = 在克隆目录 `git pull` 后重跑 `python install.py`。安装器输出人类可读文本，不属于 CLI JSON 契约。
+
 `doctor` 完全只读。省略工作区时检查 Python、SQLite、脚本导入、stdout 编码和 `humanizer-zh`；传入工作区后还会用只读 SQLite 连接检查目录、schema、注册表表名和必需列。
 
-**`humanizer-zh` 依赖。** 长篇每章和短故事全文的正式提交都必须实际调用配套的 `humanizer-zh` Skill。查找顺序：`NOVEL_HUMANIZER_PATH` 环境变量（可指向目录或文件）、Skill 根目录相邻的 `humanizer-zh/`、`%USERPROFILE%\.agents\skills\humanizer-zh`、`%USERPROFILE%\.codex\skills\humanizer-zh`。目标必须含可读的 `SKILL.md`，且 frontmatter 声明 `name: humanizer-zh`。无法解析时 `doctor` 报告 `status: blocked`，正式工作不得继续——只能保留工作目录草稿，不能用人工声明、导出时检查或 `--force` 绕过。CI 用仓库内 stub（`ci/humanizer-zh-stub`，经 `NOVEL_HUMANIZER_PATH` 选用）满足该契约；stub 不做任何改写，也不用于真实稿件。
+**`humanizer-zh` 依赖（已内置）。** 长篇每章和短故事全文的正式提交都必须实际调用 `humanizer-zh`。仓库在 Skill 根目录内置了 `humanizer-zh/` 副本（第三方 MIT Skill，译自 blader/humanizer，版权与来源标注见该目录内的 LICENSE 与 SKILL.md frontmatter），因此一次安装即自包含。解析顺序：`NOVEL_HUMANIZER_PATH` 环境变量（可指向目录或文件）→ Skill 根目录内置副本 → 相邻安装的 `humanizer-zh/` → `%USERPROFILE%\.agents\skills\humanizer-zh` → `%USERPROFILE%\.codex\skills\humanizer-zh`。目标必须含可读的 `SKILL.md`，且 frontmatter 声明 `name: humanizer-zh`。无法解析时 `doctor` 报告 `status: blocked`，正式工作不得继续——只能保留工作目录草稿，不能用人工声明、导出时检查或 `--force` 绕过。宿主未把 humanizer-zh 注册为独立技能时，按内置副本的 SKILL.md 执行同样的自然化流程即可。CI 用仓库内 stub（`ci/humanizer-zh-stub`，经 `NOVEL_HUMANIZER_PATH` 选用）满足该契约；stub 不做任何改写，也不用于真实稿件。
 
 ## 两种使用方式
 
 ### 作为 Agent Skill（推荐）
 
-本引擎设计为由 AI 编码代理驱动。把它安装到代理宿主的技能目录（如 `%USERPROFILE%\.agents\skills\novel-studio` 或 `%USERPROFILE%\.codex\skills\novel-studio`），或直接让代理指向本仓库的克隆。[`SKILL.md`](SKILL.md) 是代理入口：任务到参考文档的路由表加不可绕过的边界。代理按任务只加载所需契约，路由表见 SKILL.md 的「按任务加载参考」一节；提交协议、租约模型、哈希门禁语义与 fail-closed 默认值的推理见 [DESIGN.md](DESIGN.md)。
+本引擎设计为由 AI 编码代理驱动。在仓库根目录运行 `python install.py` 一键安装（见「安装」一节），或直接让代理指向本仓库的克隆。[`SKILL.md`](SKILL.md) 是代理入口：任务到参考文档的路由表加不可绕过的边界。代理按任务只加载所需契约，路由表见 SKILL.md 的「按任务加载参考」一节；提交协议、租约模型、哈希门禁语义与 fail-closed 默认值的推理见 [DESIGN.md](DESIGN.md)。
 
 ### 直接驱动 CLI
 
@@ -141,7 +151,7 @@ python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<proj
 
 ## 版本与 schema
 
-工具版本在 `scripts/novel_cli.py` 的 `TOOL_VERSION` 中维护。当前版本是 `2.2.0`。工作区 JSON 的 `schema_version` 仍为 `1`；本版本对旧注册表采用只增不删的 SQLite 迁移，为租约补充 `lease_seconds`、`heartbeat_enforced` 和 `lease_events`。只读 `doctor` 不迁移 legacy registry，需由可写命令完成迁移后再检查；打开注册表不会改写小说正典。
+工具版本在 `scripts/novel_cli.py` 的 `TOOL_VERSION` 中维护。当前版本是 `2.3.0`。工作区 JSON 的 `schema_version` 仍为 `1`；本版本对旧注册表采用只增不删的 SQLite 迁移，为租约补充 `lease_seconds`、`heartbeat_enforced` 和 `lease_events`。只读 `doctor` 不迁移 legacy registry，需由可写命令完成迁移后再检查；打开注册表不会改写小说正典。
 
 升级前先复制工作区并运行：
 
@@ -156,12 +166,12 @@ python -X utf8 .\scripts\novel_workspace.py status "<workspace-root>"
 
 Skill 的发布物只包含版本控制中已经提交的受控文件。工作区运行时产生的 `.agent-handoff/`、根目录 `AGENTS.md`、`__pycache__/` 和 `.pytest_cache/` 都不是 Skill 内容；它们即使存在于本机目录，也不得复制进分发包。发布前先检查 `git status --short` 和 `git ls-files --others --exclude-standard`，确认没有把本地状态或代理指令误当成 Skill 文件。
 
-`continuity-eval/`（连续性评测基准）与 Skill 同仓维护、由 CI 测试，但它不是 Skill 运行时内容，已通过 `.gitattributes` 的 `export-ignore` 排除在归档之外：Skill 用户拿到的是引擎与门禁，评测 harness 留在源码仓库里供开发与复现研究使用。该基准包含确定性种子矛盾注入器、零 LLM 矛盾检测器和 dev/held-out 阈值选择协议；只读、只做建议性度量，不写入任何正典项目，也不接入提交门禁。
+`continuity-eval/`（连续性评测基准）与 Skill 同仓维护、由 CI 测试，但它不是 Skill 运行时内容，已通过 `.gitattributes` 的 `export-ignore` 排除在归档之外：Skill 用户拿到的是引擎与门禁，评测 harness 留在源码仓库里供开发与复现研究使用。该基准包含确定性种子矛盾注入器、零 LLM 矛盾检测器和 dev/held-out 阈值选择协议；只读、只做建议性度量，不写入任何正典项目，也不接入提交门禁。内置的 `humanizer-zh/` 则相反：它是 Skill 运行时内容，随同一归档分发，且保持第三方归属与独立 LICENSE 不变。
 
 发布某个已提交版本时，从 Skill 根目录使用 Git 归档，而不是直接把整个目录压缩：
 
 ```powershell
-git archive --format=zip --output="novel-studio-2.2.0.zip" HEAD
+git archive --format=zip --output="novel-studio-2.3.0.zip" HEAD
 ```
 
 `git archive` 只读取提交中的受控路径，不会带入未跟踪的交接状态、缓存或本机临时文件。若要发布标签或其他已核对的提交，把 `HEAD` 替换为该提交引用，并在归档后重新列出压缩包内容做一次只读检查。

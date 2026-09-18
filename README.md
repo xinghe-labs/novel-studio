@@ -24,7 +24,7 @@ Writing a 100+ chapter novel with an agent is not a "generate text" problem, it 
 
 ## What it does
 
-Nine standard-library CLI tools with a documented JSON contract:
+Nine standard-library CLI tools with a documented JSON contract (plus `install.py`, a plain-text installer that is not part of the contract):
 
 | Tool | Commands | Responsibility |
 |---|---|---|
@@ -65,7 +65,17 @@ python -X utf8 scripts/novel_workspace.py doctor
 
 `doctor` is strictly read-only. Without arguments it checks the Python runtime, SQLite availability, module imports, stdout encoding, and the resolved `humanizer-zh` dependency; given a workspace root it also validates the directory layout and registry schema through a read-only connection.
 
-**The `humanizer-zh` dependency.** Formal commits (every long-form chapter, every complete short story) must actually invoke the companion `humanizer-zh` skill. It is resolved from, in order: the `NOVEL_HUMANIZER_PATH` environment variable (a directory or file), a sibling `humanizer-zh/` directory next to the skill root, `~/.agents/skills/humanizer-zh`, or `~/.codex/skills/humanizer-zh`. The target must contain a readable `SKILL.md` whose frontmatter declares `name: humanizer-zh`. When it cannot be resolved, `doctor` reports `status: blocked` and formal work must not proceed — there is no `--force` and no bypass. CI satisfies the contract with the checked-in stub at `ci/humanizer-zh-stub`, selected via `NOVEL_HUMANIZER_PATH`; the stub performs no rewriting and is never used for real manuscripts.
+To install it as an agent skill, run the bundled installer:
+
+```bash
+python install.py              # installs into the first detected skill root (~/.agents/skills or ~/.codex/skills)
+python install.py --root "<other-skill-root>"   # explicit target
+python install.py --all        # every detected skill root
+```
+
+The installer copies only controlled files (export-ignoring `continuity-eval/`), verifies the target directory's identity before atomically replacing an existing install (`--force` for a foreign directory), and finishes by running `--version` and `doctor` on the installed copy; a blocked `doctor` exits the installer with code 1. To update an install, `git pull` in the clone and re-run `python install.py`. The installer prints plain text — it is not part of the JSON CLI contract.
+
+**The `humanizer-zh` dependency (bundled).** Formal commits (every long-form chapter, every complete short story) must actually invoke the `humanizer-zh` skill. The repository vendors a `humanizer-zh/` copy inside the skill root — a third-party MIT skill (a Chinese translation of blader/humanizer; copyright and provenance live in that directory's `LICENSE` and `SKILL.md` frontmatter) — so a single install is self-contained. Resolution order: the `NOVEL_HUMANIZER_PATH` environment variable (a directory or file), the bundled copy, a sibling `humanizer-zh/` directory next to the skill root, `~/.agents/skills/humanizer-zh`, or `~/.codex/skills/humanizer-zh`. The target must contain a readable `SKILL.md` whose frontmatter declares `name: humanizer-zh`. When nothing resolves, `doctor` reports `status: blocked` and formal work must not proceed — there is no `--force` and no bypass. If the host has not registered a separate humanizer skill, the agent follows the bundled copy's `SKILL.md` to run the same naturalization pass. CI satisfies the contract with the checked-in stub at `ci/humanizer-zh-stub`, selected via `NOVEL_HUMANIZER_PATH`; the stub performs no rewriting and is never used for real manuscripts.
 
 ## Usage
 
@@ -73,7 +83,7 @@ There are two ways to use the engine. They share the same CLI and the same contr
 
 ### As an agent skill (the intended use)
 
-`novel-studio` is designed to be operated by an AI coding agent. Install it where your agent host looks for skills — for example `~/.agents/skills/novel-studio` or `~/.codex/skills/novel-studio` — or simply point the agent at a clone of this repository. [`SKILL.md`](SKILL.md) is the agent-facing entry point: a task-to-reference router plus the non-negotiable boundaries. The agent loads only the contract it needs:
+`novel-studio` is designed to be operated by an AI coding agent. Install it with `python install.py` (see Installation), or simply point the agent at a clone of this repository. [`SKILL.md`](SKILL.md) is the agent-facing entry point: a task-to-reference router plus the non-negotiable boundaries. The agent loads only the contract it needs:
 
 | Task | Reference documents (in `references/`) |
 |---|---|
@@ -159,6 +169,8 @@ A blocked gate stops downstream work instead of degrading into a warning. `--hel
 SKILL.md          entry router — task-to-reference index and non-negotiable boundaries
 references/       22 domain documents loaded on demand (commit protocol, continuity, ...)
 scripts/          9 CLI tools, standard library only
+install.py        one-command installer into agent-host skill roots
+humanizer-zh/     bundled naturalization skill — third-party MIT, see its LICENSE
 tests/            engine test suite (unittest, no third-party runner)
 continuity-eval/  seeded-contradiction benchmark for the continuity layer (dev-only)
 agents/           agent-host integration metadata
@@ -171,7 +183,7 @@ The suite uses only `unittest`, so it needs no test runner and no `pip install`:
 
 ```bash
 python -X utf8 -m unittest discover -s tests -t tests
-# Ran 167 tests in 343s
+# Ran 168 tests in 569s
 # OK (skipped=3)
 ```
 

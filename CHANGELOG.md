@@ -2,8 +2,10 @@
 
 本文件记录会影响工作流契约、数据格式或交付判断的变更。
 
-## Unreleased
+## 2.3.0 - 2026-09-18
 
+- 内置 `humanizer-zh/` 副本：解析顺序改为 `NOVEL_HUMANIZER_PATH` → Skill 根目录内置副本 → 相邻安装 → `.agents` → `.codex`。内置副本是第三方 MIT Skill（译自 blader/humanizer，版权与来源标注见其目录内 `LICENSE` 与 SKILL.md frontmatter），属于运行时内容、随受控分发归档交付；正式提交仍要求实际调用，人工声明与 `--force` 依旧不可绕过。
+- 新增根目录 `install.py` 一键安装器：只复制受控文件（`git ls-files`，缺 git 时按同规则目录遍历），应用 `.gitattributes` 的 `export-ignore`（当前排除 `continuity-eval/`），校验目标目录身份后原子替换既有安装（外来目录需 `--force`），装完以子进程运行 `--version` 与 `doctor` 并报告；`doctor` 未通过时退出码 1。安装器输出人类可读文本，不属于 CLI JSON 契约。
 - 仓库新增 `continuity-eval/`：连续性评测基准（注入器 + 确定性检测器 + 属性通道 + 评测/扫参），CI 增加其测试步骤（42 个 unittest）。
 - 分发边界变更：`continuity-eval/` 经 `.gitattributes` `export-ignore` 排除出 `git archive` 发布物——它随仓库维护、由 CI 测试，但不是 Skill 运行时内容。引擎能力与数据格式无变化。
 

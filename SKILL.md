@@ -8,7 +8,7 @@ metadata:
 
 # 小说工作室
 
-这是入口路由，不是全部操作手册。当前工具版本为 `2.2.0`，要求 Python 3.10+，只使用标准库。模块正常加载并进入 `scripts/novel_cli.py` 的 `run_cli` 后，除 `--help` 外向 stdout 输出单个 JSON 文档；业务命令的 `status`/`decision` 随命令而异，退出码 1 表示业务门禁未通过，参数或领域错误为 2，未预期异常与序列化失败为 3。模块加载失败发生在该运行时契约之前，可能由 Python 直接输出 traceback 并返回退出码 1。`--version` 才固定返回 `status: ok`、`tool` 和 `version`。`metadata.requires` 声明本 Skill 的 `humanizer-zh` 依赖；顶层 `requires` 不属于当前技能规范允许的 frontmatter 字段。详细字段见 [schemas-and-cli.md](references/schemas-and-cli.md)。
+这是入口路由，不是全部操作手册。当前工具版本为 `2.3.0`，要求 Python 3.10+，只使用标准库。模块正常加载并进入 `scripts/novel_cli.py` 的 `run_cli` 后，除 `--help` 外向 stdout 输出单个 JSON 文档；业务命令的 `status`/`decision` 随命令而异，退出码 1 表示业务门禁未通过，参数或领域错误为 2，未预期异常与序列化失败为 3。模块加载失败发生在该运行时契约之前，可能由 Python 直接输出 traceback 并返回退出码 1。`--version` 才固定返回 `status: ok`、`tool` 和 `version`。`metadata.requires` 声明本 Skill 的 `humanizer-zh` 依赖；顶层 `requires` 不属于当前技能规范允许的 frontmatter 字段。详细字段见 [schemas-and-cli.md](references/schemas-and-cli.md)。
 
 ## 先判断是否需要写入
 
@@ -75,7 +75,7 @@ python -X utf8 .\scripts\novel_review.py status "<project-root>"
 
 ## 自然度与原创性
 
-长篇每章和短故事全文在正式提交前都必须实际调用 `$humanizer-zh`。保留 `chapter-before-humanizer.md`、最终 `chapter.md` 与哈希绑定的 `humanization-review.json`；Skill 不可用或调用未完成时只能保留草稿。依赖名和 JSON 的 `skill` 字段写 `humanizer-zh`，Agent 调用语法写 `$humanizer-zh`，两者不要混用。
+长篇每章和短故事全文在正式提交前都必须实际调用 `$humanizer-zh`。保留 `chapter-before-humanizer.md`、最终 `chapter.md` 与哈希绑定的 `humanization-review.json`；Skill 不可用或调用未完成时只能保留草稿。依赖名和 JSON 的 `skill` 字段写 `humanizer-zh`，Agent 调用语法写 `$humanizer-zh`，两者不要混用。本 Skill 根目录自带 `humanizer-zh/` 副本；宿主未把 humanizer-zh 注册为独立技能时，按该副本的 SKILL.md 执行同样的自然化流程，产物与哈希绑定要求不变。
 
 质量报告中的历史机器字段 `humanization_and_repetition` 统一解释为“叙述自然度、声音一致性与机械模式检查”，包括机械排比、解释过度、段落过于均匀、空泛总结和无意重复。它不承担平台检测目标，也不代表规避、欺骗或通过任何 AI 检测器；不得向作者或平台作此承诺。
 
