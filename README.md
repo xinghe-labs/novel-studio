@@ -186,6 +186,7 @@ references/       22 domain documents loaded on demand (commit protocol, continu
 scripts/          9 CLI tools, standard library only
 install.py        one-command installer into agent-host skill roots
 humanizer-zh/     bundled naturalization skill — third-party MIT, see its LICENSE
+pyproject.toml    machine-readable metadata (version, license); installs no packages
 tests/            engine test suite (unittest, no third-party runner)
 continuity-eval/  seeded-contradiction benchmark for the continuity layer (dev-only)
 agents/           agent-host integration metadata
