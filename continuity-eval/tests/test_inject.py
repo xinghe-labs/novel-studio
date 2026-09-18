@@ -228,7 +228,7 @@ class AttributeTests(unittest.TestCase):
 
     def test_conflicting_death_years_are_flagged(self):
         # prose says 1978, the declared fact says 2024 -- the shape of the real
-        # 张某A contradiction this channel exists to catch
+        # contradiction this channel exists to catch
         self.write_chapter("0001-a.md", "户籍记载：林某人，1894年生。林某人1978年6月过世。\n")
         findings = attributes.attribute_findings(self.source)
         deaths = [f for f in findings if f["name"] == "林某人" and f["attribute"] == "death"]
@@ -254,12 +254,12 @@ class AttributeTests(unittest.TestCase):
         # conflicts, not single claims).
         self.write_chapter(
             "0001-a.md",
-            "江某C说：\u201c李某B，1924年出生。\u201d\n\n"
-            "江某C又问：\u201c确定是李某B，1950年出生？\u201d\n")
+            "江某说：\u201c李某，1924年出生。\u201d\n\n"
+            "江某又问：\u201c确定是李某，1950年出生？\u201d\n")
         findings = attributes.attribute_findings(self.source)
         bound = {(f["name"], f["attribute"]) for f in findings}
-        self.assertIn(("李某B", "birth"), bound)
-        self.assertNotIn(("江某C", "birth"), bound)
+        self.assertIn(("李某", "birth"), bound)
+        self.assertNotIn(("江某", "birth"), bound)
 
 
 class RunEvalReportTests(unittest.TestCase):
@@ -271,7 +271,7 @@ class RunEvalReportTests(unittest.TestCase):
         self.source = self.tmp / "source"
         build_fixture(self.source)
         # plant a real name-attribute contradiction in the original corpus:
-        # prose says 1978, the declared fact says 2024 (the 张某A shape)
+        # prose says 1978, the declared fact says 2024 (the 张某 shape)
         (self.source / "manuscript" / "chapters" / "0040-生卒.md").write_text(
             "户籍记载：林某人1978年6月过世。\n", encoding="utf-8")
         with (self.source / "continuity" / "canon-facts.jsonl").open(

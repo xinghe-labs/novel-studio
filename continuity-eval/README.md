@@ -53,22 +53,26 @@ evasion claims, or generalisation to other languages/genres.
 
 ## Pipeline
 
+The commands below use placeholder paths and project ids; run them against
+your own corpus (the real identifiers and local layout are deliberately not
+published — see `snapshots/README.md`).
+
 ```powershell
 # 1. pin the corpus (records per-file hashes and a corpus digest)
 python -X utf8 corpus_snapshot.py --projects-root <projects-root> --output snapshot.json
 
 # 2. inject contradictions (seed=1 is reproducible; writes scratch copies + labels)
-python -X utf8 inject.py --project <projects-root>\project-dev-a --out <scratch-root>\injected --seed 1
+python -X utf8 inject.py --project <projects-root>\<project-a> --out <temp>\injected --seed 1
 
 # 3. verify the dataset before trusting any number run on it
-python -X utf8 verify_dataset.py --injected-root <scratch-root>\injected --output verify-report.json
+python -X utf8 verify_dataset.py --injected-root <temp>\injected --output verify-report.json
 
 # 4. score full vs baseline, by class / distance bucket / anchor, plus the second column
 #    (--snapshot refuses to run if any project's live bytes drifted from the pinned manifest)
-python -X utf8 run_eval.py --projects-root <projects-root> --injected-root <scratch-root>\injected --snapshot snapshot.json --output eval-report.json --chart eval-recall.svg
+python -X utf8 run_eval.py --projects-root <projects-root> --injected-root <temp>\injected --snapshot snapshot.json --output eval-report.json --chart eval-recall.svg
 
 # 5. sweep thresholds under the dev / held-out protocol
-python -X utf8 sweep.py --projects-root <projects-root> --injected-root <scratch-root>\injected --dev project-dev-a --held-out project-heldout-b,project-heldout-c --output sweep-report.json
+python -X utf8 sweep.py --projects-root <projects-root> --injected-root <temp>\injected --dev <project-a> --held-out <project-b>,<project-c> --output sweep-report.json
 ```
 
 `run_eval.py --no-attributes` skips the second column (below); default is to
@@ -117,9 +121,9 @@ author adjudication, never merged into injection scores.
 | full (`canon_fact,slot_match,rare_near_common`) | 0.240 | 0.298 | **0.266** |
 | baseline (`rare_near_common`) | 0.235 | 0.270 | 0.251 |
 
-Per project (full): `project-heldout-c` F1 0.514 / `project-dev-a`
-0.303 / `project-heldout-b` 0.159. The ranking tracks how dense the legal
-near-value traffic is in each book: project-heldout-b's debt ledgers increment legally
+Per project (full): held-out book C F1 0.514 / dev book A
+0.303 / book B 0.159. The ranking tracks how dense the legal
+near-value traffic is in each book: book B's debt ledgers increment legally
 (债务递增), which is exactly the pattern the frequency guard cannot
 distinguish from a contradiction.
 
@@ -157,11 +161,14 @@ Readings we consider load-bearing, not footnotes:
 
 ### Second column (real-corpus attribute channel)
 
-On the untouched corpus the channel found **2 conflicts, both in project-dev-a, both
-genuine**: `张某A[death] {<conflicting-values>}` — an earlier chapter's registry passage states one date while the
-declared canon states another — and `张某A[birth] {<conflicting-values>}`  (one value belongs to another character).
-Zero findings on the other two books. These go to the author as adjudication
-input, matching the advisory-only invariant.
+On the untouched corpus the channel found **2 conflicts, both in the same
+book, both genuine**: one person's `[death] {<conflicting-values>}` — a mid-book
+registry passage states one date while the declared canon says another — and the same person's
+`[birth] {<conflicting-values>}`. Names,
+book titles, and project ids are withheld here on purpose: the findings and
+their chapter ranges belong to unpublished work. Zero findings on the other
+two books. These go to the author as adjudication input, matching the
+advisory-only invariant.
 
 ## Limitations
 

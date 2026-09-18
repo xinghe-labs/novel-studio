@@ -18,7 +18,7 @@ What it does
 * Prose claims: for every birth/death word occurrence, the nearest date token
   within a small radius and the nearest name within a larger radius form a claim
   (name, attribute, year). Attr-centric binding (word first, then date, then
-  name) handles both "张某A1978年6月过世" and the registry form
+  name) handles both "张某1978年6月过世" and the registry form
   "死亡日期：1978年...".
 * Fact claims: a declared fact is by construction about its subject, so its
   object text is scanned with the subject bound directly -- no radius game.
@@ -63,10 +63,10 @@ DATE_RADIUS = 12     # attr word <-> date token
 FALLBACK_RADIUS = 25  # attr word <-> declared-name fallback (left side only)
 
 # Registry and dialogue phrasing put the subject directly before the date
-# ("林某人1978年6月过世", ""李某B，1924年出生""). Binding prefers that local
+# ("林某人1978年6月过世", ""李某，1924年出生""). Binding prefers that local
 # subject and only falls back to the nearest declared name -- the previous
 # lexicon-only binding attributed other people's dates to whoever was nearby
-# (the listener 江某C, the prop 账簿), which is worse than useless in a review
+# (the listener 江某, the prop 账簿), which is worse than useless in a review
 # list because it looks authoritative.
 _SKIP_TEXT = (
     "，。：；！？、·「」《》（）—…"
@@ -74,7 +74,7 @@ _SKIP_TEXT = (
     " \n\t\"'"                     # string quoting stays unambiguous
 )
 SKIP_CHARS = set(_SKIP_TEXT)
-# 左边界字：收集局部主语时在这里停止（「确定是李某B」停在「是」而不是作废）。
+# 左边界字：收集局部主语时在这里停止（「确定是李某」停在「是」而不是作废）。
 # 年月日也在内，避免把日期残片收进名字。
 SUBJECT_STOP = set("说道问想看回的是在了他她我你个和与把被将又也都不没就还这那有很年月日号")
 ROLE_SUFFIXES = ("持有人", "债务人", "账房", "老板", "警察", "医生", "律师", "老人",

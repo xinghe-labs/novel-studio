@@ -28,10 +28,11 @@ a same-chapter pair is indistinguishable from an enumeration, so the rule would
 be noise; intra-chapter contradictions are still caught by the other two rules
 when the mutated value is rare.
 
-The rarity guard is load-bearing, not decoration: in the counter-ledger book the debt *legitimately*
-progresses (3秒 -> 6秒 -> 9秒 ...), so near values coexist on every page. A rule
-that flagged any near pair would drown in true positives of the wrong kind. Both
-values being frequent means the variation is established usage, not an error.
+The rarity guard is load-bearing, not decoration: in the counter-ledger book
+the debt *legitimately* progresses (3秒 -> 6秒 -> 9秒 ...), so near values
+coexist on every page. A rule that flagged any near pair would drown in true
+positives of the wrong kind. Both values being frequent means the variation is
+established usage, not an error.
 
 Tokenisation is shared with the injector (`inject.scan_text`). That is honest
 and worth stating: the benchmark measures the *comparison* layer, not the

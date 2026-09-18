@@ -113,7 +113,7 @@ class ContinuityGateTests(unittest.TestCase):
             "status": "ready",
             "candidate": {
                 "logline": {
-                    "text": "调查员在时间债务失控前追查异常源头。",
+                    "text": "调查员在账目债务失控前追查异常源头。",
                     "influences": [],
                     "causal_transformation": "",
                 },
@@ -163,14 +163,14 @@ class ContinuityGateTests(unittest.TestCase):
         filename = f"{number:04d}-第{number}次记账.md"
         chapter_text = (
             f"# 第{number}章 第{number}次记账\n\n"
-            f"林某D在第{number}日核对第{number}笔时间债务，账面仍然守恒。\n"
+            f"林某D在第{number}日核对第{number}笔账目债务，账面仍然守恒。\n"
         )
         write_text(package / "chapter.md", chapter_text)
         write_text(
             package / "memory.md",
             f"# 第{number:04d}章记忆卡\n\n"
             f"- 正文：[{filename}](../../manuscript/chapters/{filename})\n"
-            f"- 事实：林某D核对第{number}笔时间债务。\n",
+            f"- 事实：林某D核对第{number}笔账目债务。\n",
         )
         state = read_json(root / "continuity/state.json")
         state.update(
@@ -218,7 +218,7 @@ class ContinuityGateTests(unittest.TestCase):
                 "pov": "林某D",
                 "story_time": f"第{number}日",
                 "location": "旧钟楼",
-                "fact_summary": f"林某D核对第{number}笔时间债务",
+                "fact_summary": f"林某D核对第{number}笔账目债务",
                 "key_change": "账本新增可追溯记录",
                 "thread_ids": ["T-DEBT"],
             },
@@ -419,10 +419,10 @@ class ContinuityGateTests(unittest.TestCase):
     def test_knowledge_and_outline_facts_require_candidate_bound_sources(self) -> None:
         root = self.init_project("fact-categories")
         categories = (
-            ("F-KNOW-0001", "character_knows", "林某D", "知道", "第一笔债务已核对", None, "candidate", "林某D在第1日核对第1笔时间债务，账面仍然守恒。"),
-            ("F-BELIEVE-0001", "character_believes", "林某D", "相信", "债务必须守恒", None, "candidate", "林某D在第1日核对第1笔时间债务，账面仍然守恒。"),
-            ("F-CLAIM-0001", "character_claims", "林某D", "声称", "账面没有异常", None, "candidate", "林某D在第1日核对第1笔时间债务，账面仍然守恒。"),
-            ("F-READER-0001", "reader_knows", "读者", "知道", "林某D正在核账", None, "candidate", "林某D在第1日核对第1笔时间债务，账面仍然守恒。"),
+            ("F-KNOW-0001", "character_knows", "林某D", "知道", "第一笔债务已核对", None, "candidate", "林某D在第1日核对第1笔账目债务，账面仍然守恒。"),
+            ("F-BELIEVE-0001", "character_believes", "林某D", "相信", "债务必须守恒", None, "candidate", "林某D在第1日核对第1笔账目债务，账面仍然守恒。"),
+            ("F-CLAIM-0001", "character_claims", "林某D", "声称", "账面没有异常", None, "candidate", "林某D在第1日核对第1笔账目债务，账面仍然守恒。"),
+            ("F-READER-0001", "reader_knows", "读者", "知道", "林某D正在核账", None, "candidate", "林某D在第1日核对第1笔账目债务，账面仍然守恒。"),
             ("F-PLAN-LOCKED", "author_plan", "大纲", "安排", "债务不能凭空消失", "locked", "outlines/master-outline.md", "- [locked] 债务不能凭空消失。"),
             ("F-PLAN-PLANNED", "author_plan", "大纲", "安排", "主角追查时间异常", "planned", "outlines/master-outline.md", "- [planned] 主角追查时间异常。"),
             ("F-PLAN-OPTIONAL", "author_plan", "大纲", "安排", "旧钟楼支线", "optional", "outlines/master-outline.md", "- [optional] 旧钟楼支线。"),
@@ -531,7 +531,7 @@ class ContinuityGateTests(unittest.TestCase):
             ),
             "number": (
                 "items_and_resources",
-                "时间债务余额与前章账本不一致",
+                "账目债务余额与前章账本不一致",
             ),
         }
         for name, (dimension, problem) in cases.items():
