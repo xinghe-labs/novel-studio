@@ -162,13 +162,14 @@ Readings we consider load-bearing, not footnotes:
 ### Second column (real-corpus attribute channel)
 
 On the untouched corpus the channel found **2 conflicts, both in the same
-book, both genuine**: one person's `[death] {<conflicting-values>}` — a mid-book
-registry passage states one date while the declared canon says another — and the same person's
-`[birth] {<conflicting-values>}`. Names,
-book titles, and project ids are withheld here on purpose: the findings and
-their chapter ranges belong to unpublished work. Zero findings on the other
-two books. These go to the author as adjudication input, matching the
-advisory-only invariant.
+book, both genuine**: one person's `[death]` attribute carries two
+conflicting years — a mid-book registry passage and the declared canon
+disagree, and the prose resolves the conflict in-story — and the same
+person's `[birth]` attribute carries two values, one of which belongs to
+another character. Names, book titles, project ids, and the exact values are
+withheld here on purpose: the findings and their chapter ranges belong to
+unpublished work. Zero findings on the other two books. These go to the
+author as adjudication input, matching the advisory-only invariant.
 
 ## Limitations
 
