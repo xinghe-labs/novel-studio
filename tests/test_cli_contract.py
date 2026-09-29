@@ -879,6 +879,32 @@ class LeaseAndDoctorTests(unittest.TestCase):
                 SimpleNamespace(root=str(self.project_root), package="staging/chapters/noop")
             )
 
+    def test_gate_failure_returns_exit_one_with_parseable_json(self) -> None:
+        """Pin the exit-code contract: a business gate failure exits 1 and its
+        stdout stays a parseable business result, distinct from the exit-2
+        domain-error and exit-3 unexpected-exception shapes."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "project"
+            root.mkdir()
+            (root / "novel.json").write_text("{}", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8",
+                    str(SCRIPTS / "novel_continuity.py"),
+                    "check-package",
+                    str(root),
+                    "staging/chapters/0001-title",
+                ],
+                capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 1)
+            payload = json.loads(completed.stdout.decode("utf-8"))
+            self.assertEqual(payload["status"], "blocked")
+            self.assertIn("error", payload)
+
 
 if __name__ == "__main__":
     unittest.main()
