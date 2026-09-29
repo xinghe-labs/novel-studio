@@ -166,7 +166,7 @@ python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<proj
 
 ## 版本与 schema
 
-工具版本在 `scripts/novel_cli.py` 的 `TOOL_VERSION` 中维护。当前版本是 `2.4.0`。工作区 JSON 的 `schema_version` 仍为 `1`；2.3.0 对旧注册表采用只增不删的 SQLite 迁移，为租约补充 `lease_seconds`、`heartbeat_enforced` 和 `lease_events`。2.4.0 是写作流程增强版本：`story-bible/style-guide.md` 明确为风格合同并扩充最少字段，新增可选 `story-bible/voice-anchor.md` 声音锚点，写作合同与章节记忆卡各增质量审核字段，`humanizer-zh` 增加小说专项模式；数据格式无变化。只读 `doctor` 不迁移 legacy registry，需由可写命令完成迁移后再检查；打开注册表不会改写小说正典。
+工具版本在 `scripts/novel_cli.py` 的 `TOOL_VERSION` 中维护。当前版本是 `2.5.0`。工作区 JSON 的 `schema_version` 仍为 `1`；2.3.0 对旧注册表采用只增不删的 SQLite 迁移，为租约补充 `lease_seconds`、`heartbeat_enforced` 和 `lease_events`。2.4.0 补写作流程层（风格合同、声音锚点、合同与记忆卡质量字段、humanizer 小说专项模式）；2.5.0 补写作机理内容层（期待感、爽点、对抗阶梯、信息差、中段防塌陷与对照示例）。两者均不改变命令与数据格式。只读 `doctor` 不迁移 legacy registry，需由可写命令完成迁移后再检查；打开注册表不会改写小说正典。
 
 升级前先复制工作区并运行：
 
@@ -186,7 +186,7 @@ Skill 的发布物只包含版本控制中已经提交的受控文件。工作�
 发布某个已提交版本时，从 Skill 根目录使用 Git 归档，而不是直接把整个目录压缩：
 
 ```powershell
-git archive --format=zip --output="novel-studio-2.4.0.zip" HEAD
+git archive --format=zip --output="novel-studio-2.5.0.zip" HEAD
 ```
 
 `git archive` 只读取提交中的受控路径，不会带入未跟踪的交接状态、缓存或本机临时文件。若要发布标签或其他已核对的提交，把 `HEAD` 替换为该提交引用，并在归档后重新列出压缩包内容做一次只读检查。
