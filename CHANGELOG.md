@@ -2,6 +2,12 @@
 
 本文件记录会影响工作流契约、数据格式或交付判断的变更。
 
+## 2.6.0 - 2026-09-29
+
+- SQLite 检索层引入 FTS5 trigram 全文索引（`SCHEMA_VERSION` 1→2，旧缓存判 stale，`rebuild` 一次即可）：启动时自动探测 FTS5 可用性，可用时 `chunks_fts` 随 rebuild/update 维护，短语检索用它做候选预筛并按 bm25 相关度参与排序；短于三字的查询、含英文字母的查询、any/all 模式下的不安全词组合、无 FTS5 环境或索引表不完整时，自动回退到全量扫描——`query_matches` 匹配语义、返回字段与实体检索完全不变。
+- 检索定位协议不变：`search` 仍只用于决定回读哪些原文，不替代回读；FTS 层是可重建派生缓存的一部分，不是第五层正典。
+- 测试新增：FTS 表与 chunks 计数同步（rebuild/update）、FTS 预筛与禁用回退结果等价、短词回退命中。
+
 ## 2.5.3 - 2026-09-29
 
 - 逐行脚本审核修补。SQLite 缓存锁自愈：写入者中途被杀留下的空/残缺锁文件在下次竞争时被直接回收（进入临界区前重读并匹配自身 token，保证不会出现双持有者）；Windows 探活改用 `OpenProcess`+`WaitForSingleObject`，替代在 win32 上恒为 CTRL_C_EVENT 语义的 `os.kill(pid, 0)`。

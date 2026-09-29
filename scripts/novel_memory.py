@@ -24,12 +24,13 @@ from typing import Any, Iterable
 import novel_cli
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DB_RELATIVE = Path(".novel-cache/novel-memory.sqlite3")
 CACHE_LOCK_NAME = ".novel-memory.lock"
 CACHE_LOCK_STALE_SECONDS = 3600.0
 _CACHE_LOCKS: dict[Path, threading.RLock] = {}
 _CACHE_LOCKS_GUARD = threading.Lock()
+_FTS5_CACHE: bool | None = None
 _REAL_OS_REPLACE = os.replace
 CHAPTER_NAME = re.compile(r"^(?P<number>\d{4})(?:-[^/\\]+)?\.md$", re.IGNORECASE)
 HEADING = re.compile(r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$")
@@ -286,6 +287,25 @@ def connect_database(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def fts5_available() -> bool:
+    """Probe (once) whether this SQLite build supports FTS5 trigram tables."""
+
+    global _FTS5_CACHE
+    if _FTS5_CACHE is None:
+        try:
+            probe = sqlite3.connect(":memory:")
+            try:
+                probe.execute(
+                    "CREATE VIRTUAL TABLE fts5_probe USING fts5(x, tokenize='trigram')"
+                )
+                _FTS5_CACHE = True
+            finally:
+                probe.close()
+        except sqlite3.Error:
+            _FTS5_CACHE = False
+    return _FTS5_CACHE
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -324,6 +344,17 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS entities_document_idx ON entities(document_path);
         """
     )
+    if fts5_available():
+        connection.executescript(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                text,
+                document_path UNINDEXED,
+                start_line UNINDEXED,
+                tokenize='trigram'
+            );
+            """
+        )
 
 
 def set_metadata(connection: sqlite3.Connection, key: str, value: str) -> None:
@@ -515,6 +546,14 @@ def index_document(connection: sqlite3.Connection, document: SourceDocument) -> 
             for heading, start, end, chunk_text in chunks
         ],
     )
+    if fts5_available():
+        connection.executemany(
+            "INSERT INTO chunks_fts(document_path, start_line, text) VALUES(?, ?, ?)",
+            [
+                (document.relative, start, chunk_text)
+                for heading, start, end, chunk_text in chunks
+            ],
+        )
     entities = structured_entities(document, text)
     connection.executemany(
         "INSERT INTO entities(document_path, entity_type, value, context, "
@@ -831,8 +870,16 @@ def _update_index_locked(root: Path) -> dict[str, Any]:
         deleted = sorted(set(indexed) - set(current))
         with connection:
             for relative in deleted:
+                if fts5_available():
+                    connection.execute(
+                        "DELETE FROM chunks_fts WHERE document_path = ?", (relative,)
+                    )
                 connection.execute("DELETE FROM documents WHERE path = ?", (relative,))
             for relative in changed:
+                if fts5_available():
+                    connection.execute(
+                        "DELETE FROM chunks_fts WHERE document_path = ?", (relative,)
+                    )
                 connection.execute("DELETE FROM documents WHERE path = ?", (relative,))
                 index_document(connection, current[relative])
             latest_documents = scan_documents(root)
@@ -886,6 +933,50 @@ def excerpt(text: str, position: int, width: int = 240) -> str:
     return value
 
 
+def _fts_safe_term(term: str) -> bool:
+    """Trigram needs >=3 characters and cannot case-fold ASCII letters."""
+
+    return len(term) >= 3 and not re.search(r"[A-Za-z]", term)
+
+
+def _fts_document_candidates(
+    connection: sqlite3.Connection, terms: list[str], mode: str
+) -> dict[tuple[str, int], float] | None:
+    """Candidate (document_path, start_line) -> bm25 rank, or None to scan all.
+
+    The prefilter is only used when it is a guaranteed superset of the legacy
+    ``query_matches`` semantics: trigram FTS needs terms of >=3 characters and
+    is case-sensitive for ASCII, so short or lettered terms force a full scan.
+    A chunk table/FTS table count mismatch (index built without FTS5) also
+    falls back to the full scan.
+    """
+
+    if not fts5_available():
+        return None
+    safe = [term for term in terms if _fts_safe_term(term)]
+    if not safe:
+        return None
+    if mode != "all" and len(safe) != len(terms):
+        return None
+    match_query = " OR ".join('"' + term.replace('"', '""') + '"' for term in safe)
+    try:
+        chunk_count = connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        fts_count = connection.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+        if chunk_count != fts_count:
+            return None
+        rows = connection.execute(
+            "SELECT document_path, start_line, bm25(chunks_fts) AS rank "
+            "FROM chunks_fts WHERE chunks_fts MATCH ?",
+            (match_query,),
+        )
+        return {
+            (str(row["document_path"]), int(row["start_line"])): float(row["rank"])
+            for row in rows
+        }
+    except sqlite3.OperationalError:
+        return None
+
+
 def search_index(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     root = resolve_project(args.root)
     status = database_status(root)
@@ -924,12 +1015,19 @@ def search_index(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         }
                     )
         else:
+            candidates = _fts_document_candidates(connection, terms, mode)
             rows = connection.execute(
                 "SELECT c.document_path, d.kind, d.chapter_number, c.heading, "
                 "c.start_line, c.end_line, c.text FROM chunks c "
                 "JOIN documents d ON d.path = c.document_path"
             )
             for row in rows:
+                candidate_key = (str(row["document_path"]), int(row["start_line"]))
+                rank = 0.0
+                if candidates is not None:
+                    if candidate_key not in candidates:
+                        continue
+                    rank = candidates[candidate_key]
                 text = str(row["text"])
                 matches, score, position = query_matches(text, terms, mode)
                 if not matches:
@@ -945,6 +1043,7 @@ def search_index(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         "line": line,
                         "excerpt": excerpt(text, position),
                         "score": score,
+                        "_rank": rank,
                     }
                 )
         results.sort(
@@ -952,9 +1051,12 @@ def search_index(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 -int(item.get("score", 0)),
                 item.get("chapter_number") is None,
                 -(item.get("chapter_number") or 0),
+                float(item.get("_rank", 0.0)),
                 str(item.get("path", "")),
             )
         )
+        for item in results:
+            item.pop("_rank", None)
         limited = results[: args.limit]
     finally:
         connection.close()

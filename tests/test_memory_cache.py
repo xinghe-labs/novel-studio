@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
@@ -144,6 +145,73 @@ class MemoryCacheTests(unittest.TestCase):
         self.assertIs(novel_memory._cache_pid_alive(os.getpid()), True)
         # A pid far beyond the platform range cannot exist on any host.
         self.assertIs(novel_memory._cache_pid_alive(999_999_999), False)
+
+    def test_fts_table_is_maintained_across_rebuild_and_update(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = build_minimal_project(Path(temp))
+            novel_memory.rebuild_index(root)
+            database = root / novel_memory.DB_RELATIVE
+            connection = __import__("sqlite3").connect(database)
+            try:
+                chunks = connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                fts = connection.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+                self.assertEqual(chunks, fts)
+            finally:
+                connection.close()
+            (root / "manuscript" / "chapters" / "0002-第二座停钟.md").write_text(
+                "# 第二座停钟\n\n人物：赵十千\n",
+                encoding="utf-8",
+            )
+            novel_memory.update_index(root)
+            connection = __import__("sqlite3").connect(database)
+            try:
+                chunks = connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                fts = connection.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+                self.assertEqual(chunks, fts)
+            finally:
+                connection.close()
+
+    def test_fts_prefilter_matches_legacy_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = build_minimal_project(Path(temp))
+            (root / "manuscript" / "chapters" / "0002-第二座停钟.md").write_text(
+                "# 第二座停钟\n\n人物：赵十千\n",
+                encoding="utf-8",
+            )
+            novel_memory.rebuild_index(root)
+            result, code = novel_memory.search_index(
+                search_args(root, "第二座停钟")
+            )
+            self.assertEqual(code, 0)
+            fts_paths = [item["path"] for item in result["results"]]
+            self.assertTrue(fts_paths)
+            with mock.patch.object(novel_memory, "_FTS5_CACHE", False):
+                fallback, fallback_code = novel_memory.search_index(
+                    search_args(root, "第二座停钟")
+                )
+            self.assertEqual(fallback_code, 0)
+            self.assertEqual(
+                [item["path"] for item in fallback["results"]], fts_paths
+            )
+
+    def test_short_phrase_falls_back_to_full_scan(self) -> None:
+        """Trigram FTS cannot match 1-2 character queries; the legacy scan must
+        still find them."""
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = build_minimal_project(Path(temp))
+            (root / "manuscript" / "chapters" / "0002-第二座停钟.md").write_text(
+                "# 第二座停钟\n\n人物：赵十千\n",
+                encoding="utf-8",
+            )
+            novel_memory.rebuild_index(root)
+            result, code = novel_memory.search_index(search_args(root, "停钟"))
+            self.assertEqual(code, 0)
+            self.assertEqual(result["matches"], 1)
+            self.assertEqual(
+                result["results"][0]["path"],
+                "manuscript/chapters/0002-第二座停钟.md",
+            )
 
 
 if __name__ == "__main__":
