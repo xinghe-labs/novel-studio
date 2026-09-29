@@ -1157,6 +1157,28 @@ def _reconcile_work_file(
     return True
 
 
+def _reconcile_after_commit(
+    connection: sqlite3.Connection,
+    work: sqlite3.Row,
+    *,
+    context: str,
+    extra: dict[str, Any] | None = None,
+) -> bool | None:
+    """Project the committed registry row into work.json with a clear failure.
+
+    The registry write has already committed, so a projection failure must not
+    read like a pre-commit rejection; it needs its own actionable message.
+    """
+
+    try:
+        return _reconcile_work_file(connection, work, extra=extra)
+    except OSError as exc:
+        raise WorkspaceError(
+            f"{context}, but the work.json projection failed: {exc}; "
+            "run work-reconcile to repair the projection"
+        ) from exc
+
+
 def register_project(
     raw_workspace: str | Path,
     raw_project_root: str | Path,
@@ -1189,20 +1211,6 @@ def register_project(
     )
     connection = open_registry(root)
     try:
-        by_id = connection.execute(
-            "SELECT * FROM projects WHERE project_id = ?", (normalized_id,)
-        ).fetchone()
-        by_path = connection.execute(
-            "SELECT * FROM projects WHERE project_root = ?", (str(project_root),)
-        ).fetchone()
-        if by_id is not None and Path(by_id["project_root"]) != project_root:
-            raise WorkspaceError(
-                f"project_id is already registered to {by_id['project_root']}"
-            )
-        if by_path is not None and by_path["project_id"] != normalized_id:
-            raise WorkspaceError(
-                f"Project path is already registered as {by_path['project_id']}"
-            )
         existing_metadata = project_root / ".novel-project.json"
         if _link_like(existing_metadata):
             raise WorkspaceError("Project metadata cannot be a link or reparse point")
@@ -1248,6 +1256,23 @@ def register_project(
         metadata_attempted = False
         try:
             connection.execute("BEGIN IMMEDIATE")
+            # Conflict checks run inside the reservation so two concurrent
+            # registrations of the same project_id cannot both pass the
+            # pre-check and silently rewrite each other's mapping.
+            by_id = connection.execute(
+                "SELECT * FROM projects WHERE project_id = ?", (normalized_id,)
+            ).fetchone()
+            by_path = connection.execute(
+                "SELECT * FROM projects WHERE project_root = ?", (str(project_root),)
+            ).fetchone()
+            if by_id is not None and Path(by_id["project_root"]) != project_root:
+                raise WorkspaceError(
+                    f"project_id is already registered to {by_id['project_root']}"
+                )
+            if by_path is not None and by_path["project_id"] != normalized_id:
+                raise WorkspaceError(
+                    f"Project path is already registered as {by_path['project_id']}"
+                )
             if metadata_changed:
                 metadata_attempted = True
                 atomic_write_bytes(existing_metadata, metadata_bytes)
@@ -1528,7 +1553,7 @@ def resume_work(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
             raise WorkspaceError("Registered work directory escapes workspaces/")
         if row["status"] != "active":
             connection.commit()
-            _reconcile_work_file(connection, row)
+            _reconcile_after_commit(connection, row, context="Work status verified")
             raise WorkspaceError(
                 f"Work {row['work_id']} is {row['status']}; start a new work context."
             )
@@ -1536,7 +1561,7 @@ def resume_work(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
         if row["project_id"] is not None:
             project_root = project_row(connection, row["project_id"])["project_root"]
         connection.commit()
-        reconciled = _reconcile_work_file(connection, row)
+        reconciled = _reconcile_after_commit(connection, row, context="Work context reused")
         return {
             "status": "reused",
             "workspace_root": str(root),
@@ -1618,7 +1643,7 @@ def bind_work(
         )
         updated_work = work_row(connection, work["work_id"])
         connection.commit()
-        _reconcile_work_file(connection, updated_work)
+        _reconcile_after_commit(connection, updated_work, context="Work bound to project")
         return {
             "status": "bound",
             "work_id": work["work_id"],
@@ -2045,7 +2070,7 @@ def write_check(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
             "lease": lease_status(owner),
         }
         connection.commit()
-        _reconcile_work_file(connection, work)
+        _reconcile_after_commit(connection, work, context="write-check passed")
         return result
     except BaseException:
         if connection.in_transaction:
@@ -2285,7 +2310,12 @@ def refresh_base(
                 validation_reference=external_validation["reference"],
             )
         connection.commit()
-        _reconcile_work_file(connection, updated_work, extra=projection_extra)
+        _reconcile_after_commit(
+            connection,
+            updated_work,
+            context="Base state refreshed",
+            extra=projection_extra,
+        )
         return {
             "status": "refreshed",
             "work_id": work["work_id"],
@@ -2449,7 +2479,7 @@ def close_work(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
         )
         updated_work = work_row(connection, work["work_id"])
         connection.commit()
-        _reconcile_work_file(connection, updated_work)
+        _reconcile_after_commit(connection, updated_work, context="Work closed")
         return {
             "status": "closed",
             "work_id": work["work_id"],

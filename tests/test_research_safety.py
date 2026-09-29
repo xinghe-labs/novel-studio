@@ -24,6 +24,41 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
+class FetchPublicJsonTests(unittest.TestCase):
+    def test_same_host_redirect_is_returned_to_the_caller(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__ = mock.MagicMock(return_value=response)
+        response.__exit__ = mock.MagicMock(return_value=False)
+        response.read.return_value = b"{}"
+        response.geturl.return_value = "https://fanqienovel.com/api/author/library?page=2"
+        with mock.patch.object(
+            novel_research.urllib.request,
+            "urlopen",
+            return_value=response,
+        ):
+            data, final_url = novel_research.fetch_public_json(
+                "https://fanqienovel.com/api/author/library", timeout=5
+            )
+        self.assertEqual(data, b"{}")
+        self.assertEqual(final_url, response.geturl.return_value)
+
+    def test_cross_host_redirect_is_refused(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__ = mock.MagicMock(return_value=response)
+        response.__exit__ = mock.MagicMock(return_value=False)
+        response.read.return_value = b"{}"
+        response.geturl.return_value = "https://evil.example.com/library"
+        with mock.patch.object(
+            novel_research.urllib.request,
+            "urlopen",
+            return_value=response,
+        ):
+            with self.assertRaisesRegex(novel_research.ResearchError, "off-host"):
+                novel_research.fetch_public_json(
+                    "https://fanqienovel.com/api/author/library", timeout=5
+                )
+
+
 def project_files(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()

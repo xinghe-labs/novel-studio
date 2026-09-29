@@ -2,6 +2,14 @@
 
 本文件记录会影响工作流契约、数据格式或交付判断的变更。
 
+## 2.6.1 - 2026-09-29
+
+- 逐行审核低级项收尾：`project-register` 的 ID/路径冲突检查移入 `BEGIN IMMEDIATE` 预约内，并发登记同一 ID 不再能静默改写指向；`invalidate` 的 invalidations/head 写入补 `expected_existing` CAS 收据，租约换手窗口内的并发失效登记不再互相覆盖。
+- `work.json` 投影失败的六处命令（work-ensure/resume、bind、write-check、base-refresh、close）给出可区分的"已提交但投影失败，运行 work-reconcile"消息，不再与提交前错误混淆。
+- 研究采集：`fetch_public_json` 返回实际响应 URL，跨主机重定向直接拒绝（登记来源永不偏离请求主机），同主机重定向把最终 URL 写入 provenance 注记。
+- 事务目录 fsync 在 Windows 走 `FlushFileBuffers`（best-effort），补上文档承认的重命名元数据耐久性缺口；journal 提交标记重读加短重试，瞬时读失败不再回滚已提交字节。
+- DOCX 必需部件清单补 `word/_rels/document.xml.rels`、`docProps/core.xml`、`docProps/app.xml`（构建器本就写入，校验补齐纵深防御）。
+
 ## 2.6.0 - 2026-09-29
 
 - SQLite 检索层引入 FTS5 trigram 全文索引（`SCHEMA_VERSION` 1→2，旧缓存判 stale，`rebuild` 一次即可）：启动时自动探测 FTS5 可用性，可用时 `chunks_fts` 随 rebuild/update 维护，短语检索用它做候选预筛并按 bm25 相关度参与排序；短于三字的查询、含英文字母的查询、any/all 模式下的不安全词组合、无 FTS5 环境或索引表不完整时，自动回退到全量扫描——`query_matches` 匹配语义、返回字段与实体检索完全不变。

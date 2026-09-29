@@ -2441,7 +2441,10 @@ def _invalidate_command(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     if not authorization or not reason:
         raise ContinuityError("reason and authorization_reference must not be empty")
     impact = dependency_impact(root, args.changed_path, args.change_type)
-    invalidations = read_json(root / INVALIDATIONS_PATH)
+    invalidations_path = root / INVALIDATIONS_PATH
+    head_path = root / HEAD_PATH
+    invalidations = read_json(invalidations_path)
+    invalidations_current = invalidations_path.read_bytes()
     item = {
         "id": f"INV-{compact_stamp()}-{hashlib.sha256(json.dumps(impact, sort_keys=True).encode()).hexdigest()[:8].upper()}",
         "status": "open",
@@ -2455,15 +2458,20 @@ def _invalidate_command(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     }
     invalidations.setdefault("items", []).append(item)
     invalidations_bytes = dump_json(invalidations).encode("utf-8")
-    head = read_json(root / HEAD_PATH)
+    head = read_json(head_path)
+    head_current = head_path.read_bytes()
     _, canon_hash = canonical_snapshot(root, {INVALIDATIONS_PATH: invalidations_bytes})
     head.update({"status": "blocked", "canon_sha256": canon_hash, "authorization_reference": authorization, "updated_at": utc_now()})
     transactional_write(
         [
-            (root / INVALIDATIONS_PATH, invalidations_bytes),
-            (root / HEAD_PATH, dump_json(head).encode("utf-8")),
+            (invalidations_path, invalidations_bytes),
+            (head_path, dump_json(head).encode("utf-8")),
         ],
         journal_root=root,
+        expected_targets={
+            invalidations_path: hashlib.sha256(invalidations_current).hexdigest(),
+            head_path: hashlib.sha256(head_current).hexdigest(),
+        },
     )
     return {"status": "invalidated", "invalidation": item, "commit_blocked": True, "delivery_blocked": True}
 

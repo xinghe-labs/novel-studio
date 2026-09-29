@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 
-TOOL_VERSION = "2.6.0"
+TOOL_VERSION = "2.6.1"
 
 
 class CliUsageError(RuntimeError):

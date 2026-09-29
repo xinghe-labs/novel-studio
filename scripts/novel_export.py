@@ -2428,11 +2428,14 @@ def validate_docx(
         "[Content_Types].xml",
         "_rels/.rels",
         "word/document.xml",
+        "word/_rels/document.xml.rels",
         "word/styles.xml",
         "word/settings.xml",
         "word/fontTable.xml",
         "word/footer1.xml",
         "word/footer2.xml",
+        "docProps/core.xml",
+        "docProps/app.xml",
     }
     try:
         with zipfile.ZipFile(path) as archive:

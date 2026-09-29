@@ -1020,7 +1020,14 @@ class FanqieAdapter(PlatformAdapter):
 ADAPTERS: dict[str, PlatformAdapter] = {"fanqie": FanqieAdapter()}
 
 
-def fetch_public_json(url: str, timeout: float) -> bytes:
+def fetch_public_json(url: str, timeout: float) -> tuple[bytes, str]:
+    """Fetch a public JSON document and report the URL actually served.
+
+    ``urlopen`` follows redirects, so the responding URL can differ from the
+    requested one.  The caller records both and refuses cross-host redirects so
+    a manifest entry can never silently describe a different origin.
+    """
+
     request = urllib.request.Request(
         url,
         headers={
@@ -1032,13 +1039,18 @@ def fetch_public_json(url: str, timeout: float) -> bytes:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = response.read(MAX_RESPONSE_BYTES + 1)
+            final_url = response.geturl()
     except Exception as exc:
         raise ResearchError(f"Public request failed without retry or bypass: {exc}") from exc
     if len(data) > MAX_RESPONSE_BYTES:
         raise ResearchError(
             f"Response exceeds the {MAX_RESPONSE_BYTES}-byte safety limit"
         )
-    return data
+    if urllib.parse.urlsplit(final_url).netloc != urllib.parse.urlsplit(url).netloc:
+        raise ResearchError(
+            f"Public request redirected off-host; refusing to treat {final_url} as {url}"
+        )
+    return data, final_url
 
 
 def updated_platform_record(
@@ -1098,6 +1110,7 @@ def _collect_platform(
         raise ResearchError(f"Unknown platform adapter: {args.platform}")
     source_url = adapter.request_url(args)
     observed_at = args.observed_at or utc_now()
+    redirect_suffix = ""
 
     if args.input:
         input_raw = Path(args.input).expanduser()
@@ -1109,7 +1122,10 @@ def _collect_platform(
         raw_bytes = read_stable_file(input_path, label="Offline input")
     else:
         input_path = None
-        raw_bytes = fetch_public_json(source_url, args.timeout)
+        raw_bytes, final_url = fetch_public_json(source_url, args.timeout)
+        redirect_suffix = (
+            f" Final URL after redirects: {final_url}" if final_url != source_url else ""
+        )
 
     try:
         payload = json.loads(raw_bytes.decode("utf-8-sig"))
@@ -1188,7 +1204,8 @@ def _collect_platform(
         observed_at=observed_at,
         platform=adapter.adapter_id,
         originality_compare=False,
-        provenance_note="Collected or normalized by the platform adapter.",
+        provenance_note="Collected or normalized by the platform adapter."
+        + redirect_suffix,
     )
     normalized_record, normalized_added, normalized_writes = _prepare_bytes_registration(
         root,

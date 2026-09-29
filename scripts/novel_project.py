@@ -14,6 +14,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -369,16 +370,60 @@ def _atomic_write_bytes_unpatched(path: Path, content: bytes) -> None:
         temp_path.unlink(missing_ok=True)
 
 
+def _fsync_directory_windows(path: Path) -> None:
+    """Best-effort rename-metadata durability via FlushFileBuffers."""
+
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CreateFileW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    kernel32.FlushFileBuffers.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ_WRITE_DELETE = 0x7
+    OPEN_EXISTING = 3
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    handle = kernel32.CreateFileW(
+        str(path),
+        GENERIC_WRITE,
+        FILE_SHARE_READ_WRITE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    )
+    if not handle:
+        return
+    try:
+        kernel32.FlushFileBuffers(handle)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _fsync_directory(path: Path) -> None:
     """Best-effort parent-directory durability for rename metadata.
 
-    Windows does not expose a portable stdlib directory handle that can be
-    fsynced.  POSIX filesystems generally do; failures there are deliberately
-    ignored because the file data itself has already been flushed and a
-    platform-specific directory fsync must not make the transaction unusable.
+    POSIX filesystems generally expose a directory handle that can be fsynced;
+    failures there are deliberately ignored because the file data itself has
+    already been flushed and a platform-specific directory fsync must not make
+    the transaction unusable.  Windows routes through FlushFileBuffers on a
+    backup-semantics directory handle, also best-effort.
     """
 
     if os.name == "nt":
+        try:
+            _fsync_directory_windows(path)
+        except BaseException:
+            return
         return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     descriptor: int | None = None
@@ -1141,11 +1186,22 @@ def transactional_write(
         # exits.  Once that marker exists, rolling bytes back would turn a
         # committed transaction into a false rollback.
         if journal_path is not None and not journal_committed:
-            try:
-                marker = _read_transaction_journal(journal_path)
-                journal_committed = marker.get("status") == "committed"
-            except BaseException:
-                pass
+            # The committed marker is durable; a transient read failure right
+            # after it lands must not roll back already-replaced bytes. Retry
+            # the read briefly, and only roll back when no marker is visible.
+            for _ in range(3):
+                try:
+                    marker = _read_transaction_journal(journal_path)
+                    journal_committed = marker.get("status") == "committed"
+                    break
+                except BaseException:
+                    time.sleep(0.05)
+            else:
+                try:
+                    marker = _read_transaction_journal(journal_path)
+                    journal_committed = marker.get("status") == "committed"
+                except BaseException:
+                    pass
         if journal_committed:
             # Preserve the committed journal after an interrupted control
             # path.  The next controlled operation validates every target and
