@@ -111,7 +111,7 @@ python -X utf8 .\scripts\novel_continuity.py prepare-context "<project-root>" --
 
 `prepare-context` 只读取项目，输出必须位于项目外的工作目录。Agent 回读并补全上下文后，取得项目租约并通过 `write-check`，再把它复制到 `staging/chapters/0056-title/continuity-context.json`；项目 staging 没有写前豁免。
 
-Agent 必须真实读取并填入 `required_reading`：全书摘要、作者决策、章节索引、故事圣经、总纲、当前状态、时间线、线索账本、稳定事实库、有意例外、依赖图、失效记录和最近 3 章正文/记忆卡。空 JSONL 账本用文件哈希证明读取，不伪造引文。任何 `touched_fact_ids` 的原始证据也必须回读。
+Agent 必须真实读取并填入 `required_reading`：全书摘要、作者决策、章节索引、故事圣经、总纲、当前状态、时间线、线索账本、稳定事实库、有意例外、依赖图、失效记录和最近 3 章正文/记忆卡。空 JSONL 账本用文件哈希证明读取，不伪造引文。任何 `touched_fact_ids` 的原始证据也必须回读。本清单是写前必读的唯一全集；[project-contract.md](project-contract.md) 的“上下文加载”与 [long-term-memory.md](long-term-memory.md) 的续写检索协议是它的检索视角子集，出现出入时以本清单为准。
 
 上下文还要明确：
 

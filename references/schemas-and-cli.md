@@ -10,9 +10,11 @@
 {
   "status": "ok",
   "tool": "novel_project",
-  "version": "2.2.0"
+  "version": "2.5.1"
 }
 ```
+
+示例中的 `version` 值随当版 `TOOL_VERSION` 变化，以实际输出为准。
 
 例如，`novel_workspace.py work-list` 自己定义的成功结果形状为：
 
@@ -129,6 +131,16 @@ project-settings.json
 ```
 
 `before`、`after` 和 `continuity` 的实际字段由命令返回；示例中的路径、时间和状态不是可直接提交的固定值。
+
+## `framework-state` 单独状态补写
+
+`framework-state` 只做一件事：在正典内容已经稳定且当前租约有效时，对 `planning/framework-session.md` 应用一次受控的 stage/confirmation/信心值变更。它不能替代 `framework-sync`，也不读写故事圣经、总纲或 `novel.json`：
+
+```powershell
+python -X utf8 .\scripts\novel_project.py framework-state "<project-root>" --stage complete --confirmation confirmed --requirements-confidence 96 --story-confidence 97 --authorization-reference "作者确认框架状态回填" --workspace "<workspace-root>" --work-id "<work-id>"
+```
+
+`--stage` 取 `discovery` 到 `complete` 的九个值，`--confirmation` 取 `pending` 或 `confirmed`；两个信心值是 0-100 整数，`complete` 必须与 `confirmed` 成对且信心不低于 95。`--workspace` 与 `--work-id` 按写入守卫要求提供。内容尚未经 `framework-sync` 同步时不要用它追认；那会掩盖未审查的正典变化。
 
 ## `work.json`
 

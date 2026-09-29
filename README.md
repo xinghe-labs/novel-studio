@@ -130,6 +130,8 @@ python -X utf8 scripts/novel_workspace.py doctor
 python -X utf8 scripts/novel_workspace.py init "<workspace-root>"
 python -X utf8 scripts/novel_workspace.py project-create "<workspace-root>" \
     --title "书名" --work-type serial_novel --genre "都市脑洞"
+# init refuses non-empty directories and lists the entries; re-run with
+# --adopt-existing only after confirming those contents should be kept.
 
 # 2) Open an isolated work context and take the single-writer lease
 python -X utf8 scripts/novel_workspace.py work-ensure "<workspace-root>" --client "generic"

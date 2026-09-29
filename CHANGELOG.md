@@ -2,6 +2,13 @@
 
 本文件记录会影响工作流契约、数据格式或交付判断的变更。
 
+## 2.5.1 - 2026-09-29
+
+- 完整审核的文档修补：周期质量审核读取协议纳入 [drafting.md](references/drafting.md) 的写作机理（期待感来源、爽点前提、对抗阶梯、信息差），使 2.5.0 的机理进入审核对照；写前必读清单在 [continuity.md](references/continuity.md) 钉为唯一全集，其余清单为视角子集。
+- [schemas-and-cli.md](references/schemas-and-cli.md) 修正 `--version` 示例版本并标注随发布变化；新增 `framework-state` 的调用语法与边界小节。
+- README（中/英）补充 `novel_workspace.py init --adopt-existing` 的收编语义；[publication-feedback.md](references/publication-feedback.md) 新增质量信号类记录（编辑反馈、审核标记、留存骤降）及回灌 `style-guide.md` 黑名单的路径。
+- 命令、数据格式与门禁无变化。
+
 ## 2.5.0 - 2026-09-29
 
 - 写作知识内容层增强，全部为“机理+失败模式”紧凑条目，不新增节拍模板：[drafting.md](references/drafting.md) 新增「信息差设计」「期待感与兑现」「爽点与情绪价值」三节，扩写对话潜台词、冲突升级阶梯、话语权与群戏技术，并新增三组“平写 vs 活写”机理标注的「对照示例」。
