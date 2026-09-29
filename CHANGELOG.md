@@ -2,6 +2,14 @@
 
 本文件记录会影响工作流契约、数据格式或交付判断的变更。
 
+## 2.4.0 - 2026-09-29
+
+- 写作链路补正向定调层：`story-bible/style-guide.md` 明确为风格合同的唯一归宿，最少字段新增句长节奏、比喻密度、对话留白、每章字数带、断章风格与禁用措辞黑名单（脚手架模板同步扩充）；新增可选 `story-bible/voice-anchor.md` 收录作者亲写片段，作为写前定调与自然化保留项的正向基准。数据格式无变化。
+- 写作合同模板新增 `节拍` 与 `钩子` 字段；[drafting.md](references/drafting.md) 新增“开篇章与卷首”一节，前 3 章与卷首逐项确认冲突进入位置、首个兑现与开篇承诺一致性。
+- 章节记忆卡新增质量审核字段：结尾钩子、开头进入与实际字数；[periodic-review.md](references/periodic-review.md) 新增“跨窗口重复扫描”，每个检查点用 SQLite 检索或 `rg` 在全本范围核对高频短语、意象与断章方式的碰撞和漂移。旧项目不回填，连续性结论不依赖新字段。
+- 内置 `humanizer-zh/` 副本新增小说专项模式：情绪直接命名、器官反应套话、对话节拍机械交替、章首场景重置公式、比喻密度过高、心理转场套话、人物声音趋同。
+- 入口 `SKILL.md` 拆分运行契约段落，frontmatter 合规说明移入 [DESIGN.md](DESIGN.md)；文档行为边界无变化。
+
 ## 2.3.0 - 2026-09-18
 
 - 内置 `humanizer-zh/` 副本：解析顺序改为 `NOVEL_HUMANIZER_PATH` → Skill 根目录内置副本 → 相邻安装 → `.agents` → `.codex`。内置副本是第三方 MIT Skill（译自 blader/humanizer，版权与来源标注见其目录内 `LICENSE` 与 SKILL.md frontmatter），属于运行时内容、随受控分发归档交付；正式提交仍要求实际调用，人工声明与 `--force` 依旧不可绕过。

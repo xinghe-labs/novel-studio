@@ -121,3 +121,5 @@ Gates compose with the staleness model: because artifacts are hash-bound and gat
 The distributable is only the set of controlled files in version control. Local runtime state — `.agent-handoff/`, a root `AGENTS.md`, `__pycache__/`, `.pytest_cache/` — is not skill content even when it exists on the same disk.
 
 Releases use `git archive` rather than zipping the directory, because `archive` can only read committed paths and therefore cannot sweep in untracked handoff state or caches. `continuity-eval/` lives in the repository and runs under CI, but it is a measurement harness rather than skill runtime content, so it is excluded from release archives via `export-ignore` in `.gitattributes`. Each verified checkpoint is a commit; changes to tool capabilities, contracts, or compatibility also update `TOOL_VERSION`, the README, and `CHANGELOG.md`.
+
+The entry `SKILL.md` keeps its frontmatter spec-compliant: the `humanizer-zh` dependency is declared as `metadata.requires` because a top-level `requires` key is not an allowed frontmatter field for skills.
