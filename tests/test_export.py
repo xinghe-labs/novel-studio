@@ -27,6 +27,29 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
+class ReadUtf8SourceTests(unittest.TestCase):
+    def test_reads_source_bytes_through_the_stable_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "0001-雾.md"
+            write_text(path, "# 雾\n\n正文。\n")
+            raw, text, counts = novel_export.read_utf8_source(path, context="chapter")
+            self.assertEqual(raw, path.read_bytes())
+            self.assertIn("雾", text)
+            self.assertIsInstance(counts, dict)
+
+    def test_maps_project_errors_to_export_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "0001-雾.md"
+            write_text(path, "# 雾\n")
+            with mock.patch.object(
+                novel_project,
+                "read_stable_bytes",
+                side_effect=novel_project.ProjectError("replaced mid-read"),
+            ):
+                with self.assertRaisesRegex(novel_export.ExportError, "replaced mid-read"):
+                    novel_export.read_utf8_source(path, context="chapter")
+
+
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 

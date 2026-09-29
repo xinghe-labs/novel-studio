@@ -566,6 +566,8 @@ def _parse_cache_lock(raw: str) -> tuple[int, float, str]:
 def _cache_pid_alive(pid: int) -> bool | None:
     if pid == os.getpid():
         return True
+    if os.name == "nt":
+        return _cache_pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -575,6 +577,46 @@ def _cache_pid_alive(pid: int) -> bool | None:
     except OSError:
         return None
     return True
+
+
+def _cache_pid_alive_windows(pid: int) -> bool | None:
+    """Probe a Windows pid without os.kill's console-control semantics.
+
+    ``os.kill(pid, 0)`` maps sig 0 to CTRL_C_EVENT on Windows, so it can never
+    answer "is this process alive". ``WaitForSingleObject`` with a zero timeout
+    is the equivalent probe: WAIT_OBJECT_0 means the process has exited.
+    """
+
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0
+    WAIT_TIMEOUT = 0x00000102
+    ERROR_ACCESS_DENIED = 5
+    ERROR_INVALID_PARAMETER = 87
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == ERROR_ACCESS_DENIED:
+            return True
+        if error == ERROR_INVALID_PARAMETER:
+            return False
+        return None
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0)
+    finally:
+        kernel32.CloseHandle(handle)
+    if result == WAIT_OBJECT_0:
+        return False
+    if result == WAIT_TIMEOUT:
+        return True
+    return None
 
 
 @contextlib.contextmanager
@@ -595,6 +637,22 @@ def cache_lock(root: Path):
                 descriptor.write(payload)
                 descriptor.flush()
                 os.fsync(descriptor.fileno())
+                try:
+                    persisted = path.read_text(encoding="ascii")
+                except FileNotFoundError:
+                    persisted = None
+                except OSError as exc:
+                    raise MemoryIndexError(
+                        f"Cannot inspect memory-cache lock: {exc}"
+                    ) from exc
+                if persisted != payload:
+                    # Our claim was replaced while we were writing it. Re-read
+                    # before entering the critical section so a recycled lock
+                    # can never yield two concurrent holders.
+                    descriptor.close()
+                    descriptor = None
+                    time.sleep(0.05)
+                    continue
                 break
             except FileExistsError:
                 try:
@@ -602,7 +660,14 @@ def cache_lock(root: Path):
                     pid, created, _ = _parse_cache_lock(raw)
                 except FileNotFoundError:
                     continue
-                except (OSError, UnicodeError, MemoryIndexError) as exc:
+                except MemoryIndexError:
+                    # A writer killed between creating and filling the lock file
+                    # leaves empty or partial content that identifies no holder.
+                    # Entering the critical section requires re-reading and
+                    # matching our own token, so reclaiming it is safe.
+                    path.unlink(missing_ok=True)
+                    continue
+                except (OSError, UnicodeError) as exc:
                     raise MemoryIndexError(f"Cannot inspect memory-cache lock: {exc}") from exc
                 if (
                     time.time() - created >= CACHE_LOCK_STALE_SECONDS

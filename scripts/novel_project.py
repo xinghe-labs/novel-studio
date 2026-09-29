@@ -1201,6 +1201,7 @@ def transactional_write(
 
 UPGRADE_IGNORED_PARTS = frozenset(
     {
+        ".git",
         "exports",
         "staging",
         ".novel-cache",
@@ -1815,11 +1816,26 @@ def parse_frontmatter_metadata(text: str, *, label: str) -> dict[str, str]:
     return metadata
 
 
+def read_utf8_project_text(path: Path, *, label: str = "project file") -> str:
+    """Read project text, mapping decode failures to a structured error.
+
+    A project file saved in a legacy encoding must fail validation with exit
+    code 2 instead of escaping as an unhandled UnicodeDecodeError (exit 3).
+    """
+
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProjectError(f"{label} is not valid UTF-8: {path}: {exc}") from exc
+
+
 def frontmatter_metadata(path: Path) -> dict[str, str]:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         raise ProjectError(f"Missing file: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise ProjectError(f"Project file is not valid UTF-8: {path}: {exc}") from exc
     return parse_frontmatter_metadata(text, label=str(path))
 
 
@@ -2109,7 +2125,9 @@ def _upgrade_project(args: argparse.Namespace, root: Path) -> dict[str, Any]:
 
     if not created_dirs and not created_files:
         chapters = chapter_files(root)
-        index_text = (root / "manuscript/index.md").read_text(encoding="utf-8")
+        index_text = read_utf8_project_text(
+            root / "manuscript/index.md", label="manuscript/index.md"
+        )
         index_targets = markdown_link_targets(index_text)
         backfill = []
         for chapter_path in chapters:
@@ -2120,7 +2138,8 @@ def _upgrade_project(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             card_path = root / "memory/chapters" / f"{match.group('number')}.md"
             card_valid = (
                 card_path.is_file()
-                and chapter_path.name in card_path.read_text(encoding="utf-8")
+                and chapter_path.name
+                in read_utf8_project_text(card_path, label="chapter memory card")
             )
             if relative not in index_targets or not card_valid:
                 backfill.append(chapter_path.name)
@@ -2190,7 +2209,9 @@ def _upgrade_project(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     _write_upgrade_journal(root, journal)
 
     chapters = chapter_files(root)
-    index_text = (root / "manuscript/index.md").read_text(encoding="utf-8")
+    index_text = read_utf8_project_text(
+        root / "manuscript/index.md", label="manuscript/index.md"
+    )
     index_targets = markdown_link_targets(index_text)
     backfill: list[str] = []
     for chapter_path in chapters:
@@ -2200,9 +2221,10 @@ def _upgrade_project(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         relative = chapter_path.relative_to(root / "manuscript").as_posix()
         card_path = root / "memory/chapters" / f"{match.group('number')}.md"
         card_valid = (
-            card_path.is_file()
-            and chapter_path.name in card_path.read_text(encoding="utf-8")
-        )
+        card_path.is_file()
+        and chapter_path.name
+        in read_utf8_project_text(card_path, label="chapter memory card")
+    )
         if relative not in index_targets or not card_valid:
             backfill.append(chapter_path.name)
 
@@ -2447,7 +2469,11 @@ def collect_validation(
     chapters = chapter_files(root)
     chapter_numbers: dict[str, Path] = {}
     index_path = root / "manuscript/index.md"
-    index_text = index_path.read_text(encoding="utf-8") if index_path.is_file() else ""
+    index_text = (
+        read_utf8_project_text(index_path, label="manuscript/index.md")
+        if index_path.is_file()
+        else ""
+    )
     index_targets = markdown_link_targets(index_text)
     indexed_titles = index_titles(index_text)
     expected_cards: set[str] = set()
@@ -2505,7 +2531,9 @@ def collect_validation(
         card_path = root / "memory/chapters" / card_name
         if not card_path.is_file():
             errors.append(f"Missing chapter memory card: memory/chapters/{card_name}")
-        elif chapter_path.name not in card_path.read_text(encoding="utf-8"):
+        elif chapter_path.name not in read_utf8_project_text(
+            card_path, label="chapter memory card"
+        ):
             errors.append(
                 f"Chapter memory card does not link to its manuscript: "
                 f"memory/chapters/{card_name}"
@@ -2590,7 +2618,7 @@ def _research_state(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         updates["candidate_authorization"] = authorization
     if args.deep_analysis is not None:
         updates["analysis_authorization"] = authorization
-    original = path.read_text(encoding="utf-8")
+    original = read_utf8_project_text(path, label="comparable-works frontmatter")
     updated = replace_frontmatter(original, updates)
     continuity_result: dict[str, Any] | None = None
     try:
@@ -2745,7 +2773,7 @@ def _framework_state(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         requirements_confidence=requirements_confidence,
         story_confidence=story_confidence,
     )
-    original = path.read_text(encoding="utf-8")
+    original = read_utf8_project_text(path, label="framework session frontmatter")
     updated = replace_frontmatter(original, updates)
     continuity_result: dict[str, Any] | None = None
     try:
@@ -3626,7 +3654,7 @@ def _commit_chapter_impl(args: argparse.Namespace) -> dict[str, Any]:
     if chapter_target.exists() or memory_target.exists():
         raise ProjectError("Refusing to overwrite an existing chapter or memory card")
     index_path = root / "manuscript/index.md"
-    index_text = index_path.read_text(encoding="utf-8")
+    index_text = read_utf8_project_text(index_path, label="manuscript/index.md")
     relative_target = f"chapters/{manuscript_filename}"
     if relative_target in markdown_link_targets(index_text):
         raise ProjectError("Chapter is already linked in manuscript/index.md")
@@ -3899,7 +3927,7 @@ def project_status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     comparables = frontmatter_metadata(root / "research/comparable-works.md")
     chapters = chapter_files(root)
     index_path = root / "manuscript/index.md"
-    index_text = index_path.read_text(encoding="utf-8")
+    index_text = read_utf8_project_text(index_path, label="manuscript/index.md")
     index_targets = markdown_link_targets(index_text)
     memory_cards = list((root / "memory/chapters").glob("*.md"))
     source_records = source_manifest_records(root / "research/source-manifest.jsonl")

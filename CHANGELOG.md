@@ -2,6 +2,14 @@
 
 本文件记录会影响工作流契约、数据格式或交付判断的变更。
 
+## 2.5.3 - 2026-09-29
+
+- 逐行脚本审核修补。SQLite 缓存锁自愈：写入者中途被杀留下的空/残缺锁文件在下次竞争时被直接回收（进入临界区前重读并匹配自身 token，保证不会出现双持有者）；Windows 探活改用 `OpenProcess`+`WaitForSingleObject`，替代在 win32 上恒为 CTRL_C_EVENT 语义的 `os.kill(pid, 0)`。
+- 导出源读取改为 `read_stable_bytes` 并同源取哈希：章节与 index 的 SHA-256 一律来自实际解析的同一份字节，消除并发改稿下"旧正文+新哈希"混合包窗口；`source_snapshot_hash` 公式因此变化，旧导出清单会判 `stale`，重新导出即可。
+- `UPGRADE_IGNORED_PARTS` 补 `.git`，与状态哈希排除集一致；内嵌 git 仓库的项目不再被升级快照卷入。
+- 非 UTF-8 项目文件改为结构化域错误（退出码 2）：validate/status/upgrade/commit 的裸 `read_text` 统一收口到 `read_utf8_project_text`，连续性证据校验把解码失败记入 errors 列表。
+- 命令与数据格式无变化；导出清单哈希公式变化见上。
+
 ## 2.5.2 - 2026-09-29
 
 - 脚本层审核收尾：新增 `tests/test_memory_cache.py`，直接覆盖 SQLite 缓存的损坏库报告与重建、过期库判定、`search --require-fresh` 拒绝路径、以及实体抽取只认显式标签不从正文臆造的边界。

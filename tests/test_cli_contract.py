@@ -905,6 +905,42 @@ class LeaseAndDoctorTests(unittest.TestCase):
             self.assertEqual(payload["status"], "blocked")
             self.assertIn("error", payload)
 
+    def test_upgrade_snapshot_ignores_git_directory(self) -> None:
+        """The upgrade exclusion set must match the state-hash contract, which
+        excludes .git; otherwise a project that embeds its own repository gets
+        swept into the upgrade journal and fails on any git activity."""
+
+        self.assertIn(".git", novel_project.UPGRADE_IGNORED_PARTS)
+
+    def test_validate_reports_non_utf8_index_as_domain_error(self) -> None:
+        """A project file in a legacy encoding must fail validate with a
+        structured domain error (exit 2), never an unhandled exception (3)."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "project"
+            root.mkdir()
+            (root / "novel.json").write_text(
+                json.dumps({"schema_version": 1, "title": "冒烟"}),
+                encoding="utf-8",
+            )
+            (root / "manuscript").mkdir()
+            (root / "manuscript" / "index.md").write_bytes("第一章 测试".encode("gbk"))
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8",
+                    str(SCRIPTS / "novel_project.py"),
+                    "validate",
+                    str(root),
+                ],
+                capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 2)
+            payload = json.loads(completed.stdout.decode("utf-8"))
+            self.assertEqual(payload["status"], "error")
+            self.assertIn("not valid UTF-8", payload["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

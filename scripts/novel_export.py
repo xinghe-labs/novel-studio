@@ -1223,9 +1223,19 @@ def normalize_unicode_for_delivery(
     return normalized, counts
 
 
-def read_utf8_source(path: Path, *, context: str) -> tuple[str, dict[str, int]]:
+def read_utf8_source(path: Path, *, context: str) -> tuple[bytes, str, dict[str, int]]:
+    """Read source bytes once and derive both text and identity from them.
+
+    ``read_stable_bytes`` re-reads to reject replacement races, so the returned
+    raw bytes are the authoritative content; callers must hash these bytes
+    instead of re-reading the file, or a concurrent commit could pair old text
+    with new hashes.
+    """
+
     try:
-        raw = path.read_bytes()
+        raw = novel_project.read_stable_bytes(path, label=context)
+    except novel_project.ProjectError as exc:
+        raise ExportError(str(exc)) from exc
     except OSError as exc:
         raise ExportError(f"Cannot read {context}: {exc}") from exc
     if UTF8_BOM in raw:
@@ -1235,7 +1245,10 @@ def read_utf8_source(path: Path, *, context: str) -> tuple[str, dict[str, int]]:
         value = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         raise ExportError(f"{context} is not strict UTF-8: {exc}") from exc
-    return normalize_unicode_for_delivery(value, context=context, multiline=True)
+    text, normalizations = normalize_unicode_for_delivery(
+        value, context=context, multiline=True
+    )
+    return raw, text, normalizations
 
 
 def prepare_utf8_document(
@@ -1491,12 +1504,13 @@ def display_unit_title(snapshot: ProjectSnapshot, chapter: Chapter) -> str:
     return display_chapter_title(chapter.number, chapter.title)
 
 
-def parse_index(root: Path) -> tuple[tuple[Chapter, ...], dict[str, int]]:
+def parse_index(root: Path) -> tuple[tuple[Chapter, ...], dict[str, int], str]:
     index_path = root / "manuscript/index.md"
-    index_text, index_normalizations = read_utf8_source(
+    index_raw, index_text, index_normalizations = read_utf8_source(
         index_path,
         context="manuscript/index.md",
     )
+    index_sha256 = hashlib.sha256(index_raw).hexdigest()
     source_normalizations = empty_normalizations()
     merge_normalizations(source_normalizations, index_normalizations)
     manuscript_root = (root / "manuscript").resolve()
@@ -1548,7 +1562,7 @@ def parse_index(root: Path) -> tuple[tuple[Chapter, ...], dict[str, int]]:
         )
         chapter_normalizations = empty_normalizations()
         merge_normalizations(chapter_normalizations, title_normalizations)
-        markdown, markdown_normalizations = read_utf8_source(
+        markdown_raw, markdown, markdown_normalizations = read_utf8_source(
             source_path,
             context=f"chapter {number_text} Markdown",
         )
@@ -1574,7 +1588,7 @@ def parse_index(root: Path) -> tuple[tuple[Chapter, ...], dict[str, int]]:
                 title=title,
                 source_path=source_path,
                 source_relative=f"manuscript/{source_relative}",
-                source_sha256=sha256_file(source_path),
+                source_sha256=hashlib.sha256(markdown_raw).hexdigest(),
                 blocks=blocks,
                 plain_text=plain_text,
                 non_whitespace_characters=sum(
@@ -1593,18 +1607,28 @@ def parse_index(root: Path) -> tuple[tuple[Chapter, ...], dict[str, int]]:
         chapter.number for chapter in chapters
     ):
         raise ExportError("manuscript/index.md chapter rows must be in ascending order")
-    return tuple(chapters), source_normalizations
+    return tuple(chapters), source_normalizations, index_sha256
 
 
-def source_snapshot_hash(root: Path, chapters: Iterable[Chapter]) -> str:
-    paths = [root / "novel.json", root / "manuscript/index.md"]
-    paths.extend(chapter.source_path for chapter in chapters)
+def source_snapshot_hash(root: Path, index_sha256: str, chapters: Iterable[Chapter]) -> str:
+    """Bind the snapshot to the exact bytes that parse_index consumed.
+
+    novel.json is re-read (its mid-export change fails validation on refresh);
+    the index and every chapter hash come from the same read as the content.
+    """
+
     digest = hashlib.sha256()
-    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
-        relative = path.relative_to(root).as_posix()
+    entries: list[tuple[str, str]] = [
+        ("manuscript/index.md", index_sha256),
+        ("novel.json", sha256_file(root / "novel.json")),
+    ]
+    entries.extend(
+        (chapter.source_relative, chapter.source_sha256) for chapter in chapters
+    )
+    for relative, sha256_hex in sorted(entries):
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(sha256_file(path).encode("ascii"))
+        digest.update(sha256_hex.encode("ascii"))
         digest.update(b"\n")
     return digest.hexdigest()
 
@@ -1635,7 +1659,7 @@ def load_snapshot(raw_root: str | Path) -> ProjectSnapshot:
         context="novel.json genre",
         multiline=False,
     )
-    chapters, source_normalizations = parse_index(root)
+    chapters, source_normalizations, index_sha256 = parse_index(root)
     merge_normalizations(
         source_normalizations,
         title_normalizations,
@@ -1673,7 +1697,7 @@ def load_snapshot(raw_root: str | Path) -> ProjectSnapshot:
         work_type=work_type,
         project_id=project_id,
         current_chapter=int(current_chapter),
-        source_snapshot_sha256=source_snapshot_hash(root, chapters),
+        source_snapshot_sha256=source_snapshot_hash(root, index_sha256, chapters),
         chapters=chapters,
         validation_warnings=tuple(warnings),
         source_normalizations=source_normalizations,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -125,6 +126,24 @@ class MemoryCacheTests(unittest.TestCase):
             result, code = novel_memory.search_index(search_args(root, "雾港来信"))
             self.assertEqual(code, 0)
             self.assertIn("0001-雾港来信.md", json.dumps(result, ensure_ascii=False))
+
+    def test_cache_lock_recovers_from_garbage_lock_file(self) -> None:
+        """A writer killed between creating and filling the lock file must not
+        permanently wedge rebuild/update behind "Malformed memory-cache lock"."""
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = build_minimal_project(Path(temp))
+            cache_dir = root / ".novel-cache"
+            cache_dir.mkdir()
+            (cache_dir / novel_memory.CACHE_LOCK_NAME).write_bytes(b"")
+            rebuild = novel_memory.rebuild_index(root)
+            self.assertEqual(rebuild["status"], "rebuilt")
+            self.assertFalse((cache_dir / novel_memory.CACHE_LOCK_NAME).exists())
+
+    def test_cache_pid_probe(self) -> None:
+        self.assertIs(novel_memory._cache_pid_alive(os.getpid()), True)
+        # A pid far beyond the platform range cannot exist on any host.
+        self.assertIs(novel_memory._cache_pid_alive(999_999_999), False)
 
 
 if __name__ == "__main__":

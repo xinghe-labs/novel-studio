@@ -8,7 +8,7 @@ metadata:
 
 # 小说工作室
 
-这是入口路由，不是全部操作手册。当前工具版本为 `2.5.2`，要求 Python 3.10+，只使用标准库。
+这是入口路由，不是全部操作手册。当前工具版本为 `2.5.3`，要求 Python 3.10+，只使用标准库。
 
 模块正常加载并进入 `scripts/novel_cli.py` 的 `run_cli` 后，除 `--help` 外向 stdout 输出单个 JSON 文档；业务命令的 `status`/`decision` 随命令而异，退出码 1 表示业务门禁未通过，参数或领域错误为 2，未预期异常与序列化失败为 3。`--version` 才固定返回 `status: ok`、`tool` 和 `version`。模块加载失败发生在该运行时契约之前，可能由 Python 直接输出 traceback 并返回退出码 1。详细字段见 [schemas-and-cli.md](references/schemas-and-cli.md)。
 

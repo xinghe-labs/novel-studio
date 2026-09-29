@@ -1251,7 +1251,14 @@ def validate_context(root: Path, context_path: Path, chapter_number: int) -> dic
                 errors.append(f"required_reading[{index}] has a stale sha256")
             if not isinstance(item.get("reason"), str) or not item["reason"].strip():
                 errors.append(f"required_reading[{index}].reason must not be empty")
-            source_is_empty = not (root / relative).read_text(encoding="utf-8").strip()
+            try:
+                source_text = (root / relative).read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                errors.append(
+                    f"required_reading[{index}] source {relative} is not valid UTF-8: {exc}"
+                )
+                continue
+            source_is_empty = not source_text.strip()
             errors.extend(
                 validate_evidence(
                     root,
