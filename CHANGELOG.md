@@ -2,6 +2,12 @@
 
 本文件记录会影响工作流契约、数据格式或交付判断的变更。
 
+## 2.9.0 - 2026-09-29
+
+- 建书预检六处补线:失败同行死因预注册仪表(信号/阈值/触发动作,发布后按 publication-feedback.md 的"仪表对表"核对)、自家已发布作品数据入一手证据、简介与书名设计流程(3-5 个候选/钩子类型/违禁边界/标签对齐)、黄金三章流失点预演、世界硬规则利用审查、声音锚点"作者改定稿"通道。
+- [drafting.md](references/drafting.md) 开篇章、[market-research.md](references/market-research.md)、[publication-feedback.md](references/publication-feedback.md)、[interactive-planning.md](references/interactive-planning.md) 同步。
+- 命令与数据格式无变化。
+
 ## 2.8.2 - 2026-09-30
 
 - 需求层闸门补商业生存预检三件:失败同行预验尸(同题材 3-5 本死因各一句 + Agent 对抗性反证至少三条,作者逐条回应,映射为确认单预防措施)、更新节奏与存稿缓冲承诺(日更字数×每周天数、开更缓冲章数、断更预案,不填不立项)、平台义务核查(已有签约作品的独家条款范围不波及新书)。
