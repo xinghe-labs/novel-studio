@@ -38,7 +38,7 @@ Eight standard-library CLI tools with a documented JSON contract, plus `novel_cl
 | `novel_export.py` | `export` `status` | DOCX / EPUB export with structural verification |
 | `novel_cli.py` | — | Shared CLI contract, atomic file primitives, version source (not an executable command) |
 
-**19,472 lines of runtime Python**, **8,178 lines of tests**, and **22 progressive-disclosure reference documents**, with no third-party runtime dependency.
+**19,472 lines of runtime Python**, **8,178 lines of tests**, and **23 progressive-disclosure reference documents**, with no third-party runtime dependency.
 <!-- The three counts above are machine-checked by ci/check_doc_stats.py; run `python -X utf8 ci/check_doc_stats.py --print` for the current values. -->
 
 ## How the pieces fit
