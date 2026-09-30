@@ -2196,6 +2196,10 @@ def init_project(args: argparse.Namespace) -> dict[str, Any]:
             "interval_chapters": (
                 1 if work_type == "short_story" else novel_review.DEFAULT_INTERVAL
             ),
+            "first_review_chapter": (
+                1 if work_type == "short_story"
+                else novel_review.DEFAULT_FIRST_REVIEW_CHAPTER
+            ),
             "block_next_commit": True,
         },
         "updated_at": utc_now(),

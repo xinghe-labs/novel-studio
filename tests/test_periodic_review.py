@@ -126,6 +126,16 @@ class PeriodicReviewTests(unittest.TestCase):
             work_id=self.work_ids[root.resolve()],
         )
 
+    def hold_legacy_first_review(self, root: Path) -> None:
+        """Pin the legacy interval-grid checkpoint in flow tests seeded to five chapters."""
+        manifest_path = root / "novel.json"
+        manifest = read_json(manifest_path)
+        del manifest["periodic_review"]["first_review_chapter"]
+        write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
+
     def prepare_and_record(
         self,
         root: Path,
@@ -187,7 +197,7 @@ class PeriodicReviewTests(unittest.TestCase):
             )
         )
 
-    def test_default_policy_triggers_after_five_chapters(self) -> None:
+    def test_scaffold_pins_first_review_to_chapter_three(self) -> None:
         root = self.init_project()
         manifest = read_json(root / "novel.json")
         self.assertEqual(
@@ -195,8 +205,41 @@ class PeriodicReviewTests(unittest.TestCase):
             {
                 "enabled": True,
                 "interval_chapters": 5,
+                "first_review_chapter": 3,
                 "block_next_commit": True,
             },
+        )
+
+        self.seed_chapters(root, 2)
+        before = novel_review.review_status(root)
+        self.assertFalse(before["review_due"])
+        self.assertEqual(before["next_due_chapter"], 3)
+
+        self.seed_chapters(root, 3)
+        due = novel_review.review_status(root)
+        self.assertTrue(due["review_due"])
+        self.assertEqual((due["review_from"], due["review_through"]), (1, 3))
+        self.assertTrue(due["commit_blocked"])
+        errors, warnings = novel_project.collect_validation(root)
+        self.assertEqual(errors, [])
+        self.assertTrue(any("Periodic review is due" in item for item in warnings))
+
+        self.prepare_and_record(root)
+        after = novel_review.review_status(root)
+        self.assertFalse(after["review_due"])
+        self.assertEqual(after["next_due_chapter"], 8)
+
+        self.seed_chapters(root, 4)
+        self.assertFalse(novel_review.review_status(root)["review_due"])
+
+    def test_manifest_without_first_review_field_keeps_the_legacy_grid(self) -> None:
+        root = self.init_project()
+        manifest_path = root / "novel.json"
+        manifest = read_json(manifest_path)
+        del manifest["periodic_review"]["first_review_chapter"]
+        write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         )
 
         self.seed_chapters(root, 4)
@@ -209,9 +252,62 @@ class PeriodicReviewTests(unittest.TestCase):
         self.assertTrue(due["review_due"])
         self.assertEqual((due["review_from"], due["review_through"]), (1, 5))
         self.assertTrue(due["commit_blocked"])
-        errors, warnings = novel_project.collect_validation(root)
-        self.assertEqual(errors, [])
-        self.assertTrue(any("Periodic review is due" in item for item in warnings))
+        self.assertEqual(due["policy"]["first_review_chapter"], 5)
+
+    def test_first_review_chapter_validation_and_configure(self) -> None:
+        root = self.init_project()
+        manifest_path = root / "novel.json"
+        manifest = read_json(manifest_path)
+        manifest["periodic_review"]["first_review_chapter"] = 7
+        write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
+        with self.assertRaisesRegex(novel_review.ReviewError, "must not exceed"):
+            novel_review.review_status(root)
+
+        manifest["periodic_review"]["first_review_chapter"] = "3"
+        write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
+        with self.assertRaisesRegex(
+            novel_review.ReviewError, "first_review_chapter must be an integer"
+        ):
+            novel_review.review_status(root)
+
+        del manifest["periodic_review"]["first_review_chapter"]
+        write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
+        refresh_fixture_base(
+            root,
+            self.workspace,
+            self.work_ids[root.resolve()],
+            reference="测试恢复项目基准后重试策略配置",
+        )
+        result = novel_review.configure_policy(
+            SimpleNamespace(
+                root=str(root),
+                interval=4,
+                enabled=None,
+                block_next_commit=None,
+                first_review_chapter=2,
+                authorization_reference="作者确认首检提前到第二章",
+                workspace=str(self.workspace),
+                work_id=self.work_ids[root.resolve()],
+            )
+        )
+        self.assertEqual(
+            (
+                result["after"]["interval_chapters"],
+                result["after"]["first_review_chapter"],
+            ),
+            (4, 2),
+        )
+        self.seed_chapters(root, 2)
+        self.assertTrue(novel_review.review_status(root)["review_due"])
 
     def test_review_root_rejects_link_like_path(self) -> None:
         root = self.init_project("review-link-root")
@@ -371,6 +467,7 @@ class PeriodicReviewTests(unittest.TestCase):
 
     def test_passing_report_advances_next_checkpoint_to_ten(self) -> None:
         root = self.init_project()
+        self.hold_legacy_first_review(root)
         self.seed_chapters(root, 5)
         recorded = self.prepare_and_record(root)
         self.assertEqual(recorded["decision"], "pass")
@@ -383,6 +480,7 @@ class PeriodicReviewTests(unittest.TestCase):
 
     def test_important_finding_blocks_until_a_new_passing_review(self) -> None:
         root = self.init_project()
+        self.hold_legacy_first_review(root)
         self.seed_chapters(root, 5)
         self.prepare_and_record(root, decision="needs_revision", severity="important")
 
@@ -497,12 +595,14 @@ class PeriodicReviewTests(unittest.TestCase):
                 interval=3,
                 enabled=None,
                 block_next_commit=None,
+                first_review_chapter=None,
                 authorization_reference="作者确认改为每三章审核一次",
                 workspace=str(self.workspace),
                 work_id=self.work_ids[root.resolve()],
             )
         )
         self.assertEqual(result["after"]["interval_chapters"], 3)
+        self.assertEqual(result["after"]["first_review_chapter"], 3)
         self.seed_chapters(root, 3)
         status = novel_review.review_status(root)
         self.assertTrue(status["review_due"])
@@ -525,6 +625,7 @@ class PeriodicReviewTests(unittest.TestCase):
                 interval=None,
                 enabled=None,
                 block_next_commit="false",
+                first_review_chapter=None,
                 authorization_reference="作者确认本阶段先不阻断提交与导出",
                 workspace=str(self.workspace),
                 work_id=self.work_ids[root.resolve()],

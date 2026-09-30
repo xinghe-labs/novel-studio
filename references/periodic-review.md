@@ -11,25 +11,26 @@
   "periodic_review": {
     "enabled": true,
     "interval_chapters": 5,
+    "first_review_chapter": 3,
     "block_next_commit": true
   }
 }
 ```
 
-- 第 1-4 章不触发；第 5 章先正常提交，再立即审核第 1-5 章。
-- 第 1-5 章质量审核通过后，下一个检查点是第 10 章。届时重点精读第 6-10 章，并结合前文检查读者承诺、节奏、人物弧和留存体验；同一检查点的连续性由另一份独立全局报告负责。
+- 新项目脚手架默认写 `first_review_chapter: 3`：第 1-2 章不触发；第 3 章先正常提交，再立即审核第 1-3 章（开篇专项审核，见下节）；通过前第 4 章的提交与导出都被阻断。此后检查点为 8、13、18……即首检章加 `interval_chapters` 的整数倍。
+- 每个检查点通过后，下一个检查点在 `interval_chapters` 之后（例如首检第 3 章通过后是第 8 章，再后是第 13 章）。届时重点精读自上次通过后的新增区间，并结合前文检查读者承诺、节奏、人物弧和留存体验；同一检查点的连续性由另一份独立全局报告负责。
 - 审核到期不是结构损坏，因此 `novel_project.py validate` 返回警告，不回滚刚提交的检查点章节。
 - 默认只保存报告，不自动修改正文。存在 `blocker` 或 `important` 质量问题时，下一章的 `prepare-context`、正式提交、导出和平台交付都被阻断，直到修订并重新记录 `pass` 报告；不能先生成写前上下文继续写，再等提交时补审。
 - `minor` 与 `note` 可以随 `pass` 报告保留为后续清理项。不能为了放行而把实际重要问题降级。
 
-以上是 `serial_novel` 的原有行为。旧项目缺少 `work_type` 时仍按该模式和每五章默认值执行，不做迁移或重写。
+以上是 `serial_novel` 的原有行为。旧项目缺少 `work_type` 时仍按该模式执行，不做迁移或重写。旧项目 `novel.json` 缺少 `first_review_chapter` 时首检章等于 `interval_chapters`（即第 5 章），检查点网格与历史完全一致；要提前首检时用 `configure --first-review-chapter` 显式设置，值不得大于 `interval_chapters`。
 
 `short_story` 是独立新增分支：项目只有一个完整正文单元，初始化时固定 `interval_chapters: 1`。正文提交后状态返回 `review_mode: completion`、`review_due: true`，质量审核包精读完整故事，报告写入 `reviews/completion/`。它与全篇连续性基线是两份报告，不是每场景一次的周期审核，也不会改变任何 `serial_novel` 项目的检查点。
 
 每个项目可以把间隔改为 1-100 章，也可以明确关闭自动阻断。修改策略属于项目写入，必须先取得当前工作的项目租约并通过 `write-check`：
 
 ```powershell
-python -X utf8 .\scripts\novel_review.py configure "<project-root>" --interval 5 --enabled true --block-next-commit true --authorization-reference "作者确认每五章审核一次" --workspace "<workspace-root>" --work-id "<work-id>"
+python -X utf8 .\scripts\novel_review.py configure "<project-root>" --interval 5 --first-review-chapter 3 --enabled true --block-next-commit true --authorization-reference "作者确认每五章审核一次" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
 `block_next_commit: false` 是唯一一处"审核到期但不阻断"的开关，它对**提交和导出同时生效**：两条路径都读取同一判据（`novel_review.review_gate()`），因此不会出现"能提交却永远无法导出"的分歧。关闭后到期审核不阻断，但 `review_status`、`commit-chapter` 的 `warnings` 与 `export` 的 `review_warnings` 都会显式记录该状态；审核报告本身仍然照常要求，`validate` 仍返回到期警告。关闭开关只适合作者明确知情后短期使用，不能用来让未审核的正典进入正式交付。
@@ -49,6 +50,18 @@ python -X utf8 .\scripts\novel_review.py configure "<project-root>" --interval 5
 9. `language_and_format`：错字、漏字、病句、标点、Markdown 格式和 POV 表达问题。
 
 事实、时间、知识、物品和规则是否矛盾不在本报告重复裁决；引用当前连续性审计状态即可。发现新的疑似矛盾时，将其转入连续性报告，不用质量术语模糊处理。
+
+## 开篇专项审核（首检加项）
+
+`first_review_chapter` 触发的首检除九个维度外，逐项核对开篇抓力（判据见 [drafting.md](drafting.md) 的开篇章与 [building-precheck.md](building-precheck.md) D 段）：
+
+1. 第一屏硬标准：第一屏（约前三段、三百字）内出现异常、冲突或处境反差；“谁、在哪、想要什么、什么不对劲”四问至少答出三问；主角带具体可共情的处境或欲望；开场处于“变化发生中”；静态开场四件套（天气铺陈、起床洗漱、照镜子自我介绍、大段回忆或世界观讲解）零命中。
+2. 黄金三章合同逐项落地：每章的进入、兑现、卡点都成文而不是被旁白宣布；三章钩子不同型，开场方式不同源。
+3. 兑现节奏：每章至少一个真实兑现（爽点、关键信息或关系推进），铺垫不连续两章无回报；期待线表主线的首次铺设已发生。
+4. 流失点预演的对策确实写进了正文，不是只留在确认单里。
+5. 书名、简介与首章承诺一致：简介承诺的体验在前三章已被兑现第一口。
+
+命中项按对应九维维度与严重度记录，不另立开篇分数；`blocker` 或 `important` 未修复前，第 4 章提交与导出保持阻断。作者另有历史数据时，第 1、3 章的入口信号阈值按确认单预注册仪表核对（见 [publication-feedback.md](publication-feedback.md)）。
 
 历史报告只有同时声明 `review_domain: quality`、`continuity_review_separate: true`，完整覆盖上述九个质量维度，并记录真实的独立审稿者时才算有效。旧版把连续性和质量混在一起的报告会被状态命令忽略，并要求在当前检查点重新审核，不能继续充当放行依据。
 

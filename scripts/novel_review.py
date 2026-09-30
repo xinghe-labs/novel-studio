@@ -20,6 +20,7 @@ import novel_cli
 
 SCHEMA_VERSION = 1
 DEFAULT_INTERVAL = 5
+DEFAULT_FIRST_REVIEW_CHAPTER = 3
 MIN_INTERVAL = 1
 MAX_INTERVAL = 100
 DECISIONS = frozenset({"pass", "needs_revision", "block"})
@@ -366,9 +367,30 @@ def policy_for_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         raise ReviewError(
             "short_story completion review requires interval_chapters=1"
         )
+    first_raw = raw.get("first_review_chapter")
+    if first_raw is None:
+        first_review = interval
+    else:
+        if (
+            not isinstance(first_raw, int)
+            or isinstance(first_raw, bool)
+            or first_raw < MIN_INTERVAL
+            or first_raw > MAX_INTERVAL
+        ):
+            raise ReviewError(
+                f"periodic_review.first_review_chapter must be an integer from "
+                f"{MIN_INTERVAL} to {MAX_INTERVAL}"
+            )
+        if first_raw > interval:
+            raise ReviewError(
+                "periodic_review.first_review_chapter must not exceed "
+                "interval_chapters"
+            )
+        first_review = first_raw
     return {
         "enabled": enabled,
         "interval_chapters": interval,
+        "first_review_chapter": first_review,
         "block_next_commit": block_next_commit,
         "source": source,
     }
@@ -705,11 +727,19 @@ def review_status(root: str | Path) -> dict[str, Any]:
         due = bool(due_through and passed < 1)
         next_due = 1 if policy["enabled"] and passed < 1 else None
     else:
-        due_through = (current // interval) * interval if policy["enabled"] else 0
+        first = policy["first_review_chapter"]
+        if policy["enabled"] and current >= first:
+            due_through = first + ((current - first) // interval) * interval
+        else:
+            due_through = 0
         due = bool(policy["enabled"] and due_through > passed)
-        next_due = (
-            ((passed // interval) + 1) * interval if policy["enabled"] else None
-        )
+        if policy["enabled"]:
+            if passed < first:
+                next_due = first
+            else:
+                next_due = first + ((passed - first) // interval + 1) * interval
+        else:
+            next_due = None
     latest_nonpassing = None
     for report in sorted(reports, key=lambda item: item["chapter_through"], reverse=True):
         if report["decision"] != "pass" and report["chapter_through"] >= due_through:
@@ -1127,6 +1157,23 @@ def _configure_policy(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "short_story completion review uses interval 1 because the project "
             "contains one complete manuscript unit"
         )
+    first_arg = getattr(args, "first_review_chapter", None)
+    first_review = (
+        first_arg
+        if first_arg is not None
+        else min(before["first_review_chapter"], interval)
+    )
+    if (
+        not isinstance(first_review, int)
+        or isinstance(first_review, bool)
+        or first_review < MIN_INTERVAL
+        or first_review > MAX_INTERVAL
+    ):
+        raise ReviewError(
+            f"--first-review-chapter must be from {MIN_INTERVAL} to {MAX_INTERVAL}"
+        )
+    if first_review > interval:
+        raise ReviewError("--first-review-chapter must not exceed --interval")
     enabled = before["enabled"] if args.enabled is None else parse_bool(args.enabled, "--enabled")
     block = (
         before["block_next_commit"]
@@ -1138,6 +1185,7 @@ def _configure_policy(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     updated["periodic_review"] = {
         "enabled": enabled,
         "interval_chapters": interval,
+        "first_review_chapter": first_review,
         "block_next_commit": block,
     }
     updated["updated_at"] = utc_now()
@@ -1231,6 +1279,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     configure_parser.add_argument("root", help="Project directory.")
     configure_parser.add_argument("--interval", type=int)
+    configure_parser.add_argument("--first-review-chapter", type=int)
     configure_parser.add_argument("--enabled", choices=("true", "false"))
     configure_parser.add_argument(
         "--block-next-commit", choices=("true", "false")

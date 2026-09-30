@@ -108,6 +108,17 @@ class ContinuityGateTests(unittest.TestCase):
         )
         return result
 
+    def pin_first_review(self, root: Path, chapter: int = 5) -> None:
+        """Tests that commit past chapter 3 hold the legacy ch5 checkpoint."""
+        manifest = read_json(root / "novel.json")
+        manifest["periodic_review"]["first_review_chapter"] = chapter
+        write_json(root / "novel.json", manifest)
+        seal_full_baseline(
+            root,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
+
     def write_originality_plan(self, root: Path) -> None:
         plan = {
             "schema_version": 1,
@@ -636,6 +647,7 @@ class ContinuityGateTests(unittest.TestCase):
 
     def test_fifth_chapter_blocks_next_context_and_delivery_until_global_review(self) -> None:
         root = self.init_project("five-chapter-gate")
+        self.pin_first_review(root)
         for number in range(1, 6):
             package = self.stage_chapter(root, number)
             self.commit(root, package)
@@ -673,6 +685,7 @@ class ContinuityGateTests(unittest.TestCase):
         """One policy switch must never block commits while allowing delivery."""
 
         root = self.init_project("review-opt-out")
+        self.pin_first_review(root)
         for number in range(1, 6):
             package = self.stage_chapter(root, number)
             self.commit(root, package)

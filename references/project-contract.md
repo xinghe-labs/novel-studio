@@ -140,13 +140,14 @@ python -X utf8 .\scripts\novel_export.py status "<project-root>"
   "periodic_review": {
     "enabled": true,
     "interval_chapters": 5,
+    "first_review_chapter": 3,
     "block_next_commit": true
   },
   "updated_at": "ISO-8601 时间"
 }
 ```
 
-上例是原有长篇清单结构。短故事在此基础上显式增加 `"work_type": "short_story"`，并把默认审核间隔设为 1；不得为了统一格式给旧长篇批量补字段。
+上例是原有长篇清单结构。短故事在此基础上显式增加 `"work_type": "short_story"`，并把默认审核间隔设为 1；不得为了统一格式给旧长篇批量补字段。新项目脚手架另写 `first_review_chapter: 3`（首检提前到第 3 章做开篇专项审核，见 [periodic-review.md](periodic-review.md)）；旧项目缺少该字段时首检等于 `interval_chapters`，行为不变、不必补。
 
 正文、锁定故事圣经和连续性事实账本共同组成内容真源。章节索引、长期记忆卡与 `.novel-cache/novel-memory.sqlite3` 是检索读模型，不得反过来覆盖原文。`continuity/head.json` 用哈希封存当前正典，不能作为人工修改正典的替代入口。SQLite 损坏、缺失或过期时从文件重建。不要把整个小说塞入 JSON，也不要把推断写成确认事实。
 
