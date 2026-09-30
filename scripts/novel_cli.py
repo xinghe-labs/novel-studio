@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 
-TOOL_VERSION = "2.6.1"
+TOOL_VERSION = "2.7.0"
 
 
 class CliUsageError(RuntimeError):
@@ -303,3 +303,30 @@ def run_cli(
     if not emit_json(result):
         return 3
     return code
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by CLI smoke tests
+    # ``novel_cli`` is a shared library, not a tool.  Running it directly used
+    # to exit 0 with no output, which silently broke the one-JSON-document
+    # contract every caller relies on.  Report the boundary instead.
+    configure_utf8_streams()
+    sys.stdout.write(
+        json.dumps(
+            {
+                "status": "error",
+                "error": (
+                    "novel_cli.py is a shared library without a command line; "
+                    "run one of the tool entry points instead "
+                    "(novel_workspace.py, novel_project.py, novel_continuity.py, "
+                    "novel_review.py, novel_export.py, novel_memory.py, "
+                    "novel_originality.py, novel_research.py)"
+                ),
+                "error_type": "usage",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n"
+    )
+    sys.stdout.flush()
+    raise SystemExit(2)

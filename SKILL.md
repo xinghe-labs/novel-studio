@@ -8,7 +8,7 @@ metadata:
 
 # 小说工作室
 
-这是入口路由，不是全部操作手册。当前工具版本为 `2.6.1`，要求 Python 3.10+，只使用标准库。
+这是入口路由，不是全部操作手册。当前工具版本为 `2.7.0`，要求 Python 3.10+，只使用标准库。
 
 模块正常加载并进入 `scripts/novel_cli.py` 的 `run_cli` 后，除 `--help` 外向 stdout 输出单个 JSON 文档；业务命令的 `status`/`decision` 随命令而异，退出码 1 表示业务门禁未通过，参数或领域错误为 2，未预期异常与序列化失败为 3。`--version` 才固定返回 `status: ok`、`tool` 和 `version`。模块加载失败发生在该运行时契约之前，可能由 Python 直接输出 traceback 并返回退出码 1。详细字段见 [schemas-and-cli.md](references/schemas-and-cli.md)。
 
@@ -83,6 +83,8 @@ python -X utf8 .\scripts\novel_review.py status "<project-root>"
 
 原创性审计同时检查措辞重合和结构映射，不能用一个百分比代替证据。单一来源主导、独特场面或因果链高风险时必须重构或请求作者裁决。
 
+脚本只能校验自然化与独立审稿的**结构**证据：`humanization-review.json` 的字段形状、`skill` 字段为 `humanizer-zh`、以及源文与结果的 SHA-256 绑定；独立审稿只验证 `mode: independent`、`independent_context: true` 和 `reviewer_id` 非空。它无法证明人类化步骤真的执行过，也无法证明审稿者真的处于独立上下文——这两项是**对使用者的行为要求**，不是脚本可强制的事实。不得把"校验通过"表述为"已确认人工去过 AI 味"或"已确认独立审稿"。边界说明见 [controlled-automation.md](references/controlled-automation.md)。
+
 ## 按任务加载参考
 
 下表是参考文件路由的唯一索引；各参考中的交叉链接只补充局部前置条件，不另行定义一套模式映射。
@@ -92,6 +94,7 @@ python -X utf8 .\scripts\novel_review.py status "<project-root>"
 | 互动建书/框架确认 | [interactive-planning.md](references/interactive-planning.md)、[planning.md](references/planning.md)、[controlled-automation.md](references/controlled-automation.md) |
 | 市场研究/来源登记 | [market-research.md](references/market-research.md)、[platform-adapters.md](references/platform-adapters.md)、[source-ingestion.md](references/source-ingestion.md) |
 | 新建或升级项目 | [project-contract.md](references/project-contract.md) |
+| 工作隔离与单写者租约 | [workspace-isolation.md](references/workspace-isolation.md) |
 | 写作/续写/记忆检索 | [drafting.md](references/drafting.md)、[long-term-memory.md](references/long-term-memory.md)、[continuity.md](references/continuity.md) |
 | 正典暂存与提交 | [commit-protocol.md](references/commit-protocol.md)、[controlled-automation.md](references/controlled-automation.md)、[schemas-and-cli.md](references/schemas-and-cli.md) |
 | 原创性审计 | [originality-audit.md](references/originality-audit.md) |

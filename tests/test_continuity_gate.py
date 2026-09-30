@@ -19,6 +19,7 @@ import novel_cli  # noqa: E402
 import novel_export  # noqa: E402
 import novel_originality  # noqa: E402
 import novel_project  # noqa: E402
+import novel_review  # noqa: E402
 import novel_workspace  # noqa: E402
 from continuity_test_utils import (  # noqa: E402
     complete_staged_continuity,
@@ -667,6 +668,45 @@ class ContinuityGateTests(unittest.TestCase):
             novel_export.export_project(
                 SimpleNamespace(root=str(root), format=["txt"], force=False)
             )
+
+    def test_review_block_opt_out_is_honored_by_commit_and_export_alike(self) -> None:
+        """One policy switch must never block commits while allowing delivery."""
+
+        root = self.init_project("review-opt-out")
+        for number in range(1, 6):
+            package = self.stage_chapter(root, number)
+            self.commit(root, package)
+        seal_full_baseline(
+            root,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
+        with self.assertRaisesRegex(novel_export.ExportError, "periodic quality review"):
+            novel_export.export_project(
+                SimpleNamespace(root=str(root), format=["txt"], force=False)
+            )
+
+        manifest = read_json(root / "novel.json")
+        manifest["periodic_review"]["block_next_commit"] = False
+        write_json(root / "novel.json", manifest)
+        seal_full_baseline(
+            root,
+            workspace=self.workspace,
+            work_id=self.work_contexts[root.resolve()],
+        )
+
+        status = novel_review.review_status(root)
+        self.assertTrue(status["review_due"])
+        self.assertFalse(status["commit_blocked"])
+        self.assertTrue(
+            any("block_next_commit is false" in item for item in status["warnings"])
+        )
+        exported = novel_export.export_project(
+            SimpleNamespace(root=str(root), format=["txt"], force=False)
+        )
+        self.assertEqual(exported["status"], "exported")
+        self.assertTrue(exported["review_warnings"])
+        self.assertIn("block_next_commit is false", exported["review_warnings"][0])
 
     def test_prepare_context_writes_only_outside_project_tree(self) -> None:
         root = self.init_project("context-output-boundary")

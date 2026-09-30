@@ -43,6 +43,7 @@ HASH_EXCLUDED_PARTS = frozenset(
         ".git",
         ".novel-cache",
         ".novel-transaction",
+        ".novel-transaction-conflicts",
         ".novel-upgrade-transaction",
         ".novel-export.lock",
         ".novel-export-journal.json",
@@ -826,6 +827,16 @@ def create_schema(connection: sqlite3.Connection) -> None:
             project_root TEXT NOT NULL UNIQUE,
             reserved_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS transaction_conflicts (
+            conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT,
+            project_root TEXT NOT NULL,
+            conflict_path TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE (project_root, conflict_path)
+        );
         """
     )
     # Additive migration for registries created by schema revision 1.  The
@@ -984,6 +995,81 @@ def open_registry(root: Path, *, synchronize: bool = True) -> sqlite3.Connection
         # undeletable after this function fails closed.
         connection.close()
         raise
+
+
+def sync_transaction_conflicts(
+    connection: sqlite3.Connection, project_root: str | Path
+) -> int:
+    """Index a project's on-disk quarantine records into the registry.
+
+    The conflict directory and its ``conflict.json`` files are the durable
+    evidence; this table is a rebuildable index of them.  The caller passes the
+    registry connection it already holds (recovery normally runs inside an open
+    write transaction), so nothing here can stall on a busy registry or lose a
+    row to a nested-connection timeout.  Re-running is idempotent.
+    """
+
+    project = Path(project_root).expanduser().resolve()
+    if "transaction_conflicts" not in _registry_table_names(connection):
+        return 0
+    row = connection.execute(
+        "SELECT project_id FROM projects WHERE project_root = ?", (str(project),)
+    ).fetchone()
+    project_id = row["project_id"] if row is not None else None
+    recorded = 0
+    for item in novel_project.load_transaction_conflicts(project):
+        conflict_path = str(item.get("path", ""))
+        if not conflict_path:
+            continue
+        connection.execute(
+            """
+            INSERT INTO transaction_conflicts(
+                project_id, project_root, conflict_path, reason, detected_at, recorded_at
+            ) VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_root, conflict_path) DO UPDATE SET
+                project_id = excluded.project_id,
+                reason = excluded.reason,
+                detected_at = excluded.detected_at,
+                recorded_at = excluded.recorded_at
+            """,
+            (
+                project_id,
+                str(project),
+                conflict_path,
+                str(item.get("reason", "")),
+                str(item.get("detected_at") or ""),
+                utc_now(),
+            ),
+        )
+        recorded += 1
+    return recorded
+
+
+def transaction_conflicts(project_root: str | Path) -> list[dict[str, Any]]:
+    """Return recorded transaction conflicts for a project, newest last."""
+
+    project = Path(project_root).expanduser().resolve()
+    candidate = _workspace_candidate_for_project(project)
+    if candidate is None:
+        return []
+    root = require_workspace(candidate)
+    if not (root / "registry.sqlite3").is_file():
+        return []
+    connection = open_read_only_registry(root / "registry.sqlite3")
+    try:
+        if "transaction_conflicts" not in _registry_table_names(connection):
+            return []
+        rows = connection.execute(
+            """
+            SELECT project_root, conflict_path, reason, detected_at
+            FROM transaction_conflicts WHERE project_root = ?
+            ORDER BY conflict_id
+            """,
+            (str(project),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        connection.close()
 
 
 def project_state_hash(
@@ -1779,7 +1865,15 @@ def lease_status(owner: sqlite3.Row, *, now: datetime | None = None) -> dict[str
         "heartbeat_enforced": lease_heartbeat_enforced(owner),
         "heartbeat_age_seconds": max(0, int((current - heartbeat).total_seconds())),
         "expires_in_seconds": int((expires - current).total_seconds()),
+        # ``expires_at`` alone overstates how long a lease can actually be held
+        # once the enforced heartbeat deadline is the binding limit.  Report the
+        # effective value so a stale-owner reclaim is never a surprise.
         "live_until": live_until.replace(microsecond=0).isoformat(),
+        "live_in_seconds": int((live_until - current).total_seconds()),
+        "limited_by": (
+            "heartbeat" if lease_heartbeat_enforced(owner) and live_until < expires
+            else "expires_at"
+        ),
         "live": live_until > current,
     }
 
@@ -1871,6 +1965,9 @@ def acquire_lock(
             novel_project.recover_pending_transactions(project["project_root"])
         except novel_project.ProjectError as exc:
             raise WorkspaceError(f"Unable to recover the project transaction: {exc}") from exc
+        # Index any quarantine records recovery just produced, using the
+        # registry transaction already open here.
+        sync_transaction_conflicts(connection, project["project_root"])
         current_hash, hash_version, hash_error = safe_match_project_state_hash(
             project["project_root"], work["base_state_hash"]
         )
@@ -1914,6 +2011,10 @@ def acquire_lock(
                 state_hash_error=hash_error,
             )
         connection.commit()
+        heartbeat_live_until = now_dt + timedelta(
+            seconds=min(HEARTBEAT_GRACE_SECONDS, lease_seconds)
+        )
+        parsed_expires = parse_timestamp(expires)
         return {
             "status": status,
             "project_id": work["project_id"],
@@ -1921,6 +2022,13 @@ def acquire_lock(
             "expires_at": expires,
             "heartbeat_at": now,
             "lease_seconds": lease_seconds,
+            # The enforced heartbeat deadline can be earlier than expires_at;
+            # report the binding value so callers do not plan around the
+            # larger, unenforceable one.
+            "live_until": min(parsed_expires, heartbeat_live_until).replace(
+                microsecond=0
+            ).isoformat(),
+            "heartbeat_grace_seconds": min(HEARTBEAT_GRACE_SECONDS, lease_seconds),
             "base_state_hash": work["base_state_hash"],
             "current_state_hash": current_hash,
             "state_matches": hash_version is not None,
@@ -2048,6 +2156,7 @@ def write_check(raw_workspace: str | Path, work_id: str) -> dict[str, Any]:
             novel_project.recover_pending_transactions(project["project_root"])
         except novel_project.ProjectError as exc:
             raise WorkspaceError(f"Unable to recover the project transaction: {exc}") from exc
+        sync_transaction_conflicts(connection, project["project_root"])
         try:
             current_hash, hash_version = match_project_state_hash(
                 project["project_root"], work["base_state_hash"]
@@ -2117,6 +2226,7 @@ def write_guard(
             upgrade_recovery = novel_project.recover_pending_upgrade(project_root)
         except novel_project.ProjectError as exc:
             raise WorkspaceError(f"Unable to recover the project transaction: {exc}") from exc
+        sync_transaction_conflicts(connection, project_root)
         if upgrade_recovery:
             recovered_hash = project_state_hash(project_root)
             connection.execute(
@@ -2541,6 +2651,88 @@ def _doctor_check(
     checks.append({"name": name, "status": status, "detail": detail, **extra})
 
 
+def _doctor_transaction_state(checks: list[dict[str, Any]], root: Path) -> None:
+    """Report pending and quarantined project transactions without writing.
+
+    An incomplete transaction is recovered by the next controlled operation, so
+    it is a warning rather than a failure.  A quarantined conflict is durable
+    evidence that a transaction diverged from the bytes on disk; it never blocks
+    work by itself, but it must be visible, because it is the one condition
+    that used to make a project unusable while ``doctor`` still reported pass.
+    """
+
+    registry = root / "registry.sqlite3"
+    try:
+        connection = open_read_only_registry(registry)
+        try:
+            rows = connection.execute(
+                "SELECT project_root FROM projects"
+            ).fetchall()
+        finally:
+            connection.close()
+    except Exception as exc:
+        _doctor_check(
+            checks,
+            "transactions",
+            "warning",
+            f"Unable to inspect project transactions: {exc}",
+            error_type=type(exc).__name__,
+        )
+        return
+
+    pending: list[str] = []
+    conflicts: list[dict[str, Any]] = []
+    unreadable: list[str] = []
+    for row in rows:
+        project = Path(row["project_root"])
+        transaction_root = project / novel_project.TRANSACTION_DIRNAME
+        try:
+            if transaction_root.is_dir() and any(transaction_root.iterdir()):
+                pending.append(str(project))
+        except OSError as exc:
+            unreadable.append(f"{project}: {exc}")
+            continue
+        try:
+            conflicts.extend(novel_project.load_transaction_conflicts(project))
+        except Exception as exc:
+            unreadable.append(f"{project}: {exc}")
+
+    if pending:
+        _doctor_check(
+            checks,
+            "transactions",
+            "warning",
+            "Incomplete project transactions will be recovered by the next "
+            "controlled operation: " + ", ".join(sorted(pending)),
+            projects=sorted(pending),
+        )
+    if conflicts:
+        _doctor_check(
+            checks,
+            "transaction-conflicts",
+            "warning",
+            "Quarantined transaction conflicts need review before the affected "
+            "chapters are trusted; evidence is kept under "
+            f"{novel_project.CONFLICT_DIRNAME}/: "
+            + ", ".join(str(item.get("path", "")) for item in conflicts),
+            conflicts=conflicts,
+        )
+    if unreadable:
+        _doctor_check(
+            checks,
+            "transactions",
+            "warning",
+            "Unable to inspect some project transactions: " + "; ".join(unreadable),
+        )
+    if not pending and not conflicts and not unreadable:
+        _doctor_check(
+            checks,
+            "transactions",
+            "pass",
+            "No pending or quarantined project transactions",
+        )
+
+
 def open_read_only_registry(registry: Path) -> sqlite3.Connection:
     """Open a registry without writes while still honoring an active WAL.
 
@@ -2874,6 +3066,8 @@ def doctor(raw_workspace: str | Path | None = None) -> dict[str, Any]:
                 str(exc),
                 error_type=type(exc).__name__,
             )
+        else:
+            _doctor_transaction_state(checks, root)
 
     failures = [check for check in checks if check["status"] == "fail"]
     warnings = [check for check in checks if check["status"] == "warning"]

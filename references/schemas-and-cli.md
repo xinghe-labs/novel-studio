@@ -10,7 +10,7 @@
 {
   "status": "ok",
   "tool": "novel_project",
-  "version": "2.5.1"
+  "version": "<TOOL_VERSION>"
 }
 ```
 

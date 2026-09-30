@@ -672,6 +672,29 @@ def _validate_registration_metadata(
             )
 
 
+def _project_relative_path(root: Path, target: Path) -> str:
+    """Return a project-relative POSIX path for a registered source.
+
+    ``root`` is whatever spelling the caller passed, while ``target`` is
+    usually resolved.  On Windows the same directory can have several spellings
+    (8.3 short names such as ``RUNNER~1``, trailing dots), and comparing a
+    resolved child against an unresolved root raised a bare ``ValueError``
+    instead of registering the source.  Fall back to canonical forms rather
+    than letting one spelling of the same directory look like a foreign path.
+    """
+
+    try:
+        return target.relative_to(root).as_posix()
+    except ValueError:
+        resolved_root = Path(root).resolve()
+        resolved_target = Path(target).resolve()
+        if not is_within(resolved_target, resolved_root):
+            raise ResearchError(
+                f"Registered source is outside the project root: {target}"
+            ) from None
+        return resolved_target.relative_to(resolved_root).as_posix()
+
+
 def _source_record(
     root: Path,
     target: Path,
@@ -690,7 +713,7 @@ def _source_record(
     originality_compare: bool,
     provenance_note: str,
 ) -> dict[str, Any]:
-    relative_path = target.relative_to(root).as_posix()
+    relative_path = _project_relative_path(root, target)
     digest = hashlib.sha256(content).hexdigest()
     return {
         "schema_version": SCHEMA_VERSION,

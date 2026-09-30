@@ -32,6 +32,8 @@
 python -X utf8 .\scripts\novel_review.py configure "<project-root>" --interval 5 --enabled true --block-next-commit true --authorization-reference "作者确认每五章审核一次" --workspace "<workspace-root>" --work-id "<work-id>"
 ```
 
+`block_next_commit: false` 是唯一一处"审核到期但不阻断"的开关，它对**提交和导出同时生效**：两条路径都读取同一判据（`novel_review.review_gate()`），因此不会出现"能提交却永远无法导出"的分歧。关闭后到期审核不阻断，但 `review_status`、`commit-chapter` 的 `warnings` 与 `export` 的 `review_warnings` 都会显式记录该状态；审核报告本身仍然照常要求，`validate` 仍返回到期警告。关闭开关只适合作者明确知情后短期使用，不能用来让未审核的正典进入正式交付。
+
 ## 质量审核范围
 
 每次必须覆盖以下九个维度，字段名与脚本一致：

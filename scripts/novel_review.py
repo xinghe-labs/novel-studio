@@ -739,8 +739,9 @@ def review_status(root: str | Path) -> dict[str, Any]:
         "commit_blocked": bool(due and policy["block_next_commit"]),
         "latest_nonpassing_review": latest_nonpassing,
         "valid_report_count": len(reports),
-        "warnings": warnings,
+        "warnings": list(warnings),
     }
+    result["warnings"] = result["warnings"] + review_gate(result)["warnings"]
     if work_type == "short_story":
         result.update({"work_type": work_type, "review_mode": identity["mode"]})
     return result
@@ -762,6 +763,33 @@ def ensure_commit_allowed(root: str | Path, next_chapter: int) -> dict[str, Any]
             "record a passing report, then retry"
         )
     return status
+
+
+REVIEW_BLOCK_DISABLED_WARNING = (
+    "periodic_review.block_next_commit is false: the due independent quality "
+    "review is recorded but does not stop canonical commits or formal exports"
+)
+
+
+def review_gate(status: dict[str, Any]) -> dict[str, Any]:
+    """Return the one commit/export gate decision derived from a review status.
+
+    Both ``commit-chapter`` and ``export`` must consult this single predicate.
+    Blocking on a bare ``review_due`` in one path and on
+    ``periodic_review.block_next_commit`` in the other let a project that opted
+    out of the block commit chapters that could never be exported.
+    """
+
+    policy = status.get("policy") or {}
+    due = bool(status.get("review_due"))
+    blocking = bool(due and policy.get("block_next_commit", True))
+    policy_disables_block = bool(due and not blocking)
+    return {
+        "review_due": due,
+        "blocking": blocking,
+        "policy_disables_block": policy_disables_block,
+        "warnings": [REVIEW_BLOCK_DISABLED_WARNING] if policy_disables_block else [],
+    }
 
 
 def prepare_review(args: argparse.Namespace) -> dict[str, Any]:

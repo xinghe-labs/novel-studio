@@ -39,15 +39,24 @@ jobs:
             experimental: false
           - os: windows-latest
             python: "3.13"
-            # Known environment-specific failure, under investigation.
-            # canonical_snapshot raises "Canonical source is missing or out of
-            # scope: continuity/canon-facts.jsonl" for fixture projects that
-            # live under the runner's temp directory. Reproduces only on the
-            # GitHub Windows runner: the same suite passes on Windows 3.11
-            # locally and on every Linux job, and the affected checks behave
-            # correctly when probed against real junctions on this machine.
+            # This entry does not gate the workflow: `continue-on-error` below
+            # makes the whole Windows job non-blocking, so its failures stay
+            # visible without failing CI. Kept that way only while the cause
+            # below is being eliminated.
+            # Known environment-specific failure. The runner's %TEMP% carries an
+            # 8.3 short name (RUNNER~1), so fixture projects get a non-canonical
+            # root spelling while product code holds resolved paths. That made
+            # canonical_snapshot raise "Canonical source is missing or out of
+            # scope: continuity/canon-facts.jsonl"; the scope check and
+            # novel_research source registration now compare canonical forms,
+            # but several remaining checks still compare raw spellings (test
+            # fixtures that inject failures by matching exact paths, and a few
+            # resolved-vs-raw comparisons). The same suite passes on Windows
+            # 3.11 locally and on every Linux job, and the affected checks
+            # behave correctly when probed against real junctions.
             # Kept in the matrix so the signal stays visible rather than being
-            # deleted; not allowed to fail the workflow until it is understood.
+            # deleted; not allowed to fail the workflow until that class of
+            # mixed-spelling comparison is gone.
             experimental: true
 
     continue-on-error: ${{ matrix.experimental == true }}
@@ -76,6 +85,9 @@ jobs:
 
       - name: Verify CLI version contract
         run: python -X utf8 scripts/novel_workspace.py --version
+
+      - name: Verify README statistics
+        run: python -X utf8 ci/check_doc_stats.py
 
       - name: Run test suite
         run: python -X utf8 -m unittest discover -s tests -t tests

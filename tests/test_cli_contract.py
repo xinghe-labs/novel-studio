@@ -134,7 +134,6 @@ class CliContractTests(unittest.TestCase):
 
     def test_every_tool_exposes_json_version_and_usage_errors(self) -> None:
         scripts = (
-            "novel_cli.py",
             "novel_continuity.py",
             "novel_export.py",
             "novel_memory.py",
@@ -144,10 +143,17 @@ class CliContractTests(unittest.TestCase):
             "novel_review.py",
             "novel_workspace.py",
         )
-        # novel_cli.py is a shared module rather than an executable command, so
-        # only assert its importability here.
-        self.assertEqual(self.run_script("novel_cli.py").returncode, 0)
-        for script in scripts[1:]:
+        # novel_cli.py is a shared module rather than an executable command.
+        # Running it directly must still honor the one-JSON-document contract
+        # instead of exiting 0 with no output.
+        direct = self.run_script("novel_cli.py")
+        self.assertEqual(direct.returncode, 2)
+        self.assertEqual(direct.stderr, b"")
+        boundary = json.loads(direct.stdout.decode("utf-8"))
+        self.assertEqual(boundary["status"], "error")
+        self.assertEqual(boundary["error_type"], "usage")
+        self.assertIn("shared library", boundary["error"])
+        for script in scripts:
             version = self.run_script(script, "--version")
             self.assertEqual(version.returncode, 0, version.stderr.decode())
             payload = json.loads(version.stdout.decode("utf-8"))
@@ -160,6 +166,37 @@ class CliContractTests(unittest.TestCase):
             self.assertEqual(error["status"], "error")
             self.assertEqual(error["error_type"], "usage")
             self.assertEqual(invalid.stderr, b"")
+
+    def test_install_force_preserves_the_replaced_directory(self) -> None:
+        """--force must not silently destroy content this installer did not create."""
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            foreign = root / "novel-studio"
+            foreign.mkdir()
+            (foreign / "keep-me.txt").write_text("do not delete", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8",
+                    str(SKILL_ROOT / "install.py"),
+                    "--root",
+                    str(root),
+                    "--force",
+                ],
+                capture_output=True,
+            )
+            self.assertEqual(
+                result.returncode, 0, result.stderr.decode(errors="replace")
+            )
+            preserved = list(root.glob("novel-studio-replaced-*"))
+            self.assertEqual(len(preserved), 1, result.stdout.decode(errors="replace"))
+            self.assertEqual(
+                (preserved[0] / "keep-me.txt").read_text(encoding="utf-8"),
+                "do not delete",
+            )
+            self.assertTrue((root / "novel-studio" / "SKILL.md").is_file())
 
     def test_cp936_environment_still_receives_utf8_json(self) -> None:
         result = self.run_script(
@@ -334,6 +371,163 @@ class LeaseAndDoctorTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def test_acquire_lock_reports_the_binding_lease_deadline(self) -> None:
+        """A lease reports when it actually becomes reclaimable."""
+
+        short = novel_workspace.acquire_lock(
+            self.workspace, self.work_id, lease_seconds=300
+        )
+        self.assertEqual(short["heartbeat_grace_seconds"], 300)
+        self.assertEqual(short["live_until"], short["expires_at"])
+
+        long_lease = novel_workspace.acquire_lock(
+            self.workspace, self.work_id, lease_seconds=1800
+        )
+        self.assertEqual(long_lease["status"], "renewed")
+        self.assertEqual(long_lease["heartbeat_grace_seconds"], 300)
+        self.assertLess(long_lease["live_until"], long_lease["expires_at"])
+
+        status = novel_workspace.workspace_status(self.workspace)["leases"][0][
+            "lease_status"
+        ]
+        self.assertEqual(status["limited_by"], "heartbeat")
+        self.assertTrue(status["live"])
+        self.assertLess(status["live_in_seconds"], status["expires_in_seconds"])
+
+    def test_doctor_reports_pending_and_quarantined_transactions(self) -> None:
+        """doctor must never report pass while a project cannot be written."""
+
+        pending = self.project_root / novel_project.TRANSACTION_DIRNAME / "crashed"
+        pending.mkdir(parents=True)
+        (pending / "backup-0000.bin").write_bytes(b"OLD")
+
+        doctor = novel_workspace.doctor(self.workspace)
+        self.assertEqual(doctor["status"], "warning")
+        checks = {check["name"]: check for check in doctor["checks"]}
+        self.assertEqual(checks["transactions"]["status"], "warning")
+        self.assertIn("Incomplete project transactions", checks["transactions"]["detail"])
+
+        # Recovery clears the condition without manual deletion.
+        recovered = novel_project.recover_pending_transactions(self.project_root)
+        self.assertTrue(any("discarded unjournaled transaction" in item for item in recovered))
+        self.assertEqual(novel_workspace.doctor(self.workspace)["status"], "pass")
+
+        # A divergent committed transaction leaves durable, visible evidence.
+        target = self.project_root / "continuity/state.json"
+        transaction_dir = (
+            self.project_root / novel_project.TRANSACTION_DIRNAME / "diverged"
+        )
+        transaction_dir.mkdir(parents=True)
+        (transaction_dir / "journal.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": novel_project.TRANSACTION_SCHEMA_VERSION,
+                    "status": "committed",
+                    "project_root": str(self.project_root),
+                    "created_at": "2026-09-12T00:00:00+00:00",
+                    "files": [
+                        {
+                            "target": "continuity/state.json",
+                            "prior_exists": True,
+                            "prior_sha256": novel_project.sha256_bytes(b"OLD"),
+                            "new_sha256": novel_project.sha256_bytes(b"EXPECTED"),
+                            "backup": "backup-0000.bin",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        recovered = novel_project.recover_pending_transactions(self.project_root)
+        self.assertTrue(
+            any("quarantined divergent transaction" in item for item in recovered)
+        )
+        conflicts = novel_project.load_transaction_conflicts(self.project_root)
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("changed before cleanup", conflicts[0]["reason"])
+        self.assertIn("continuity/state.json", conflicts[0]["details"])
+
+        doctor = novel_workspace.doctor(self.workspace)
+        self.assertEqual(doctor["status"], "warning")
+        checks = {check["name"]: check for check in doctor["checks"]}
+        self.assertIn("transaction-conflicts", checks)
+        self.assertEqual(checks["transaction-conflicts"]["status"], "warning")
+        self.assertIn(
+            novel_project.CONFLICT_DIRNAME, checks["transaction-conflicts"]["detail"]
+        )
+        # The conflict is inert: it is reported, not fatal.
+        errors, warnings = novel_project.collect_validation(self.project_root)
+        self.assertEqual(errors, [])
+        self.assertTrue(
+            any("Quarantined transaction conflict" in item for item in warnings)
+        )
+        self.assertTrue(target.is_file())
+
+    def test_lock_acquisition_indexes_a_quarantined_conflict(self) -> None:
+        """Recovery must not lose the audit row to the open registry transaction.
+
+        Recovery runs inside ``BEGIN IMMEDIATE``; writing the index from a
+        second connection stalled on the busy timeout and dropped the row
+        silently.  The index is now refreshed on the connection the caller
+        already holds.
+        """
+
+        transaction_dir = (
+            self.project_root / novel_project.TRANSACTION_DIRNAME / "diverged"
+        )
+        transaction_dir.mkdir(parents=True)
+        (transaction_dir / "journal.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": novel_project.TRANSACTION_SCHEMA_VERSION,
+                    "status": "committed",
+                    "project_root": str(self.project_root),
+                    "created_at": "2026-09-12T00:00:00+00:00",
+                    "files": [
+                        {
+                            "target": "continuity/state.json",
+                            "prior_exists": True,
+                            "prior_sha256": novel_project.sha256_bytes(b"OLD"),
+                            "new_sha256": novel_project.sha256_bytes(b"EXPECTED"),
+                            "backup": "backup-0000.bin",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # The workspace path is the one that holds the registry transaction.
+        acquired = novel_workspace.acquire_lock(
+            self.workspace, self.work_id, lease_seconds=300
+        )
+        self.assertEqual(acquired["status"], "renewed")
+
+        indexed = novel_workspace.transaction_conflicts(self.project_root)
+        self.assertEqual(len(indexed), 1)
+        self.assertIn("changed before cleanup", indexed[0]["reason"])
+        self.assertIn(
+            novel_project.CONFLICT_DIRNAME, indexed[0]["conflict_path"]
+        )
+        self.assertEqual(
+            len(novel_project.load_transaction_conflicts(self.project_root)), 1
+        )
+        # Idempotent: re-indexing the same evidence keeps one row.
+        connection = novel_workspace.open_registry(self.workspace)
+        try:
+            self.assertEqual(
+                novel_workspace.sync_transaction_conflicts(
+                    connection, self.project_root
+                ),
+                1,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertEqual(
+            len(novel_workspace.transaction_conflicts(self.project_root)), 1
+        )
 
     def test_explicit_renew_updates_heartbeat_and_status(self) -> None:
         before = novel_workspace.workspace_status(self.workspace)["leases"][0]

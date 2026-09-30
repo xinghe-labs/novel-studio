@@ -13,6 +13,7 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 
 import novel_project  # noqa: E402
+import novel_workspace  # noqa: E402
 
 
 class TransactionalWriteTests(unittest.TestCase):
@@ -199,7 +200,7 @@ class TransactionalWriteTests(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def test_recovery_refuses_unexpected_external_change(self) -> None:
+    def test_recovery_quarantines_unexpected_external_change(self) -> None:
         temp_dir, first, _ = self._targets()
         try:
             transaction_root = first.parent / novel_project.TRANSACTION_DIRNAME
@@ -226,10 +227,18 @@ class TransactionalWriteTests(unittest.TestCase):
                 json.dumps(journal), encoding="utf-8"
             )
             first.write_bytes(b"EXTERNAL")
-            with self.assertRaisesRegex(novel_project.ProjectError, "unexpected change"):
-                novel_project.recover_pending_transactions(first.parent)
+            recovered = novel_project.recover_pending_transactions(first.parent)
+            # Neither the recorded prior bytes nor the recorded new bytes exist
+            # any more, so there is no correct state to restore.  The ambiguous
+            # transaction is quarantined with its evidence instead of blocking
+            # the project forever.
             self.assertEqual(first.read_bytes(), b"EXTERNAL")
-            self.assertTrue(transaction_dir.is_dir())
+            self.assertFalse(transaction_root.exists())
+            self.assertTrue(any("quarantined divergent transaction" in item for item in recovered))
+            conflicts = novel_project.load_transaction_conflicts(first.parent)
+            self.assertEqual(len(conflicts), 1)
+            self.assertIn("unexpected change", conflicts[0]["reason"])
+            self.assertTrue((Path(conflicts[0]["path"]) / "journal.json").is_file())
         finally:
             temp_dir.cleanup()
 
@@ -345,6 +354,33 @@ class TransactionalWriteTests(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
+    def test_prepared_journal_is_written_before_any_backup(self) -> None:
+        """The crash window must always leave a journal that recovery can read."""
+
+        temp_dir, first, second = self._targets()
+        try:
+            real = novel_project._atomic_write_bytes_unpatched
+            order: list[str] = []
+
+            def spy(path, content):  # type: ignore[no-untyped-def]
+                order.append(Path(path).name)
+                return real(path, content)
+
+            with mock.patch.object(
+                novel_project, "_atomic_write_bytes_unpatched", side_effect=spy
+            ):
+                novel_project.transactional_write(
+                    [(first, b"NEW-A"), (second, b"NEW-B")], journal_root=first.parent
+                )
+
+            self.assertIn("backup-0000.bin", order)
+            self.assertLess(
+                order.index("journal.json"), order.index("backup-0000.bin")
+            )
+            self.assertEqual(first.read_bytes(), b"NEW-A")
+        finally:
+            temp_dir.cleanup()
+
     def test_transaction_rejects_duplicate_targets_before_writing(self) -> None:
         temp_dir, first, _ = self._targets()
         try:
@@ -383,7 +419,7 @@ class TransactionalWriteTests(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def test_committed_journal_is_retained_if_target_changed(self) -> None:
+    def test_committed_journal_target_change_is_quarantined_not_fatal(self) -> None:
         temp_dir, first, _ = self._targets()
         try:
             transaction_root = first.parent / novel_project.TRANSACTION_DIRNAME
@@ -409,12 +445,34 @@ class TransactionalWriteTests(unittest.TestCase):
             )
             first.write_bytes(b"EXTERNAL-AFTER-COMMIT")
 
-            with self.assertRaisesRegex(
-                novel_project.ProjectError, "changed before journal cleanup"
-            ):
-                novel_project.recover_pending_transactions(first.parent)
+            recovered = novel_project.recover_pending_transactions(first.parent)
+
+            # A legitimate post-commit edit is the new state; the transaction is
+            # preserved as evidence instead of wedging every later command.
             self.assertEqual(first.read_bytes(), b"EXTERNAL-AFTER-COMMIT")
-            self.assertTrue(transaction_dir.is_dir())
+            self.assertFalse(transaction_root.exists())
+            self.assertTrue(
+                any("quarantined divergent transaction" in item for item in recovered)
+            )
+
+            conflicts = novel_project.load_transaction_conflicts(first.parent)
+            self.assertEqual(len(conflicts), 1)
+            self.assertIn("changed before cleanup", conflicts[0]["reason"])
+            self.assertIn(first.name, conflicts[0]["details"])
+            conflict_dir = Path(conflicts[0]["path"])
+            self.assertTrue((conflict_dir / "journal.json").is_file())
+            self.assertEqual(
+                json.loads((conflict_dir / "journal.json").read_text(encoding="utf-8"))[
+                    "status"
+                ],
+                "committed",
+            )
+
+            # A quarantined conflict is inert: it never blocks the next write.
+            novel_project.transactional_write(
+                [(first, b"LATER-WRITE")], journal_root=first.parent
+            )
+            self.assertEqual(first.read_bytes(), b"LATER-WRITE")
         finally:
             temp_dir.cleanup()
 
@@ -596,8 +654,76 @@ class TransactionalWriteTests(unittest.TestCase):
 
             artifact.unlink()
             recovered = novel_project.recover_pending_transactions(first.parent)
-            self.assertIn("cleaned empty transaction", recovered[0])
+            self.assertIn("discarded unjournaled transaction", recovered[0])
             self.assertFalse(transaction_root.exists())
+        finally:
+            temp_dir.cleanup()
+
+    def test_unjournaled_backup_artifacts_are_discarded(self) -> None:
+        """Reproduce the crash window between the journal and the replacements.
+
+        Before this fix the journal was written after the backups, so a crash in
+        between left a journal-less directory that failed every later command
+        while ``doctor`` still reported pass.  No target can have been replaced
+        at that point, so the artifacts are safe to discard.
+        """
+
+        temp_dir, first, _ = self._targets()
+        try:
+            transaction_root = first.parent / novel_project.TRANSACTION_DIRNAME
+            abandoned = transaction_root / "crashed-cleanup"
+            abandoned.mkdir(parents=True)
+            (abandoned / "backup-0000.bin").write_bytes(first.read_bytes())
+            (abandoned / "backup-0001.bin").write_bytes(b"\xffOLD-B")
+            original = first.read_bytes()
+
+            recovered = novel_project.recover_pending_transactions(first.parent)
+
+            self.assertEqual(first.read_bytes(), original)
+            self.assertFalse(transaction_root.exists())
+            self.assertTrue(any("discarded unjournaled transaction" in item for item in recovered))
+            # Nothing was quarantined: this window never touched a target.
+            self.assertEqual(novel_project.load_transaction_conflicts(first.parent), [])
+        finally:
+            temp_dir.cleanup()
+
+    def test_unjournaled_directory_with_unknown_artifact_still_fails_closed(self) -> None:
+        temp_dir, first, _ = self._targets()
+        try:
+            transaction_root = first.parent / novel_project.TRANSACTION_DIRNAME
+            abandoned = transaction_root / "suspicious"
+            abandoned.mkdir(parents=True)
+            trap = abandoned / "unexpected-state.bin"
+            trap.write_bytes(b"DO-NOT-DELETE")
+
+            with self.assertRaisesRegex(novel_project.ProjectError, "no journal"):
+                novel_project.recover_pending_transactions(first.parent)
+            self.assertEqual(trap.read_bytes(), b"DO-NOT-DELETE")
+            self.assertTrue(abandoned.is_dir())
+        finally:
+            temp_dir.cleanup()
+
+    def test_conflict_directory_is_excluded_from_canonical_state_hash(self) -> None:
+        """Quarantine evidence must not churn the canonical state hash."""
+
+        temp_dir, first, _ = self._targets()
+        try:
+            conflicts = first.parent / novel_project.CONFLICT_DIRNAME
+            conflicts.mkdir()
+            quarantine = conflicts / "20260930T000000Z-crashed"
+            quarantine.mkdir()
+            (quarantine / "journal.json").write_text("{}", encoding="utf-8")
+            (quarantine / "backup-0000.bin").write_bytes(b"OLD")
+
+            self.assertIn(
+                novel_project.CONFLICT_DIRNAME, novel_workspace.HASH_EXCLUDED_PARTS
+            )
+            hashed = novel_workspace._iter_hash_files(
+                first.parent, set(novel_workspace.HASH_EXCLUDED_ROOTS)
+            )
+            self.assertFalse(
+                any(novel_project.CONFLICT_DIRNAME in part for path in hashed for part in path.parts)
+            )
         finally:
             temp_dir.cleanup()
 
@@ -695,6 +821,21 @@ class TransactionalWriteTests(unittest.TestCase):
         finally:
             link.unlink(missing_ok=True)
             temp_dir.cleanup()
+
+
+class StagingSnapshotGuardTests(unittest.TestCase):
+    def test_missing_staging_snapshot_fails_closed(self) -> None:
+        """A commit cannot skip its staged-package re-verification control."""
+
+        for empty in (None, {}, ""):
+            with self.assertRaisesRegex(
+                novel_project.ProjectError, "staging snapshot is unavailable"
+            ):
+                novel_project.assert_staging_snapshot_available(empty)
+        # A real snapshot passes the guard.
+        novel_project.assert_staging_snapshot_available(
+            {"snapshot_package": "somewhere"}
+        )
 
 
 if __name__ == "__main__":

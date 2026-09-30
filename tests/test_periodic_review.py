@@ -18,6 +18,7 @@ import novel_project  # noqa: E402
 import novel_review  # noqa: E402
 import novel_cli  # noqa: E402
 import novel_continuity  # noqa: E402
+import novel_export  # noqa: E402
 import novel_workspace  # noqa: E402
 from continuity_test_utils import refresh_fixture_base, seal_full_baseline  # noqa: E402
 
@@ -506,6 +507,52 @@ class PeriodicReviewTests(unittest.TestCase):
         status = novel_review.review_status(root)
         self.assertTrue(status["review_due"])
         self.assertEqual(status["review_through"], 3)
+
+    def test_export_honors_the_same_gate_predicate_as_commit(self) -> None:
+        """commit-chapter and export must never disagree about the same policy."""
+
+        root = self.init_project()
+        self.seed_chapters(root, 5)
+        default_status = novel_review.review_status(root)
+        self.assertTrue(default_status["commit_blocked"])
+        self.assertTrue(novel_review.review_gate(default_status)["blocking"])
+        self.assertEqual(novel_review.review_gate(default_status)["warnings"], [])
+
+        # A project that opted out of the commit block must also be exportable.
+        novel_review.configure_policy(
+            SimpleNamespace(
+                root=str(root),
+                interval=None,
+                enabled=None,
+                block_next_commit="false",
+                authorization_reference="作者确认本阶段先不阻断提交与导出",
+                workspace=str(self.workspace),
+                work_id=self.work_ids[root.resolve()],
+            )
+        )
+        opted_out = novel_review.review_status(root)
+        self.assertTrue(opted_out["review_due"])
+        self.assertFalse(opted_out["commit_blocked"])
+        gate = novel_review.review_gate(opted_out)
+        self.assertFalse(gate["blocking"])
+        self.assertTrue(gate["policy_disables_block"])
+        self.assertTrue(any("block_next_commit" in item for item in gate["warnings"]))
+        self.assertTrue(
+            any(
+                "block_next_commit is false" in item
+                for item in novel_review.review_status(root)["warnings"]
+            )
+        )
+        # The decision is derived from the same status for both call sites.
+        self.assertFalse(
+            novel_review.review_gate(novel_review.review_status(root))["blocking"]
+        )
+        self.assertTrue(
+            any(
+                "block_next_commit is false" in item
+                for item in novel_review.review_status(root)["warnings"]
+            )
+        )
 
 
 if __name__ == "__main__":

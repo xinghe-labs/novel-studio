@@ -24,7 +24,7 @@ Writing a 100+ chapter novel with an agent is not a "generate text" problem, it 
 
 ## What it does
 
-Nine standard-library CLI tools with a documented JSON contract (plus `install.py`, a plain-text installer that is not part of the contract):
+Eight standard-library CLI tools with a documented JSON contract, plus `novel_cli.py` (their shared runtime library, not a command) and `install.py` (a plain-text installer that is not part of the contract):
 
 | Tool | Commands | Responsibility |
 |---|---|---|
@@ -36,9 +36,10 @@ Nine standard-library CLI tools with a documented JSON contract (plus `install.p
 | `novel_research.py` | `adapters` `collect` `register` `verify` | Source registration, rights scope, access-control boundaries |
 | `novel_memory.py` | `rebuild` `update` `status` `search` | Long-term memory retrieval and index caching |
 | `novel_export.py` | `export` `status` | DOCX / EPUB export with structural verification |
-| `novel_cli.py` | — | Shared CLI contract, atomic file primitives, version source |
+| `novel_cli.py` | — | Shared CLI contract, atomic file primitives, version source (not an executable command) |
 
-**18,583 lines** of runtime Python, **7,348 lines** of tests, and **22 progressive-disclosure reference documents**, with no third-party runtime dependency.
+**19,472 lines of runtime Python**, **8,178 lines of tests**, and **22 progressive-disclosure reference documents**, with no third-party runtime dependency.
+<!-- The three counts above are machine-checked by ci/check_doc_stats.py; run `python -X utf8 ci/check_doc_stats.py --print` for the current values. -->
 
 ## How the pieces fit
 
@@ -76,7 +77,7 @@ python install.py --root "<other-skill-root>"   # explicit target
 python install.py --all        # every detected skill root
 ```
 
-The installer copies only controlled files (export-ignoring `continuity-eval/`), verifies the target directory's identity before atomically replacing an existing install (`--force` for a foreign directory), and finishes by running `--version` and `doctor` on the installed copy; a blocked `doctor` exits the installer with code 1. To update an install, `git pull` in the clone and re-run `python install.py`. The installer prints plain text — it is not part of the JSON CLI contract.
+The installer copies only controlled files (export-ignoring `continuity-eval/`), verifies the target directory's identity before atomically replacing an existing install, and finishes by running `--version` and `doctor` on the installed copy; a blocked `doctor` exits the installer with code 1. Replacing a directory that is not a `novel-studio` install requires `--force`, and that replaced tree is preserved beside the target as `novel-studio-replaced-<UTC timestamp>` rather than deleted. To update an install, `git pull` in the clone and re-run `python install.py`. The installer prints plain text — it is not part of the JSON CLI contract.
 
 ### Run from a clone
 
@@ -105,6 +106,7 @@ There are two ways to use the engine. They share the same CLI and the same contr
 | Interactive planning / framework confirmation | `interactive-planning`, `planning`, `controlled-automation` |
 | Market research / source registration | `market-research`, `platform-adapters`, `source-ingestion` |
 | Create or upgrade a project | `project-contract` |
+| Workspace isolation & single-writer lease | `workspace-isolation` |
 | Drafting / continuation / memory retrieval | `drafting`, `long-term-memory`, `continuity` |
 | Canonical staging & commit | `commit-protocol`, `controlled-automation`, `schemas-and-cli` |
 | Originality audit | `originality-audit` |
@@ -201,13 +203,11 @@ The suite uses only `unittest`, so it needs no test runner and no `pip install`:
 
 ```bash
 python -X utf8 -m unittest discover -s tests -t tests
-# Ran 168 tests in 569s
-# OK (skipped=3)
 ```
 
 Three tests skip when the environment cannot create directory symbolic links; they execute on Linux CI. The suite takes several minutes because the CLI contract is exercised through real subprocess invocations rather than in-process mocks.
 
-CI runs on Linux (Python 3.10, 3.12, 3.13) and Windows (3.13), plus a dedicated job asserting that `doctor` reports `pass` and stays read-only.
+CI gates the workflow on Linux (Python 3.10, 3.12, 3.13) and on a dedicated job asserting that `doctor` reports `pass` and stays read-only. A Windows (Python 3.13) job runs the same suite but is marked `experimental` with `continue-on-error`, so it reports without gating the workflow. Its known environment-specific failure is understood: the runner's `%TEMP%` carries an 8.3 short name (`RUNNER~1`), so fixtures get a non-canonical root spelling while product code holds resolved paths. The scope check and source registration now compare canonical forms; a few remaining checks still compare raw path spellings, so the job stays non-blocking until that class is gone. A temporary diagnostic job traces these failures and is likewise non-blocking.
 
 ## Continuity evaluation benchmark
 

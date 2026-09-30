@@ -40,7 +40,7 @@ python install.py --root "<其他技能根目录>"   # 显式指定目标
 python install.py --all        # 安装到所有检测到的技能根目录
 ```
 
-安装器只复制受控文件（自动排除 `continuity-eval/`），校验目标目录身份后原子替换既有安装（外来目录需 `--force`），装完自动运行 `--version` 与 `doctor` 体检；`doctor` 未通过时安装器以退出码 1 结束。更新安装 = 在克隆目录 `git pull` 后重跑 `python install.py`。安装器输出人类可读文本，不属于 CLI JSON 契约。
+安装器只复制受控文件（自动排除 `continuity-eval/`），校验目标目录身份后原子替换既有安装，装完自动运行 `--version` 与 `doctor` 体检；`doctor` 未通过时安装器以退出码 1 结束。替换非 novel-studio 目录需要 `--force`，被替换的目录不会删除，而是保留在目标旁边（`novel-studio-replaced-<UTC 时间戳>`）并打印路径。更新安装 = 在克隆目录 `git pull` 后重跑 `python install.py`。安装器输出人类可读文本，不属于 CLI JSON 契约。
 
 ### 克隆直跑
 
@@ -138,7 +138,7 @@ python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<proj
 
 ## 命令地图
 
-九个工具的子命令一览（`novel_cli.py` 是共享运行时契约，不提供子命令）：
+八个可执行工具的子命令一览（`novel_cli.py` 是共享运行时契约，不提供子命令，直接运行会返回结构化用法错误）：
 
 | 工具 | 子命令 |
 |---|---|
@@ -166,7 +166,7 @@ python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<proj
 
 ## 版本与 schema
 
-工具版本在 `scripts/novel_cli.py` 的 `TOOL_VERSION` 中维护。当前版本是 `2.6.1`。工作区 JSON 的 `schema_version` 仍为 `1`；2.3.0 对旧注册表采用只增不删的 SQLite 迁移，为租约补充 `lease_seconds`、`heartbeat_enforced` 和 `lease_events`。2.4.0 补写作流程层（风格合同、声音锚点、合同与记忆卡质量字段、humanizer 小说专项模式）；2.5.0 补写作机理内容层（期待感、爽点、对抗阶梯、信息差、中段防塌陷与对照示例）；2.5.1 为审核修补（质量审核纳入写作机理对照、`framework-state` 与 `--adopt-existing` 补文档、质量信号类发布反馈记录）；2.5.2 补记忆缓存边界测试与退出码契约固化测试；2.5.3 为逐行脚本审核修补（缓存锁自愈与 Windows 探活、导出同源哈希、upgrade 排除 .git、非 UTF-8 结构化错误——导出清单哈希公式变化，旧清单需重新导出）；2.6.0 为 SQLite 检索层引入 FTS5 trigram 全文索引与 bm25 排序（记忆缓存 `SCHEMA_VERSION` 1→2，旧缓存判 stale，重新 rebuild 即可；无 FTS5 环境自动回退，语义不变）；2.6.1 收尾逐行审核低级项（register 竞态入事务、invalidate CAS 收据、投影失败可区分消息、采集跨主机重定向拒绝、Windows 目录 fsync、DOCX 必需部件补齐）。命令与数据格式无变化。只读 `doctor` 不迁移 legacy registry，需由可写命令完成迁移后再检查；打开注册表不会改写小说正典。
+工具版本在 `scripts/novel_cli.py` 的 `TOOL_VERSION` 中维护。当前版本是 `2.7.0`。工作区 JSON 的 `schema_version` 仍为 `1`；2.3.0 对旧注册表采用只增不删的 SQLite 迁移，为租约补充 `lease_seconds`、`heartbeat_enforced` 和 `lease_events`。2.4.0 补写作流程层（风格合同、声音锚点、合同与记忆卡质量字段、humanizer 小说专项模式）；2.5.0 补写作机理内容层（期待感、爽点、对抗阶梯、信息差、中段防塌陷与对照示例）；2.5.1 为审核修补（质量审核纳入写作机理对照、`framework-state` 与 `--adopt-existing` 补文档、质量信号类发布反馈记录）；2.5.2 补记忆缓存边界测试与退出码契约固化测试；2.5.3 为逐行脚本审核修补（缓存锁自愈与 Windows 探活、导出同源哈希、upgrade 排除 .git、非 UTF-8 结构化错误——导出清单哈希公式变化，旧清单需重新导出）；2.6.0 为 SQLite 检索层引入 FTS5 trigram 全文索引与 bm25 排序（记忆缓存 `SCHEMA_VERSION` 1→2，旧缓存判 stale，重新 rebuild 即可；无 FTS5 环境自动回退，语义不变）；2.6.1 收尾逐行审核低级项（register 竞态入事务、invalidate CAS 收据、投影失败可区分消息、采集跨主机重定向拒绝、Windows 目录 fsync、DOCX 必需部件补齐）；2.7.0 为事务恢复与门禁一致性修补（journal 先于备份写入、无 journal 事务目录按白名单自愈、不可恢复事务移入 `.novel-transaction-conflicts/` 并在 `doctor`/`validate` 可见、注册表新增只增不删的 `transaction_conflicts` 表、`export` 与 `commit-chapter` 共用 `block_next_commit` 判据、`install.py --force` 保留被替换目录、`novel_cli.py` 直接运行返回结构化用法错误）。命令与数据格式无变化。只读 `doctor` 不迁移 legacy registry，需由可写命令完成迁移后再检查；打开注册表不会改写小说正典。
 
 升级前先复制工作区并运行：
 
@@ -186,7 +186,7 @@ Skill 的发布物只包含版本控制中已经提交的受控文件。工作�
 发布某个已提交版本时，从 Skill 根目录使用 Git 归档，而不是直接把整个目录压缩：
 
 ```powershell
-git archive --format=zip --output="novel-studio-2.6.1.zip" HEAD
+git archive --format=zip --output="novel-studio-2.7.0.zip" HEAD
 ```
 
 `git archive` 只读取提交中的受控路径，不会带入未跟踪的交接状态、缓存或本机临时文件。若要发布标签或其他已核对的提交，把 `HEAD` 替换为该提交引用，并在归档后重新列出压缩包内容做一次只读检查。

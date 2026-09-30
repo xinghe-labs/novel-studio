@@ -2,6 +2,19 @@
 
 本文件记录会影响工作流契约、数据格式或交付判断的变更。
 
+## 2.7.0 - 2026-09-30
+
+- 事务恢复自愈（P0）：一个没有 journal 的事务目录不再让项目永久不可写。`transactional_write` 改为先写 `prepared` journal、再写备份，因此崩溃窗口留下的工件只可能是 `backup-NNNN.bin` 或 `.<name>.tmp`，而这两者都在任何目标字节被替换之前产生——恢复时按白名单直接丢弃；无法识别的工件仍然 fail-closed，`doctor` 不再对不可写项目报 `pass`。
+- 事务冲突隔离（P0）：已提交/已回滚/进行中的 journal 若与磁盘上的字节不再匹配任何可恢复状态（外部改动、目标缺失），旧行为是让 `validate`/`status`/`lock-acquire` 永久失败。现在把整个事务目录移入 `.novel-transaction-conflicts/`，写入 `conflict.json` 证据并在注册表 `transaction_conflicts` 表记录（新增表，只增不删迁移），项目可继续写出；`validate`/`status` 报 warning，`doctor` 报 `transaction-conflicts` warning。冲突目录已加入 `HASH_EXCLUDED_PARTS` 与 `UPGRADE_IGNORED_PARTS`，不参与正典哈希与升级快照。
+- 提交与导出共用同一门禁判据（P1）：`commit-chapter` 一直遵守 `periodic_review.block_next_commit`，而 `export` 只看 `review_due`——选择不阻断提交的项目能提交却永远无法导出。现在两条路径都调用 `novel_review.review_gate()`；策略关闭阻断时，提交结果、导出结果与 `review_status` 都会带明确告警。
+- 事务回滚安全性（P2）：journal 在提交标记后瞬时不可读时，不再猜测字节状态并回滚，而是保留事务交给恢复流程；`atomic_write_bytes` 补目录 fsync，回滚后的重命名同样耐久。
+- 提交暂存守卫（P2）：`assert_staging_snapshot` 在缺少暂存快照信息时从静默跳过改为 fail-closed。
+- 租约语义诚实化（P2）：`lock-acquire` 与 `lease_status` 增报 `live_until`/`live_in_seconds`/`limited_by`，说明生效上限由心跳宽限而非 `expires_at` 决定；旧注册表行的 expires-only 语义不变。
+- `install.py --force` 不再删除被替换的外部目录：改名为 `novel-studio-replaced-<UTC 时间戳>` 保留并打印路径。
+- `novel_cli.py` 直接运行不再静默退出 0：按统一契约输出 JSON 错误并以退出码 2 说明它是共享库而非命令（8 个可执行 CLI 不变）。
+- 文档与 CI：README 行数统计改由 `ci/check_doc_stats.py` 在 CI 中核对；README 明确 Windows 3.13 job 与临时诊断 job 不阻断流水线；[schemas-and-cli.md](references/schemas-and-cli.md) 的 `--version` 示例改为版本无关占位符；[project-contract.md](references/project-contract.md) 把"不建议手工更新正典"改为硬规则；[workspace-isolation.md](references/workspace-isolation.md) 记录 `--allow-bootstrap` 边界并接入 SKILL.md 路由表。
+- 命令与数据格式无变化（注册表新增 `transaction_conflicts` 表，仍为只增不删迁移；`STATE_HASH_VERSION` 不变）。
+
 ## 2.6.1 - 2026-09-29
 
 - 逐行审核低级项收尾：`project-register` 的 ID/路径冲突检查移入 `BEGIN IMMEDIATE` 预约内，并发登记同一 ID 不再能静默改写指向；`invalidate` 的 invalidations/head 写入补 `expected_existing` CAS 收据，租约换手窗口内的并发失效登记不再互相覆盖。

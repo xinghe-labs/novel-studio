@@ -3144,7 +3144,11 @@ def _export_project_locked(args: argparse.Namespace) -> dict[str, Any]:
         raise ExportError(str(exc)) from exc
     snapshot = load_snapshot(args.root)
     review = novel_review.review_status(snapshot.root)
-    if review["review_due"]:
+    gate = novel_review.review_gate(review)
+    # Export honors the same predicate as commit-chapter.  Blocking on a bare
+    # review_due here while commit-chapter honored block_next_commit produced a
+    # project whose chapters could be committed but never delivered.
+    if gate["blocking"]:
         if snapshot.work_type == "short_story":
             raise ExportError(
                 "The complete short story must pass a current full-manuscript "
@@ -3448,6 +3452,7 @@ def _export_project_locked(args: argparse.Namespace) -> dict[str, Any]:
         "delivery_quality": "pass",
         "verified_profiles": used_profile_names,
         "validation_warnings": list(snapshot.validation_warnings),
+        "review_warnings": gate["warnings"],
     }
     if snapshot.work_type == "short_story":
         result["work_type"] = snapshot.work_type
@@ -3574,7 +3579,8 @@ def export_status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             ],
         }, 1
     review = novel_review.review_status(status_root)
-    if review["review_due"]:
+    gate = novel_review.review_gate(review)
+    if gate["blocking"]:
         return {
             "status": "blocked",
             "project_root": continuity["project_root"],
@@ -3711,6 +3717,7 @@ def export_status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             }
         ),
         "issues": issues,
+        "review_warnings": gate["warnings"],
     }
     if snapshot.work_type == "short_story":
         result["work_type"] = snapshot.work_type

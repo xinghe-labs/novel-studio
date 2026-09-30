@@ -24,6 +24,39 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
+class SourcePathCanonicalizationTests(unittest.TestCase):
+    """One spelling of the project directory must never look like a foreign path."""
+
+    def test_non_canonical_project_root_spelling_still_registers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            project = base / "project"
+            target = project / "sources/local/来源文件.md"
+            write_text(target, "外部资料正文\n")
+            # Same directory, different spelling: ``resolve()`` collapses the
+            # ``..`` component, the raw spelling cannot be a relative_to prefix.
+            awkward_root = base / "project" / ".." / "project"
+
+            relative = novel_research._project_relative_path(
+                awkward_root, target.resolve()
+            )
+
+            self.assertEqual(relative, "sources/local/来源文件.md")
+
+    def test_target_outside_the_project_root_is_a_domain_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            project = base / "project"
+            project.mkdir()
+            outside = base / "outside.md"
+            outside.write_text("外部文件\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                novel_research.ResearchError, "outside the project root"
+            ):
+                novel_research._project_relative_path(project, outside.resolve())
+
+
 class FetchPublicJsonTests(unittest.TestCase):
     def test_same_host_redirect_is_returned_to_the_caller(self) -> None:
         response = mock.MagicMock()

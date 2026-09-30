@@ -118,6 +118,19 @@ CHAPTER_NAME = re.compile(
     r"^(?P<number>\d{4})(?:-[^/\\]+)?\.md$", re.IGNORECASE
 )
 TRANSACTION_DIRNAME = ".novel-transaction"
+# Quarantine root for transactions whose recorded hashes no longer describe
+# any recoverable byte state.  It lives beside the transaction root, is
+# excluded from the canonical state hash, and is never removed automatically.
+CONFLICT_DIRNAME = ".novel-transaction-conflicts"
+CONFLICT_SCHEMA_VERSION = 1
+# A transaction directory without a journal can only ever hold artifacts that
+# no journal attributes: the sibling temporary files of an interrupted
+# metadata write, or backup copies from a release whose journal was written
+# last.  No target can have been replaced in that window, so these names are
+# safe to discard.  Anything else still fails closed.
+DISCARDABLE_TRANSACTION_ARTIFACT = re.compile(
+    r"^(?:backup-\d{4}\.bin|\..+\.tmp)$"
+)
 TRANSACTION_SCHEMA_VERSION = 1
 UPGRADE_TRANSACTION_DIRNAME = ".novel-upgrade-transaction"
 UPGRADE_TRANSACTION_SCHEMA_VERSION = 1
@@ -133,6 +146,23 @@ SERIAL_CHAPTER_HEADING = re.compile(
 
 class ProjectError(RuntimeError):
     pass
+
+
+class TransactionDivergence(ProjectError):
+    """A journal whose recorded bytes no longer describe any recoverable state.
+
+    This is deliberately narrower than ``ProjectError``: a missing backup or an
+    unreadable journal is still a hard failure that leaves the transaction in
+    place for a later repair, while a genuine divergence has no correct byte
+    state to restore and is quarantined instead of wedging every command.
+
+    ``details`` names the project-relative paths whose bytes diverged, so the
+    quarantine record can point a human at the chapters worth re-reading.
+    """
+
+    def __init__(self, message: str, details: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.details = list(details or [])
 
 
 def project_write_context(root: Path, args: argparse.Namespace):
@@ -226,6 +256,10 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
+        # Match the durability of the install path: a rollback that loses its
+        # rename to a power cut while the journal survives would leave the
+        # aborted bytes on disk with no record that they were rolled back.
+        _fsync_directory(path.parent)
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -672,10 +706,10 @@ def _validate_transaction_entries(
                 action = "skip"
             elif current_hash != new_hash:
                 if prior_exists:
-                    raise ProjectError(
+                    raise TransactionDivergence(
                         f"Transaction recovery found an unexpected change: {relative}"
                     )
-                raise ProjectError(
+                raise TransactionDivergence(
                     f"Transaction recovery found an unexpected new file change: {relative}"
                 )
             action = "restore" if prior_exists else "delete"
@@ -718,7 +752,9 @@ def _restore_transaction(root: Path, transaction_dir: Path, journal: dict[str, A
         if current_hash == prior_hash:
             continue
         if current_hash != entry["new_hash"]:
-            raise ProjectError(f"Transaction recovery found an unexpected change: {relative}")
+            raise TransactionDivergence(
+                f"Transaction recovery found an unexpected change: {relative}"
+            )
         if entry["action"] == "restore":
             prior_bytes = entry["prior_bytes"]
             if not isinstance(prior_bytes, bytes):
@@ -767,8 +803,143 @@ def _rollback_transaction_target(
         raise ProjectError(f"Transactional rollback failed to restore: {target}")
 
 
+def _transaction_conflict_root(root: Path) -> Path:
+    return root / CONFLICT_DIRNAME
+
+
+def _discard_journal_less_transaction(transaction_dir: Path) -> None:
+    """Discard a journal-less transaction directory that cannot hold state.
+
+    Both artifact names this accepts are written before any target byte is
+    replaced, so nothing recoverable can be lost.  Unrecognized artifacts
+    still fail closed rather than being deleted on suspicion.
+    """
+
+    artifacts = sorted(transaction_dir.iterdir(), key=lambda path: path.name)
+    for artifact in artifacts:
+        if (
+            _link_like(artifact)
+            or not artifact.is_file()
+            or DISCARDABLE_TRANSACTION_ARTIFACT.fullmatch(artifact.name) is None
+        ):
+            raise ProjectError(
+                "Transaction directory contains artifacts but no journal: "
+                f"{transaction_dir}"
+            )
+    _remove_transaction_directory(transaction_dir)
+
+
+def quarantine_transaction(
+    raw_root: str | Path,
+    transaction_dir: Path,
+    *,
+    journal: dict[str, Any] | None = None,
+    reason: str,
+    details: list[str] | None = None,
+) -> Path:
+    """Move an unrecoverable transaction aside instead of failing forever.
+
+    A journal whose targets no longer contain either the restored or the
+    installed bytes cannot be rolled forward or back: there is no correct byte
+    state to reach.  Leaving it in place makes every later command fail
+    closed, which turns one ambiguous edit into a permanently unusable
+    project.  Quarantining keeps the complete evidence (journal, backups and
+    the observed divergence) in a stable directory outside the transaction
+    root and outside the canonical state hash, and lets the project continue.
+
+    ``conflict.json`` is the durable record.  The registry index is refreshed
+    from these files by the next controlled workspace command rather than
+    written here: recovery usually runs inside an open registry write
+    transaction, so a second connection would either stall on the busy timeout
+    or silently drop the row.
+    """
+
+    root = resolve_root(str(raw_root))
+    if _link_like(transaction_dir) or not transaction_dir.is_dir():
+        raise ProjectError(
+            f"Refusing to quarantine a link-like transaction: {transaction_dir}"
+        )
+    if not is_within(transaction_dir.resolve(), _transaction_root(root).resolve()):
+        raise ProjectError(
+            f"Refusing to quarantine a transaction outside the project: {transaction_dir}"
+        )
+
+    conflict_root = _transaction_conflict_root(root)
+    if _link_like(conflict_root):
+        raise ProjectError(
+            f"Transaction conflict path cannot be a link or reparse point: {conflict_root}"
+        )
+    conflict_root.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = conflict_root / f"{stamp}-{transaction_dir.name}"
+    suffix = 1
+    while candidate.exists():
+        suffix += 1
+        candidate = conflict_root / f"{stamp}-{transaction_dir.name}-{suffix}"
+
+    record = {
+        "schema_version": CONFLICT_SCHEMA_VERSION,
+        "record_kind": "transaction_conflict",
+        "project_root": str(root),
+        "original_transaction": transaction_dir.name,
+        "detected_at": utc_now(),
+        "reason": reason,
+        "details": list(details or ()),
+        "journal_status": (journal or {}).get("status"),
+        "journal_schema_version": (journal or {}).get("schema_version"),
+    }
+    record_path = conflict_root / f".{candidate.name}.tmp"
+    _atomic_write_bytes_unpatched(
+        record_path, dump_json(record).encode("utf-8")
+    )
+
+    os.rename(transaction_dir, candidate)
+    target_record = candidate / "conflict.json"
+    os.replace(record_path, target_record)
+    _fsync_directory(conflict_root)
+    return target_record
+
+
+def load_transaction_conflicts(raw_root: str | Path) -> list[dict[str, Any]]:
+    """Read the quarantine records for a project, newest last."""
+
+    root = resolve_root(str(raw_root))
+    conflict_root = _transaction_conflict_root(root)
+    if not conflict_root.is_dir() or _link_like(conflict_root):
+        return []
+    records: list[dict[str, Any]] = []
+    for child in sorted(conflict_root.iterdir(), key=lambda path: path.name):
+        if _link_like(child) or not child.is_dir():
+            continue
+        record_path = child / "conflict.json"
+        try:
+            data = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            records.append(
+                {
+                    "path": str(child),
+                    "reason": "unreadable conflict record",
+                    "detected_at": None,
+                }
+            )
+            continue
+        if isinstance(data, dict):
+            data.setdefault("path", str(child))
+            records.append(data)
+    return records
+
+
 def recover_pending_transactions(raw_root: str | Path) -> list[str]:
-    """Recover incomplete project file transactions after interruption."""
+    """Recover incomplete project file transactions after interruption.
+
+    Recovery validates every journal structurally and against the backups it
+    names, but deliberately does not re-verify the journal's read-only
+    ``preconditions``: those hash files the transaction only *read*, and rolling
+    a target back to its prior bytes is correct even when such a file changed
+    afterwards.  Re-checking them would turn a completed rollback into a hard
+    failure for an unrelated external edit.
+    """
 
     root = resolve_root(str(raw_root))
     transaction_root = _transaction_root(root)
@@ -784,96 +955,138 @@ def recover_pending_transactions(raw_root: str | Path) -> list[str]:
             raise ProjectError(f"Transaction directory escapes the project root: {transaction_dir}")
         journal_path = transaction_dir / "journal.json"
         if not journal_path.exists():
-            if any(transaction_dir.iterdir()):
-                raise ProjectError(
-                    "Transaction directory contains artifacts but no journal: "
-                    f"{transaction_dir}"
-                )
-            transaction_dir.rmdir()
+            _discard_journal_less_transaction(transaction_dir)
             _fsync_directory(transaction_root)
-            recovered.append(f"cleaned empty transaction {transaction_dir.name}")
+            recovered.append(
+                f"discarded unjournaled transaction {transaction_dir.name}"
+            )
             continue
         journal = _read_transaction_journal(journal_path)
-        if journal["status"] == "committed":
-            # The committed marker is authoritative only while every target
-            # still contains the bytes named by that marker.  An external
-            # edit after commit must leave the journal in place and fail
-            # closed instead of erasing the last durable transaction record.
-            entries = _validate_transaction_entries(
+        try:
+            recovered.append(
+                _recover_one_transaction(
+                    root, transaction_root, transaction_dir, journal_path, journal
+                )
+            )
+        except TransactionDivergence as exc:
+            record_path = quarantine_transaction(
                 root,
                 transaction_dir,
-                journal,
-                inspect_current=False,
-                verify_backups=False,
-                verify_preconditions=False,
+                journal=journal,
+                reason=str(exc),
+                details=list(exc.details),
             )
-            for entry in entries:
-                if _current_transaction_hash(entry["target"]) != entry["new_hash"]:
-                    raise ProjectError(
-                        "Committed transaction target changed before journal cleanup: "
-                        f"{entry['relative']}"
-                    )
-            _remove_transaction_directory(transaction_dir)
-            _fsync_directory(transaction_root)
-            recovered.append(f"cleaned committed transaction {transaction_dir.name}")
-            continue
-        if journal["status"] == "prepared":
-            entries = _validate_transaction_entries(
-                root,
-                transaction_dir,
-                journal,
-                inspect_current=False,
-                verify_backups=False,
-                verify_preconditions=False,
+            recovered.append(
+                "quarantined divergent transaction instead of wedging the project: "
+                f"{record_path}"
             )
-            for entry in entries:
-                expected = entry["prior_hash"] if entry["prior_exists"] else None
-                if _current_transaction_hash(entry["target"]) != expected:
-                    raise ProjectError(
-                        "Prepared transaction target changed before cleanup: "
-                        f"{entry['relative']}"
-                    )
-            journal["status"] = "rolled_back"
-            _atomic_write_bytes_unpatched(
-                journal_path, dump_json(journal).encode("utf-8")
-            )
-            _remove_transaction_directory(transaction_dir)
-            _fsync_directory(transaction_root)
-            recovered.append(f"discarded prepared transaction {transaction_dir.name}")
-            continue
-        if journal["status"] == "rolled_back":
-            entries = _validate_transaction_entries(
-                root,
-                transaction_dir,
-                journal,
-                inspect_current=False,
-                verify_backups=False,
-                verify_preconditions=False,
-            )
-            for entry in entries:
-                expected = entry["prior_hash"] if entry["prior_exists"] else None
-                if _current_transaction_hash(entry["target"]) != expected:
-                    raise ProjectError(
-                        "Rolled-back transaction target changed before journal cleanup: "
-                        f"{entry['relative']}"
-                    )
-            _remove_transaction_directory(transaction_dir)
-            _fsync_directory(transaction_root)
-            recovered.append(f"cleaned rolled-back transaction {transaction_dir.name}")
-            continue
-        _restore_transaction(root, transaction_dir, journal)
-        journal["status"] = "rolled_back"
-        _atomic_write_bytes_unpatched(
-            journal_path, dump_json(journal).encode("utf-8")
-        )
-        _remove_transaction_directory(transaction_dir)
-        _fsync_directory(transaction_root)
-        recovered.append(f"rolled back transaction {transaction_dir.name}")
     try:
         transaction_root.rmdir()
     except OSError:
         pass
     return recovered
+
+
+def _recovery_target_hash(target: Path) -> str | None:
+    """Hash a target for recovery; a type or link change is divergence.
+
+    ``_current_transaction_hash`` fails closed on a target that is no longer a
+    regular file.  During recovery that is evidence the journal no longer
+    describes anything restorable, so it is reported as a non-matching hash
+    rather than escaping as a hard failure.
+    """
+
+    try:
+        return _current_transaction_hash(target)
+    except ProjectError:
+        return "<target-is-not-a-regular-file>"
+
+
+def _recover_one_transaction(
+    root: Path,
+    transaction_root: Path,
+    transaction_dir: Path,
+    journal_path: Path,
+    journal: dict[str, Any],
+) -> str:
+    """Recover one transaction, or raise ``TransactionDivergence``.
+
+    Returns the human-readable recovery note that callers report.
+    """
+
+    if journal["status"] == "committed":
+        # The committed marker is authoritative only while every target still
+        # contains the bytes named by that marker.  An external edit after
+        # commit has already produced a legitimate new state, so the journal is
+        # quarantined as evidence rather than replayed.
+        entries = _validate_transaction_entries(
+            root,
+            transaction_dir,
+            journal,
+            inspect_current=False,
+            verify_backups=False,
+            verify_preconditions=False,
+        )
+        diverged = [
+            entry["relative"]
+            for entry in entries
+            if _recovery_target_hash(entry["target"]) != entry["new_hash"]
+        ]
+        if diverged:
+            raise TransactionDivergence(
+                "committed transaction target changed before cleanup",
+                details=diverged,
+            )
+        _remove_transaction_directory(transaction_dir)
+        _fsync_directory(transaction_root)
+        return f"cleaned committed transaction {transaction_dir.name}"
+    if journal["status"] == "prepared":
+        entries = _validate_transaction_entries(
+            root,
+            transaction_dir,
+            journal,
+            inspect_current=False,
+            verify_backups=False,
+            verify_preconditions=False,
+        )
+        for entry in entries:
+            expected = entry["prior_hash"] if entry["prior_exists"] else None
+            if _recovery_target_hash(entry["target"]) != expected:
+                raise TransactionDivergence(
+                    "prepared transaction target changed before cleanup",
+                    details=[entry["relative"]],
+                )
+        journal["status"] = "rolled_back"
+        _atomic_write_bytes_unpatched(journal_path, dump_json(journal).encode("utf-8"))
+        _remove_transaction_directory(transaction_dir)
+        _fsync_directory(transaction_root)
+        return f"discarded prepared transaction {transaction_dir.name}"
+    if journal["status"] == "rolled_back":
+        entries = _validate_transaction_entries(
+            root,
+            transaction_dir,
+            journal,
+            inspect_current=False,
+            verify_backups=False,
+            verify_preconditions=False,
+        )
+        for entry in entries:
+            expected = entry["prior_hash"] if entry["prior_exists"] else None
+            if _recovery_target_hash(entry["target"]) != expected:
+                raise TransactionDivergence(
+                    "rolled-back transaction target changed before cleanup",
+                    details=[entry["relative"]],
+                )
+        _remove_transaction_directory(transaction_dir)
+        _fsync_directory(transaction_root)
+        return f"cleaned rolled-back transaction {transaction_dir.name}"
+    # Every remaining status describes bytes that may already be on disk.
+    _restore_transaction(root, transaction_dir, journal)
+    journal["status"] = "rolled_back"
+    _atomic_write_bytes_unpatched(journal_path, dump_json(journal).encode("utf-8"))
+    _remove_transaction_directory(transaction_dir)
+    _fsync_directory(transaction_root)
+    return f"rolled back transaction {transaction_dir.name}"
 
 
 def assert_no_pending_transactions(raw_root: str | Path) -> None:
@@ -1077,14 +1290,20 @@ def transactional_write(
         transaction_root.mkdir(parents=True, exist_ok=True)
         transaction_dir = transaction_root / uuid.uuid4().hex
         transaction_dir.mkdir()
+        journal_path = transaction_dir / "journal.json"
         journal_files: list[dict[str, Any]] = []
         try:
+            # Name every backup before writing any of them, so the prepared
+            # journal describes the complete intended transaction.  The journal
+            # is installed first: a crash after this point leaves a journal that
+            # recovery can discard without guessing, whereas a journal written
+            # last would leave unattributable artifacts behind (and, in older
+            # releases, wedge every later command).
             for index, target in enumerate(targets):
                 prior = backups[target]
                 backup_name: str | None = None
                 if prior is not None:
                     backup_name = f"backup-{index:04d}.bin"
-                    _atomic_write_bytes_unpatched(transaction_dir / backup_name, prior)
                 journal_files.append(
                     {
                         "target": target.relative_to(root).as_posix(),
@@ -1094,7 +1313,6 @@ def transactional_write(
                         "backup": backup_name,
                     }
                 )
-            journal_path = transaction_dir / "journal.json"
             journal = {
                 "schema_version": TRANSACTION_SCHEMA_VERSION,
                 "status": "prepared",
@@ -1117,13 +1335,24 @@ def transactional_write(
                 ],
             }
             _atomic_write_bytes_unpatched(journal_path, dump_json(journal).encode("utf-8"))
+            for index, entry in enumerate(journal_files):
+                if not entry["prior_exists"]:
+                    continue
+                # ``prior_sha256`` is a precondition for this restore point:
+                # the prepared journal is rewritten before it can describe a
+                # transaction whose backups have already drifted.
+                _atomic_write_bytes_unpatched(
+                    transaction_dir / entry["backup"], backups[targets[index]]
+                )
             journal["status"] = "applying"
             _atomic_write_bytes_unpatched(journal_path, dump_json(journal).encode("utf-8"))
         except BaseException:
             if transaction_dir is not None:
                 try:
                     _remove_transaction_directory(transaction_dir)
-                except OSError:
+                except Exception:
+                    # Never mask the failure that brought us here; a leftover
+                    # prepared journal is recovered on the next command.
                     pass
             raise
     try:
@@ -1186,22 +1415,25 @@ def transactional_write(
         # exits.  Once that marker exists, rolling bytes back would turn a
         # committed transaction into a false rollback.
         if journal_path is not None and not journal_committed:
-            # The committed marker is durable; a transient read failure right
-            # after it lands must not roll back already-replaced bytes. Retry
-            # the read briefly, and only roll back when no marker is visible.
+            # A transient read failure right after the committed marker lands
+            # must not roll back already-replaced bytes.  Retry briefly, and if
+            # the journal still cannot be read, refuse to act on an unknown
+            # state: the journal is left in place for recovery instead of
+            # guessing that the bytes are uncommitted.
+            marker: dict[str, Any] | None = None
             for _ in range(3):
                 try:
                     marker = _read_transaction_journal(journal_path)
-                    journal_committed = marker.get("status") == "committed"
                     break
                 except BaseException:
                     time.sleep(0.05)
-            else:
-                try:
-                    marker = _read_transaction_journal(journal_path)
-                    journal_committed = marker.get("status") == "committed"
-                except BaseException:
-                    pass
+            if marker is None:
+                raise ProjectError(
+                    "Transactional write failed and its journal is unreadable; "
+                    "refusing to roll back an unknown state. Recovery will "
+                    f"re-examine the transaction: {exc}"
+                ) from exc
+            journal_committed = marker.get("status") == "committed"
         if journal_committed:
             # Preserve the committed journal after an interrupted control
             # path.  The next controlled operation validates every target and
@@ -1262,6 +1494,7 @@ UPGRADE_IGNORED_PARTS = frozenset(
         "staging",
         ".novel-cache",
         ".novel-transaction",
+        ".novel-transaction-conflicts",
         ".novel-upgrade-transaction",
         ".novel-export.lock",
         ".novel-export-journal.json",
@@ -2376,6 +2609,12 @@ def collect_validation(
             assert_no_pending_transactions(root)
         except ProjectError as exc:
             errors.append(str(exc))
+        for conflict in load_transaction_conflicts(root):
+            warnings.append(
+                "Quarantined transaction conflict needs review: "
+                f"{conflict.get('reason', 'unknown reason')} "
+                f"({conflict.get('path', '')})"
+            )
 
     for relative_dir in REQUIRED_DIRS:
         if not (root / relative_dir).is_dir():
@@ -3291,6 +3530,23 @@ def _package_fingerprint(package: Path) -> tuple[tuple[str, str, int], ...]:
     )
 
 
+def assert_staging_snapshot_available(snapshot_info: Any) -> None:
+    """Fail closed when the commit staging snapshot was never established.
+
+    A commit re-reads the private package snapshot and its external evidence
+    immediately before replacing canonical bytes.  Without the snapshot there is
+    no way to prove the staged package did not change mid-validation, so a
+    missing snapshot must block the commit instead of silently skipping the
+    control.
+    """
+
+    if not snapshot_info:
+        raise ProjectError(
+            "Commit staging snapshot is unavailable; refusing to commit "
+            "without re-verifying the staged package"
+        )
+
+
 def _materialize_package_snapshot(
     package: Path,
 ) -> tuple[Path, tuple[tuple[str, str, int], ...], tuple[tuple[str, str, int], ...]]:
@@ -3798,8 +4054,7 @@ def _commit_chapter_impl(args: argparse.Namespace) -> dict[str, Any]:
     package_snapshot_info = getattr(args, "_package_snapshot_info", None)
 
     def assert_staging_snapshot() -> None:
-        if not package_snapshot_info:
-            return
+        assert_staging_snapshot_available(package_snapshot_info)
         _assert_package_snapshot_unchanged(
             package_snapshot_info["original_package"],
             package_snapshot_info["original_fingerprint"],
@@ -3836,7 +4091,13 @@ def _commit_chapter_impl(args: argparse.Namespace) -> dict[str, Any]:
                 journal_root=root,
                 expected_targets={chapter_target: None, memory_target: None},
             )
-    except (OSError, sqlite3.Error, novel_workspace.WorkspaceError) as exc:
+    except sqlite3.Error as exc:
+        # A busy registry is not an authorization failure; say so, because the
+        # remedy is to retry rather than to re-acquire the lease.
+        raise ProjectError(
+            f"Workspace registry unavailable during commit: {exc}"
+        ) from exc
+    except (OSError, novel_workspace.WorkspaceError) as exc:
         raise ProjectError(f"Project write authorization expired: {exc}") from exc
     cache_result: dict[str, Any] | None = None
     cache_warning: str | None = None
@@ -3849,6 +4110,7 @@ def _commit_chapter_impl(args: argparse.Namespace) -> dict[str, Any]:
             cache_warning = f"Derived SQLite index update failed; rebuild it: {exc}"
     review_after = novel_review.review_status(root)
     commit_warnings = [cache_warning] if cache_warning else []
+    gate_after = novel_review.review_gate(review_after)
     if review_after["review_due"]:
         if work_type == "short_story":
             commit_warnings.append(
@@ -3859,6 +4121,7 @@ def _commit_chapter_impl(args: argparse.Namespace) -> dict[str, Any]:
                 "Periodic review is due for chapters "
                 f"{review_after['review_from']:04d}-{review_after['review_through']:04d}"
             )
+    commit_warnings.extend(gate_after["warnings"])
     result = {
         "status": "committed",
         "project_root": str(root),

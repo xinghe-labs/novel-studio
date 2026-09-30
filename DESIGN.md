@@ -68,7 +68,9 @@ The alternative — trusting a filename or a timestamp — fails in a specific a
 
 ## 5. Fail-closed CLI contract
 
-Nine tools share one contract, enforced by `novel_cli.py`:
+Eight executable tools share one contract, enforced by `novel_cli.py` (itself a
+shared library: running it directly emits a structured usage error and exit
+code `2` rather than exiting silently):
 
 - exactly one JSON document on stdout
 - stderr stays empty

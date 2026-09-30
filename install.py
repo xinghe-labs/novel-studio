@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 SKILL_NAME = "novel-studio"
@@ -182,6 +183,7 @@ def install_into(
         )
 
     action = "installed"
+    replace_foreign = False
     if target.exists():
         existing_name = skill_frontmatter_name(target / "SKILL.md")
         if existing_name != SKILL_NAME:
@@ -190,6 +192,10 @@ def install_into(
                     f"{target} exists and is not a {SKILL_NAME} install; "
                     "pass --force to replace it"
                 )
+            # ``--force`` over a foreign directory destroys content this
+            # installer did not create, so the replaced tree is preserved
+            # beside the target instead of being deleted.
+            replace_foreign = True
             print(f"replacing foreign directory at {target} (--force)")
         action = "updated"
 
@@ -201,6 +207,7 @@ def install_into(
 
     copied = 0
     staging.mkdir(parents=True)
+    preserved: Path | None = None
     try:
         for source in files:
             relative = source.relative_to(source_root)
@@ -217,14 +224,30 @@ def install_into(
             if backup.exists():
                 os.rename(backup, target)
             raise
+        if replace_foreign and backup.exists():
+            preserved = _preserve_replaced_tree(root, backup)
+            print(f"previous content preserved at {preserved}")
     except OSError as exc:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
         raise InstallError(f"copy failed: {exc}") from exc
     finally:
-        if backup.exists():
+        if backup.exists() and preserved is None:
             shutil.rmtree(backup, ignore_errors=True)
     return target, action, copied
+
+
+def _preserve_replaced_tree(root: Path, backup: Path) -> Path:
+    """Move a replaced foreign tree to a durable, non-colliding path."""
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = root / f"{SKILL_NAME}-replaced-{stamp}"
+    suffix = 1
+    while candidate.exists():
+        suffix += 1
+        candidate = root / f"{SKILL_NAME}-replaced-{stamp}-{suffix}"
+    os.rename(backup, candidate)
+    return candidate
 
 
 def run_tool(script_path: Path, *args: str) -> tuple[int, dict | None]:

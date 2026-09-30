@@ -125,6 +125,8 @@ python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<proj
 
 旧注册表的迁移只增不删。只要 `leases` 缺少 `lease_seconds` 或 `heartbeat_enforced` 任一新增列，已有租约就按旧的 `expires_at`-only 语义保守迁移；明确标记为 legacy schema 的注册表也一样。只有该租约被新的 `lock-acquire` 或 `lock-renew` 成功写回后，才启用五分钟心跳门禁。只读 `doctor` 不执行迁移，因此对 legacy schema 会报告需要迁移的阻断；用可写工具打开并完成迁移后再重新运行 doctor。
 
+2.7.0 起注册表另有一张只增不删的 `transaction_conflicts` 表，记录被隔离的事务冲突（项目根、冲突目录、原因、检测时间）。它不是正典，也不参与哈希：删除它只是丢失审计线索，不会改变小说内容。隔离与冲突语义见 [commit-protocol.md](commit-protocol.md#中断事务的恢复与冲突隔离)。
+
 正式提交的文件替换期间，提交器通过 `write_guard` 持有 `BEGIN IMMEDIATE` 注册表事务，并在最终验证中再次检查 owner 和心跳；这使租约检查与原子文件事务处于同一受保护窗口。
 
 完成一次已授权写入后，严格执行 [commit-protocol.md](commit-protocol.md) 的完整“提交后”验证清单；本文件不再维护一个可能漂移的验证子集。验证全部通过后，再更新基准并释放租约：
@@ -135,6 +137,21 @@ python -X utf8 .\scripts\novel_workspace.py lock-release "<workspace-root>" "<wo
 ```
 
 `base-refresh` 必须记录非空验证说明，不能用空说明掩盖未经回读的并发变化。若项目已被当前工作之外的进程修改，普通 `base-refresh` 必须失败；只有逐项回读并验证变化后，才能额外提供 `--accept-external-change --validation-report <项目外 JSON>`。报告字段和哈希绑定见 [schemas-and-cli.md](schemas-and-cli.md#外部变更验证报告)。即使写入、验证或后续命令失败，也要尝试释放自己持有的租约；不能释放其他工作的租约。租约过期只能允许另一工作重新取得写入权，状态哈希检查仍然不能跳过。
+
+## 未登记项目的引导写入
+
+`--allow-bootstrap` 是显式声明“本项目尚未登记”的写入开关。省略 `--workspace` 与 `--work-id` 时默认拒绝一切项目写入；只有同时给出 `--allow-bootstrap` 且项目不在注册表中时，才允许一次无租约写入：
+
+```powershell
+python -X utf8 .\scripts\novel_project.py upgrade "<project-root>" --allow-bootstrap
+python -X utf8 .\scripts\novel_continuity.py install "<project-root>" --allow-bootstrap
+```
+
+- 已登记的项目永远要求 `--workspace` 和 `--work-id`；`--allow-bootstrap` 不能绕过，命中注册表时直接以退出码 2 报 `Registered project writes require workspace and work_id`。
+- 它只服务于初始化/引导流程：为尚未登记的项目建立脚手架、升级或登记前采集，不是日常写入路径。
+- 不得用它写入已经登记的项目；正典写入仍只能走租约门禁的 `commit-chapter` 事务。
+
+该开关出现在 `novel_continuity.py`（`install`、`prepare-audit`、`bind-audit`、`record-baseline`、`invalidate`）、`novel_project.py`（`upgrade`、`research-state`、`framework-state`）、`novel_research.py`（`collect`、`register`）、`novel_review.py`（`record`、`configure`）与 `novel_originality.py`（`audit`）共 13 个子命令上。
 
 ## 项目登记与恢复
 

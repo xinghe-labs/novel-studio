@@ -234,7 +234,7 @@ Markdown 正文与 `manuscript/index.md` 是出版导出的唯一输入。连载
 
 完整的提交顺序与命令以 [commit-protocol.md](commit-protocol.md) 为规范真源；本节只保留项目合同层的差异和检查重点。
 
-正式提交使用 [commit-protocol.md](commit-protocol.md) 的暂存清单与 `commit-chapter` 命令，不建议手工逐个更新正典文件。自然化行为边界另见 [controlled-automation.md](controlled-automation.md)。当前项目还必须满足以下合同要求：
+正式提交只允许使用 [commit-protocol.md](commit-protocol.md) 的暂存清单与租约门禁的 `commit-chapter` 事务，不得手工逐个更新正典文件。自然化行为边界另见 [controlled-automation.md](controlled-automation.md)。当前项目还必须满足以下合同要求：
 
 进入事务前，当前工作必须持有项目写入租约，并且 `write-check` 证明项目哈希仍等于该工作的 `base_state_hash`。验证失败表示另一项工作已经改变项目，必须重新读取和裁决差异，不能直接覆盖。
 
