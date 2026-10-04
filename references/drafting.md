@@ -4,7 +4,7 @@
 
 ## 写前上下文
 
-先确认 `novel_continuity.py status` 为 `current`，再生成绑定当前正典的 `continuity-context.json`。执行 [long-term-memory.md](long-term-memory.md) 的续写检索协议，逐一读取上下文列出的自动来源和被触及事实的原文；不能凭聊天记忆、摘要或上一章直接续写。读取 `story-bible/style-guide.md` 风格合同；存在 `story-bible/voice-anchor.md` 时一并读取当前 POV 的锚点片段与锚点配置（视点滤镜词库、场景签名清单、声音库），写作以锚点文风为正向基准。感知锚点与排版节奏按 [anchor-discipline.md](anchor-discipline.md) 的通用法则执行。随后按 [project-contract.md](project-contract.md) 的优先顺序形成一份短写作合同：
+先确认 `novel_continuity.py status` 为 `current`，再生成绑定当前正典的 `continuity-context.json`。执行 [long-term-memory.md](long-term-memory.md) 的续写检索协议，逐一读取上下文列出的自动来源和被触及事实的原文；不能凭聊天记忆、摘要或上一章直接续写。读取 `story-bible/style-guide.md` 风格合同；存在 `story-bible/voice-anchor.md` 时一并读取当前 POV 的锚点片段与锚点配置（视点滤镜词库、签名清单三轨与签名账、声音库、书级口径），写作以锚点文风为正向基准。感知锚点与排版节奏按 [anchor-discipline.md](anchor-discipline.md) 的通用法则执行。随后按 [project-contract.md](project-contract.md) 的优先顺序形成一份短写作合同：
 
 ```text
 交付：第几章、场景或字数范围

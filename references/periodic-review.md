@@ -43,7 +43,7 @@ python -X utf8 .\scripts\novel_review.py configure "<project-root>" --interval 5
 2. `pacing_and_scene_function`：场景是否重复、拖沓、跳步，张弛是否服务本段目标。
 3. `tension_and_information_release`：压力、悬念、揭示和留白是否按读者理解能力递进。
 4. `character_arc_and_emotional_force`：人物选择、关系变化和情绪后果是否有力度。
-5. `prose_voice_and_readability`：叙述距离、角色声音、句式和阅读流畅度是否稳定；存在 `story-bible/voice-anchor.md` 时另按 [anchor-discipline.md](anchor-discipline.md) 审稿清单核对感知锚点执行度（织进原句、复述防回声、落点锚、签名一致性、带噪与单段上限）。
+5. `prose_voice_and_readability`：叙述距离、角色声音、句式和阅读流畅度是否稳定；存在 `story-bible/voice-anchor.md` 时另按 [anchor-discipline.md](anchor-discipline.md) 的**章审清单**核对感知锚点执行度（织进原句、复述防回声、落点锚、签名一致性、锚句落名词、带噪与单段上限），并执行**批审加项**：批次方差、签名账死锚/密锚核查、生命周期演进、回声覆盖（见 anchor-discipline.md 批审清单）。
 6. `originality_and_cliche_control`：是否过度依赖套路、模板反转、通用台词和熟套意象。
 7. `platform_fit_and_retention`：在不牺牲故事的前提下，标题、开篇、章节兑现和阅读驱动力是否适合目标受众。
 8. `humanization_and_repetition`：历史兼容机器字段，语义为叙述自然度、声音一致性与机械模式检查；关注机械排比、解释过度、均匀段落、空泛总结和无意重复，不代表规避任何检测。
