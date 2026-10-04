@@ -968,18 +968,18 @@ FANQIE_SERIAL_PROFILE = DeliveryProfile(
     name="fanqie-serial",
     kind="text",
     checks=TEXT_QUALITY_CHECKS
-    + ("body_title_not_duplicated", "standalone_scene_break_removed"),
+    + ("body_title_not_duplicated", "scene_break_plain_text_marker"),
     title_policy="filename_only_body_text",
-    scene_break_policy="blank_line_only",
+    scene_break_policy="plain_text_marker",
     max_line_characters=20000,
 )
 FANQIE_SHORT_STORY_PROFILE = DeliveryProfile(
     name="fanqie-short-story",
     kind="text",
     checks=TEXT_QUALITY_CHECKS
-    + ("body_title_not_duplicated", "standalone_scene_break_removed"),
+    + ("body_title_not_duplicated", "scene_break_plain_text_marker"),
     title_policy="single_story_filename_only_body_text",
-    scene_break_policy="blank_line_only",
+    scene_break_policy="plain_text_marker",
     max_line_characters=20000,
 )
 DOCX_REVIEW_PROFILE = DeliveryProfile(
@@ -1484,11 +1484,15 @@ def blocks_to_plain_text(blocks: Iterable[TextBlock]) -> str:
     return "\n\n".join(block.text for block in blocks if block.text).strip()
 
 
+FANQIE_SCENE_BREAK_MARKER = "　　……"
+"""番茄正文场景分隔：行首两个全角空格 + 六点省略号（作者 2026-10-04 定款）。"""
+
+
 def blocks_to_fanqie_text(blocks: Iterable[TextBlock]) -> str:
     return "\n\n".join(
-        block.text
+        FANQIE_SCENE_BREAK_MARKER if block.kind == "scene_break" else block.text
         for block in blocks
-        if block.text and block.kind != "scene_break"
+        if block.text
     ).strip()
 
 

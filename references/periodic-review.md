@@ -43,7 +43,7 @@ python -X utf8 .\scripts\novel_review.py configure "<project-root>" --interval 5
 2. `pacing_and_scene_function`：场景是否重复、拖沓、跳步，张弛是否服务本段目标。
 3. `tension_and_information_release`：压力、悬念、揭示和留白是否按读者理解能力递进。
 4. `character_arc_and_emotional_force`：人物选择、关系变化和情绪后果是否有力度。
-5. `prose_voice_and_readability`：叙述距离、角色声音、句式和阅读流畅度是否稳定。
+5. `prose_voice_and_readability`：叙述距离、角色声音、句式和阅读流畅度是否稳定；存在 `story-bible/voice-anchor.md` 时另按 [anchor-discipline.md](anchor-discipline.md) 审稿清单核对感知锚点执行度（织进原句、复述防回声、落点锚、签名一致性、带噪与单段上限）。
 6. `originality_and_cliche_control`：是否过度依赖套路、模板反转、通用台词和熟套意象。
 7. `platform_fit_and_retention`：在不牺牲故事的前提下，标题、开篇、章节兑现和阅读驱动力是否适合目标受众。
 8. `humanization_and_repetition`：历史兼容机器字段，语义为叙述自然度、声音一致性与机械模式检查；关注机械排比、解释过度、均匀段落、空泛总结和无意重复，不代表规避任何检测。
@@ -71,7 +71,7 @@ python -X utf8 .\scripts\novel_review.py configure "<project-root>" --interval 5
 
 1. 精读本检查点新增区间的全部正文。例如第二次审核精读第 6-10 章。
 2. 读取截至检查点的 `manuscript/index.md`、全部章节记忆卡、`memory/book-summary.md` 和 `memory/decisions.md`。
-3. 读取故事圣经、总纲、目标平台与风格合同，以及当前已通过的连续性结论；对照 [drafting.md](drafting.md) 的写作机理评估对应维度——期待感四来源是否推进、爽点是否有铺垫与代价、对抗阶梯是否同步升级、信息差揭示是否有意图；不在此报告重做连续性判定。
+3. 读取故事圣经、总纲、目标平台与风格合同（存在 `story-bible/voice-anchor.md` 时一并读取签名清单与声音库），以及当前已通过的连续性结论；对照 [drafting.md](drafting.md) 的写作机理评估对应维度——期待感四来源是否推进、爽点是否有铺垫与代价、对抗阶梯是否同步升级、信息差揭示是否有意图；不在此报告重做连续性判定。
 4. 对节奏、人物弧、信息释放或兑现问题，回读被牵涉的旧章原文；记忆卡只能定位证据。
 5. 区分“可验证的质量缺陷”“有意的叙事选择”“信息不足”和“作者偏好”，不能把个人口味包装成错误。
 

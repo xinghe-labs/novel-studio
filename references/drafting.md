@@ -4,7 +4,7 @@
 
 ## 写前上下文
 
-先确认 `novel_continuity.py status` 为 `current`，再生成绑定当前正典的 `continuity-context.json`。执行 [long-term-memory.md](long-term-memory.md) 的续写检索协议，逐一读取上下文列出的自动来源和被触及事实的原文；不能凭聊天记忆、摘要或上一章直接续写。读取 `story-bible/style-guide.md` 风格合同；存在 `story-bible/voice-anchor.md` 时一并读取当前 POV 的锚点片段，写作以锚点文风为正向基准。随后按 [project-contract.md](project-contract.md) 的优先顺序形成一份短写作合同：
+先确认 `novel_continuity.py status` 为 `current`，再生成绑定当前正典的 `continuity-context.json`。执行 [long-term-memory.md](long-term-memory.md) 的续写检索协议，逐一读取上下文列出的自动来源和被触及事实的原文；不能凭聊天记忆、摘要或上一章直接续写。读取 `story-bible/style-guide.md` 风格合同；存在 `story-bible/voice-anchor.md` 时一并读取当前 POV 的锚点片段与锚点配置（视点滤镜词库、场景签名清单、声音库），写作以锚点文风为正向基准。感知锚点与排版节奏按 [anchor-discipline.md](anchor-discipline.md) 的通用法则执行。随后按 [project-contract.md](project-contract.md) 的优先顺序形成一份短写作合同：
 
 ```text
 交付：第几章、场景或字数范围
@@ -89,7 +89,7 @@ POV：谁在感知，叙述距离与时态
 
 ## 叙述声音
 
-具体细节优先于通用形容词。感官描写只选 POV 此刻会注意且能推动情绪或行动的细节。句式节奏跟随场景压力变化，不为“有文采”堆叠同类比喻、排比、破折号或抽象总结。
+具体细节优先于通用形容词。感官描写只选 POV 此刻会注意且能推动情绪或行动的细节。句式节奏跟随场景压力变化，不为"有文采"堆叠同类比喻、排比、破折号或抽象总结。感知锚点的织入位置、密度与验收按 [anchor-discipline.md](anchor-discipline.md) 执行：锚长在戏上、织进原句，不按类型打卡。
 
 “展示而非讲述”不是绝对规则：关键选择、关系转折和独特体验适合展开；重复劳动、旅行过渡和读者已理解的过程可以概述。
 
@@ -153,7 +153,7 @@ POV：谁在感知，叙述距离与时态
 ## 写后提交
 
 1. 连载把本章完整初稿、短故事把完整故事初稿先保存到 `<work-root>/drafts/`，不得覆盖已提交正文或追加到全书单文件；此时不把初稿直接当作可提交的 `chapter.md`。
-2. 对照写作合同检查结构和人物：关键变化是否真正发生，人物选择是否由欲望、阻力和代价推动，高潮与结尾是否兑现开篇承诺，而不是只被旁白宣布。
+2. 对照写作合同检查结构和人物：关键变化是否真正发生，人物选择是否由欲望、阻力和代价推动，高潮与结尾是否兑现开篇承诺，而不是只被旁白宣布。随后执行感知锚点"补拍 pass"：通读初稿，找到所有干、跳、空的位置，按 [anchor-discipline.md](anchor-discipline.md) 的补拍规程把感知织进原句（原文零删改、零新事实、净增不超预算；落点锚与分隔线守恒一并核对）。
 3. 先按 [continuity.md](continuity.md) 对照当前正典做连续性初检，再按 [originality-audit.md](originality-audit.md) 做措辞与结构初检；`review`、`incomplete` 或 `block` 都必须先处理，不能用后续润色掩盖。
 4. 前述检查通过后，长篇每个新章和每篇短故事都必须实际调用 `$humanizer-zh` 执行本文件的自然化末轮，保留调用前原稿，生成独立结果稿与审阅记录。Skill 不可用或调用未完成时到此停止，只保留草稿。
 5. 项目级逐章自然化授权允许直接采用不改变语义的结果稿；若建议改变事实、剧情、人物动机、关系、世界规则或 POV，先请求作者确认。结果稿有变化时重新执行第 2-3 步，不能沿用调用前检查结论。
@@ -177,6 +177,6 @@ POV：谁在感知，叙述距离与时态
 - 检查情绪直标、器官反应套话、对话后固定跟动作的机械节拍和过量比喻；小说专项模式以 `$humanizer-zh` 的清单为准。
 - 保留原 POV、叙述距离、有意复沓、时代措辞、人物口癖、叙述者偏见、不可靠叙述、诗性意象和本书节奏。
 
-完成上述内置检查后必须实际调用 `$humanizer-zh` 专项复核，并把保留项、`story-bible/style-guide.md` 风格合同与当前 POV 的锚点片段一起提供。该 Skill 不可用或调用未完成时明确报告阻断，不伪装已经调用，也不得正式提交。不要直接接受会把小说改成新闻稿、随笔或统一网文腔的建议。
+完成上述内置检查后必须实际调用 `$humanizer-zh` 专项复核，并把保留项、`story-bible/style-guide.md` 风格合同与当前 POV 的锚点片段及锚点配置一起提供；自然化不得为"均匀"而削掉长在戏上的锚——它是本书节奏的一部分。该 Skill 不可用或调用未完成时明确报告阻断，不伪装已经调用，也不得正式提交。不要直接接受会把小说改成新闻稿、随笔或统一网文腔的建议。
 
 自然化输出必须是“审阅结论 + 独立结果稿”，不得原地覆盖初稿、暂存包或正式正文。正式暂存包按 [commit-protocol.md](commit-protocol.md) 保留调用前原稿、最终正文与自然化记录；即使结论为无需修改，也要保留两个独立 Markdown 文件并记录相同内容哈希和 `outcome: unchanged`。作者设定的项目级逐章自然化要求可作为采用非语义调整的授权；有语义或正典风险时仍展示实质变化和可能损失并单独确认。自然化只服务文字自然度与叙述声音，不承诺规避、欺骗或通过任何 AI 检测器；记录只能验证文件、哈希和执行声明，执行者仍必须真实调用 Skill。记录结构见 [schemas-and-cli.md](schemas-and-cli.md)，行为边界见 [controlled-automation.md](controlled-automation.md)，短故事补充协议见 [short-story-mode.md](short-story-mode.md)。

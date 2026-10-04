@@ -168,7 +168,7 @@ class NovelExportTests(unittest.TestCase):
         fanqie_text = fanqie_one.read_text(encoding="utf-8")
         self.assertFalse(fanqie_text.startswith("第1章"))
         self.assertIn("她低声说：‘* * *’不是暗号。", fanqie_text)
-        self.assertIn("不是暗号。\n\n信封里", fanqie_text)
+        self.assertIn("不是暗号。\n\n  ……\n\n信封里", fanqie_text)
         self.assertNotRegex(fanqie_text, r"(?m)^\s*\*\s+\*\s+\*\s*$")
 
         with zipfile.ZipFile(review) as archive:

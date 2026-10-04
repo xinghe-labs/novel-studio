@@ -38,7 +38,7 @@ Eight standard-library CLI tools with a documented JSON contract, plus `novel_cl
 | `novel_export.py` | `export` `status` | DOCX / EPUB export with structural verification |
 | `novel_cli.py` | — | Shared CLI contract, atomic file primitives, version source (not an executable command) |
 
-**19,525 lines of runtime Python**, **8,292 lines of tests**, and **23 progressive-disclosure reference documents**, with no third-party runtime dependency.
+**19,529 lines of runtime Python**, **8,292 lines of tests**, and **24 progressive-disclosure reference documents**, with no third-party runtime dependency.
 <!-- The three counts above are machine-checked by ci/check_doc_stats.py; run `python -X utf8 ci/check_doc_stats.py --print` for the current values. -->
 
 ## How the pieces fit
@@ -107,12 +107,12 @@ There are two ways to use the engine. They share the same CLI and the same contr
 | Market research / source registration | `market-research`, `platform-adapters`, `source-ingestion` |
 | Create or upgrade a project | `project-contract` |
 | Workspace isolation & single-writer lease | `workspace-isolation` |
-| Drafting / continuation / memory retrieval | `drafting`, `long-term-memory`, `continuity` |
+| Drafting / continuation / memory retrieval | `drafting`, `long-term-memory`, `continuity`, `anchor-discipline` |
 | Canonical staging & commit | `commit-protocol`, `controlled-automation`, `schemas-and-cli` |
 | Originality audit | `originality-audit` |
-| Review cycles / short-story finalization | `revision`, `periodic-review`, `short-story-mode` |
-| Batch revision | `batch-revision` |
-| Export & platform delivery | `publishing-exports`, `platform-delivery-quality` |
+| Review cycles / short-story finalization | `revision`, `periodic-review`, `short-story-mode`, `anchor-discipline` |
+| Batch revision | `batch-revision`, `anchor-discipline` |
+| Export & platform delivery | `publishing-exports`, `platform-delivery-quality`, `anchor-discipline` |
 | Live platform publishing | `fanqie-live-publishing` — only with explicit per-action authorization |
 | Post-publication feedback | `publication-feedback`, `market-research`, `periodic-review` |
 
@@ -186,7 +186,7 @@ A blocked gate stops downstream work instead of degrading into a warning. `--hel
 
 ```
 SKILL.md          entry router — task-to-reference index and non-negotiable boundaries
-references/       22 domain documents loaded on demand (commit protocol, continuity, ...)
+references/       24 domain documents loaded on demand (commit protocol, continuity, ...)
 scripts/          9 CLI tools, standard library only
 install.py        one-command installer into agent-host skill roots
 humanizer-zh/     bundled naturalization skill — third-party MIT, see its LICENSE

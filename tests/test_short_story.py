@@ -367,7 +367,7 @@ class ShortStoryWorkflowTests(unittest.TestCase):
         fanqie_text = fanqie.read_text(encoding="utf-8")
         self.assertFalse(fanqie_text.startswith("#"))
         self.assertIn("她说‘* * *’不是接头暗号。", fanqie_text)
-        self.assertIn("不是接头暗号。\n\n天亮前", fanqie_text)
+        self.assertIn("不是接头暗号。\n\n  ……\n\n天亮前", fanqie_text)
         self.assertNotRegex(fanqie_text, r"(?m)^\s*\*\s+\*\s+\*\s*$")
         self.assertFalse((exports / "fanqie").exists())
         export_manifest = read_json(exports / "export-manifest.json")
