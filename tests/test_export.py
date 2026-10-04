@@ -57,7 +57,9 @@ def read_json(path: Path) -> dict:
 class NovelExportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_dir.name) / "project"
+        # Resolve so swap/recovery path equality survives 8.3 short-name TEMP
+        # dirs (engine hands back fully resolved paths).
+        self.root = (Path(self.temp_dir.name) / "project").resolve()
         novel_project.init_project(
             SimpleNamespace(
                 root=str(self.root),

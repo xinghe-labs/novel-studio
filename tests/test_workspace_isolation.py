@@ -26,7 +26,9 @@ from continuity_test_utils import refresh_fixture_base  # noqa: E402
 class WorkspaceIsolationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.base = Path(self.temp_dir.name)
+        # Resolve so path equality below survives 8.3 short-name TEMP dirs
+        # (engine hands back fully resolved paths).
+        self.base = Path(self.temp_dir.name).resolve()
         self.workspace = self.base / "novel-workspace"
 
     def tearDown(self) -> None:

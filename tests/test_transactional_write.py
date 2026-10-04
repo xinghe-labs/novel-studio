@@ -19,7 +19,9 @@ import novel_workspace  # noqa: E402
 class TransactionalWriteTests(unittest.TestCase):
     def _targets(self) -> tuple[tempfile.TemporaryDirectory[str], Path, Path]:
         temp_dir = tempfile.TemporaryDirectory()
-        root = Path(temp_dir.name)
+        # Resolve so path equality below survives 8.3 short-name TEMP dirs
+        # (engine hands back fully resolved paths).
+        root = Path(temp_dir.name).resolve()
         first = root / "first.bin"
         second = root / "second.bin"
         # Deliberately use bytes that cannot be decoded as UTF-8.  Rollback must
