@@ -8,6 +8,7 @@
 - `story-bible/voice-anchor.md` 定义扩展为双层：作者亲写片段（声音定调）+ 感知锚点书级配置（视点滤镜词库、场景签名清单、声音库、归档腔标记句）；换书重写配置，法则不动。[planning.md](references/planning.md)、[building-precheck.md](references/building-precheck.md)、[interactive-planning.md](references/interactive-planning.md) 同步。
 - 写作与审稿链路挂接：[drafting.md](references/drafting.md) 写前合同读取锚点配置、写后自检新增"补拍 pass"、自然化末轮不得削除合规锚；[revision.md](references/revision.md) 场景与文风修订、[periodic-review.md](references/periodic-review.md) 质量审核范围（`prose_voice_and_readability` 维度）与读取协议挂执行度检查；[batch-revision.md](references/batch-revision.md) 适用边界新增批量补拍安全网。
 - 番茄导出场景分隔改判（交付判断变化）：`fanqie-serial` 与 `fanqie-short-story` 两个 profile 的 `scene_break_policy` 由 `blank_line_only`（删除分隔线）改为 `plain_text_marker`——`scene_break` 块导出为行首两个全角空格＋省略号的固定标记（`FANQIE_SCENE_BREAK_MARKER`），不再从正文中丢失；导出的番茄 txt 因此与旧版不同，旧导出清单需重新生成。
+- 测试加固：测试临时根路径统一 `resolve()`，路径等值断言在 8.3 短名 TEMP 目录（如 CI runner 的 `RUNNER~1`）下保持成立。
 - 命令与数据格式无变化。
 
 ## 2.10.0 - 2026-09-29
