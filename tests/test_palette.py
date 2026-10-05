@@ -361,6 +361,31 @@ class PaletteLedgerTests(unittest.TestCase):
             {(f["type"], f["signature"]) for f in report["flags"]},
         )
 
+    def test_retired_signature_never_stale(self) -> None:
+        table = TABLE.replace(
+            "| 地点签 | 灯管 | 顶灯闪 | 叫号机 | ch1 | ch2 | 全亮＝被整理过 | 同日再进还闪 | 灯管 |",
+            "| 地点签 | 灯管 | 顶灯闪 | 叫号机 | ch1 | ch2 | 全亮＝被整理过 | 场景收束，随戏退役 | 灯管 |",
+        )
+        root = make_project(
+            {
+                1: "第一天，灯管在闪。\n",
+                2: "第二天，无事发生。\n",
+                3: "第三天，无事发生。\n",
+                4: "第四天，无事发生。\n",
+                5: "第五天，无事发生。\n",
+            },
+            table=table,
+        )
+        report = novel_palette.command_ledger(root, None)
+        lamp = next(s for s in report["signatures"] if s["name"] == "灯管")
+        # Gap 4 > window 3, but the scene has been retired (法则二「消失」终态).
+        self.assertTrue(lamp["retired"])
+        self.assertFalse(lamp["stale_risk"])
+        self.assertNotIn(
+            ("stale", "灯管"),
+            {(f["type"], f["signature"]) for f in report["flags"]},
+        )
+
     def test_dense_run_flagged(self) -> None:
         report = self.ledger()
         board = self.by_name(report, "木牌")

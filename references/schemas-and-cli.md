@@ -374,7 +374,7 @@ residual_risks
 `novel_palette.py` 是只读诊断工具：不写项目文件、不需要工作目录与租约，因此不属于提交流程的一部分。三个子命令都向 stdout 输出单个 JSON 文档；成功 `status: ok`，项目结构缺失、配置段非法或正则无效为 `status: error` 加退出码 2。
 
 - `score <project-root> [--chapter N]`：逐章人味适配评分。顶层 `book_config`（目标线、词表替换清单、上限词、豁免数、未配置检测词的签名）、`chapters[]`（`score`、`deductions[]`（`rule`/`name`/`points`/`detail`）、`waived[]`（含 `points_avoided` 与来源）、`metrics`、`signatures_on`）、`summary`（count/mean/min/max/`below_target`）。规则 ID 与扣分口径见 [anchor-discipline.md](anchor-discipline.md)「调色盘工具」；评分是结构代理指标，非 AI 检测分。
-- `ledger <project-root> [--stale-window N]`：签名账对账。`signatures[]`（`established`/`table_last`/`detected_last`/`hit_chapters`/`stale_risk`/`dense_run`/`dense_flag`/`mismatch`/`event_type`/`unscannable`）加 `flags[]`（stale/dense/mismatch/unscannable）。
+- `ledger <project-root> [--stale-window N]`：签名账对账。`signatures[]`（`established`/`table_last`/`detected_last`/`hit_chapters`/`stale_risk`/`dense_run`/`dense_flag`/`mismatch`/`event_type`/`retired`/`unscannable`）加 `flags[]`（stale/dense/mismatch/unscannable）。
 - `variance <project-root>`：逐章锚密度计数（签名检测词＋声音库）与 `stats`，供批审人工判读，不做达标判断。
 
 签名清单表要求钉死表头：轨、名称（第三人称书可用同义列名「地点/物件」）、签名锚、副签名、已建立；可选列最近复现（账）、候选反转位、状态变化备注、检测词。检测词是 Python 正则片段，单元格内的竖线写 `\|`；缺检测词的签名记 `unscannable`，不参与扫描。

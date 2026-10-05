@@ -691,12 +691,14 @@ def command_ledger(root: Path, stale_window: int | None) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     flags: list[dict[str, Any]] = []
     for signature in signatures:
+        signature_text = signature["name"] + signature["note"]
         record: dict[str, Any] = {
             "track": signature["track"],
             "name": signature["name"],
             "established": signature["established"],
             "table_last": signature["table_last"],
-            "event_type": "事件型" in (signature["name"] + signature["note"]),
+            "event_type": "事件型" in signature_text,
+            "retired": "退役" in signature_text,
             "note": signature["note"],
         }
         if not signature["detect"]:
@@ -741,6 +743,8 @@ def command_ledger(root: Path, stale_window: int | None) -> dict[str, Any]:
         stale_detail = ""
         if record["event_type"]:
             stale_detail = "事件型签名：缺席可能即叙事，不判死锚"
+        elif record["retired"]:
+            stale_detail = "退役签名：场景已收束，缺席即常态（法则二「消失」终态）"
         elif signature["established"] is not None:
             reference = detected_last if detected_last is not None else signature["established"]
             gap = max_chapter - reference
