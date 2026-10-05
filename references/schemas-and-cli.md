@@ -369,6 +369,30 @@ residual_risks
 
 短故事报告还必须包含 `review_mode: completion`；长篇周期报告不带该字段。`source_snapshot` 不由审稿者手写：它来自哈希绑定的审核包，`record` 验证当前正典后才加入归档报告。九个固定质量维度中的历史键 `humanization_and_repetition` 语义为“叙述自然度、声音一致性与机械模式检查”，不表示规避检测。每个 finding 还必须有 `id`、`location`、`evidence`、`problem`、`impact`、`suggested_fix`、`severity`、`scope`、`author_judgment` 和非空 `chapters`。
 
+## 调色盘诊断输出
+
+`novel_palette.py` 是只读诊断工具：不写项目文件、不需要工作目录与租约，因此不属于提交流程的一部分。三个子命令都向 stdout 输出单个 JSON 文档；成功 `status: ok`，项目结构缺失、配置段非法或正则无效为 `status: error` 加退出码 2。
+
+- `score <project-root> [--chapter N]`：逐章人味适配评分。顶层 `book_config`（目标线、词表替换清单、上限词、豁免数、未配置检测词的签名）、`chapters[]`（`score`、`deductions[]`（`rule`/`name`/`points`/`detail`）、`waived[]`（含 `points_avoided` 与来源）、`metrics`、`signatures_on`）、`summary`（count/mean/min/max/`below_target`）。规则 ID 与扣分口径见 [anchor-discipline.md](anchor-discipline.md)「调色盘工具」；评分是结构代理指标，非 AI 检测分。
+- `ledger <project-root> [--stale-window N]`：签名账对账。`signatures[]`（`established`/`table_last`/`detected_last`/`hit_chapters`/`stale_risk`/`dense_run`/`dense_flag`/`mismatch`/`event_type`/`unscannable`）加 `flags[]`（stale/dense/mismatch/unscannable）。
+- `variance <project-root>`：逐章锚密度计数（签名检测词＋声音库）与 `stats`，供批审人工判读，不做达标判断。
+
+签名清单表要求钉死表头：轨、名称（第三人称书可用同义列名「地点/物件」）、签名锚、副签名、已建立；可选列最近复现（账）、候选反转位、状态变化备注、检测词。检测词是 Python 正则片段，单元格内的竖线写 `\|`；缺检测词的签名记 `unscannable`，不参与扫描。
+
+voice-anchor.md 的 `### 调色盘配置` 段是机器可读书级配置，条目均为 `- 键：值` 形式：
+
+```text
+- 目标线：90                # 可选；不设＝纯诊断
+- 死锚窗口：12              # 可选，ledger 默认 12
+- 章尾扫描段数：6           # 可选，score 默认 6
+- 词表·器官直标：瞳孔地震    # 六类：器官直标/情绪直标/迟钝套话/带噪/注视拍/凉系；另落点锚时地
+- 上限词：咯噔｜1           # 词｜每章上限
+- 章尾模板：(十八|九|沙)。｜2  # 正则｜阈值；保留字「三连短句尾」启用内置结构判定
+- 豁免：R-CAP｜0021｜理由｜来源  # 规则ID｜范围（全书或章号列表）｜理由｜来源
+```
+
+词表提供任一行即整体替换内置默认；上限词、章尾模板、豁免可多行累积。未知条目类型、未知规则 ID、无法解析的范围都是领域错误（退出码 2）。
+
 ## `export-manifest.json`
 
 导出器自动生成，不建议手写。稳定的顶层结构为：

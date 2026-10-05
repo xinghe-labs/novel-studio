@@ -8,7 +8,7 @@ metadata:
 
 # 小说工作室
 
-这是入口路由，不是全部操作手册。当前工具版本为 `2.13.0`，要求 Python 3.10+，只使用标准库。
+这是入口路由，不是全部操作手册。当前工具版本为 `2.14.0`，要求 Python 3.10+，只使用标准库。
 
 模块正常加载并进入 `scripts/novel_cli.py` 的 `run_cli` 后，除 `--help` 外向 stdout 输出单个 JSON 文档；业务命令的 `status`/`decision` 随命令而异，退出码 1 表示业务门禁未通过，参数或领域错误为 2，未预期异常与序列化失败为 3。`--version` 才固定返回 `status: ok`、`tool` 和 `version`。模块加载失败发生在该运行时契约之前，可能由 Python 直接输出 traceback 并返回退出码 1。详细字段见 [schemas-and-cli.md](references/schemas-and-cli.md)。
 
@@ -79,7 +79,7 @@ python -X utf8 .\scripts\novel_review.py status "<project-root>"
 
 长篇每章和短故事全文在正式提交前都必须实际调用 `$humanizer-zh`。保留 `chapter-before-humanizer.md`、最终 `chapter.md` 与哈希绑定的 `humanization-review.json`；Skill 不可用或调用未完成时只能保留草稿。依赖名和 JSON 的 `skill` 字段写 `humanizer-zh`，Agent 调用语法写 `$humanizer-zh`，两者不要混用。本 Skill 根目录自带 `humanizer-zh/` 副本；宿主未把 humanizer-zh 注册为独立技能时，按该副本的 SKILL.md 执行同样的自然化流程，产物与哈希绑定要求不变。
 
-质量报告中的历史机器字段 `humanization_and_repetition` 统一解释为“叙述自然度、声音一致性与机械模式检查”，包括机械排比、解释过度、段落过于均匀、空泛总结和无意重复。它不承担平台检测目标，也不代表规避、欺骗或通过任何 AI 检测器；不得向作者或平台作此承诺。
+质量报告中的历史机器字段 `humanization_and_repetition` 统一解释为“叙述自然度、声音一致性与机械模式检查”，包括机械排比、解释过度、段落过于均匀、空泛总结和无意重复。它不承担平台检测目标，也不代表规避、欺骗或通过任何 AI 检测器；不得向作者或平台作此承诺。`novel_palette.py` 的人味适配评分与签名账诊断同属结构代理指标，共享这一边界；规则、词表与豁免口径见 [anchor-discipline.md](references/anchor-discipline.md)「调色盘工具」。
 
 原创性审计同时检查措辞重合和结构映射，不能用一个百分比代替证据。单一来源主导、独特场面或因果链高风险时必须重构或请求作者裁决。
 

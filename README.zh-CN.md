@@ -147,6 +147,7 @@ python -X utf8 .\scripts\novel_workspace.py lock-break "<workspace-root>" "<proj
 | `novel_continuity.py` | `install` `status` `prepare-context` `prepare-audit` `bind-audit` `check-package` `prepare-baseline` `record-baseline` `impact` `invalidate` |
 | `novel_review.py` | `status` `prepare` `record` `configure` |
 | `novel_originality.py` | `audit` |
+| `novel_palette.py` | `score` `ledger` `variance` |
 | `novel_research.py` | `adapters` `collect` `register` `verify` |
 | `novel_memory.py` | `rebuild` `update` `status` `search` |
 | `novel_export.py` | `export` `status` |

@@ -33,12 +33,12 @@ Eight standard-library CLI tools with a documented JSON contract, plus `novel_cl
 | `novel_continuity.py` | `install` `status` `prepare-context` `prepare-audit` `bind-audit` `check-package` `prepare-baseline` `record-baseline` `impact` `invalidate` | Continuity baselines and gate evaluation |
 | `novel_review.py` | `status` `prepare` `record` `configure` | Periodic quality review and gate status |
 | `novel_originality.py` | `audit` | Originality audit (wording overlap + structural mapping) |
-| `novel_research.py` | `adapters` `collect` `register` `verify` | Source registration, rights scope, access-control boundaries |
+| `novel_palette.py` | `score` `ledger` `variance` | Read-only palette diagnostics: human-flavor score, signature ledger reconciliation, batch anchor-density variance || `novel_research.py` | `adapters` `collect` `register` `verify` | Source registration, rights scope, access-control boundaries |
 | `novel_memory.py` | `rebuild` `update` `status` `search` | Long-term memory retrieval and index caching |
 | `novel_export.py` | `export` `status` | DOCX / EPUB export with structural verification |
 | `novel_cli.py` | — | Shared CLI contract, atomic file primitives, version source (not an executable command) |
 
-**19,529 lines of runtime Python**, **8,298 lines of tests**, and **25 progressive-disclosure reference documents**, with no third-party runtime dependency.
+**20,489 lines of runtime Python**, **8,789 lines of tests**, and **25 progressive-disclosure reference documents**, with no third-party runtime dependency.
 <!-- The three counts above are machine-checked by ci/check_doc_stats.py; run `python -X utf8 ci/check_doc_stats.py --print` for the current values. -->
 
 ## How the pieces fit
