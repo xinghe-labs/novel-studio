@@ -38,7 +38,7 @@ Eight standard-library CLI tools with a documented JSON contract, plus `novel_cl
 | `novel_export.py` | `export` `status` | DOCX / EPUB export with structural verification |
 | `novel_cli.py` | — | Shared CLI contract, atomic file primitives, version source (not an executable command) |
 
-**19,529 lines of runtime Python**, **8,298 lines of tests**, and **24 progressive-disclosure reference documents**, with no third-party runtime dependency.
+**19,529 lines of runtime Python**, **8,298 lines of tests**, and **25 progressive-disclosure reference documents**, with no third-party runtime dependency.
 <!-- The three counts above are machine-checked by ci/check_doc_stats.py; run `python -X utf8 ci/check_doc_stats.py --print` for the current values. -->
 
 ## How the pieces fit
@@ -186,7 +186,7 @@ A blocked gate stops downstream work instead of degrading into a warning. `--hel
 
 ```
 SKILL.md          entry router — task-to-reference index and non-negotiable boundaries
-references/       24 domain documents loaded on demand (commit protocol, continuity, ...)
+references/       25 domain documents loaded on demand (commit protocol, continuity, ...)
 scripts/          9 CLI tools, standard library only
 install.py        one-command installer into agent-host skill roots
 humanizer-zh/     bundled naturalization skill — third-party MIT, see its LICENSE

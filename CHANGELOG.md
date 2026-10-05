@@ -2,6 +2,14 @@
 
 本文件记录会影响工作流契约、数据格式或交付判断的变更。
 
+## 2.13.0 - 2026-10-05
+
+- **复盘蒸馏协议入 skill**：新增 [retrospective.md](references/retrospective.md)——周期质量审核、大轮次（批量修订/全书补拍/基线重封/导出交付）、短故事完稿后的强制复盘：发现按四桶分类（A 法则缺口→skill 补丁候选／B 书级变通→voice-anchor 与 style-guide 当场回写／C 正典裁决→裁决队列／D 管线坑→记忆），B、D 当场完成，A、C 挂 workspace 根 `adjudication-queue.md` 等作者裁决，裁决后销账留痕。
+- **裁决队列协议**：条目 schema（编号/书/来源/逐字证据/选项/状态 open→adjudicated→written-back→obsolete）、动作前扫 open 项（阻塞项先解决）、销账写回条目不删除。
+- **学习边界**：学习速率＝写作速率；审美裁决归作者不可自动化；跨书升格门槛＝同一发现两本书验证才由书级变通升格法则候选；新书 voice-anchor 配置层大纲期立初版、第 3 章提交后按实际正文修订一次（[building-precheck.md](references/building-precheck.md) C 段同步）。
+- 挂接：[periodic-review.md](references/periodic-review.md) 新增「审核后复盘」、[batch-revision.md](references/batch-revision.md) 新增「轮次后复盘」、SKILL.md 路由与「完成时必须说明」同步。
+- 命令与数据格式无变化。
+
 ## 2.12.1 - 2026-10-05
 
 - 锚点口径补丁（《死亡校规》全书补拍轮实测反馈）：条文引用块（校规、账簿条文等结构化展示）不计"单段 ≤90 字"叙述段落口径——补拍轮批量校验中 123 字的校规五条引用块被误判即此缺口。命令与数据格式无变化。

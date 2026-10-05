@@ -8,7 +8,7 @@ metadata:
 
 # 小说工作室
 
-这是入口路由，不是全部操作手册。当前工具版本为 `2.12.1`，要求 Python 3.10+，只使用标准库。
+这是入口路由，不是全部操作手册。当前工具版本为 `2.13.0`，要求 Python 3.10+，只使用标准库。
 
 模块正常加载并进入 `scripts/novel_cli.py` 的 `run_cli` 后，除 `--help` 外向 stdout 输出单个 JSON 文档；业务命令的 `status`/`decision` 随命令而异，退出码 1 表示业务门禁未通过，参数或领域错误为 2，未预期异常与序列化失败为 3。`--version` 才固定返回 `status: ok`、`tool` 和 `version`。模块加载失败发生在该运行时契约之前，可能由 Python 直接输出 traceback 并返回退出码 1。详细字段见 [schemas-and-cli.md](references/schemas-and-cli.md)。
 
@@ -98,8 +98,8 @@ python -X utf8 .\scripts\novel_review.py status "<project-root>"
 | 写作/续写/记忆检索 | [drafting.md](references/drafting.md)、[long-term-memory.md](references/long-term-memory.md)、[continuity.md](references/continuity.md)、[anchor-discipline.md](references/anchor-discipline.md) |
 | 正典暂存与提交 | [commit-protocol.md](references/commit-protocol.md)、[controlled-automation.md](references/controlled-automation.md)、[schemas-and-cli.md](references/schemas-and-cli.md) |
 | 原创性审计 | [originality-audit.md](references/originality-audit.md) |
-| 审稿/周期审核/短故事完稿 | [revision.md](references/revision.md)、[periodic-review.md](references/periodic-review.md)、[short-story-mode.md](references/short-story-mode.md)、[anchor-discipline.md](references/anchor-discipline.md) |
-| 批量改稿 | [batch-revision.md](references/batch-revision.md)、[anchor-discipline.md](references/anchor-discipline.md) |
+| 审稿/周期审核/短故事完稿 | [revision.md](references/revision.md)、[periodic-review.md](references/periodic-review.md)、[short-story-mode.md](references/short-story-mode.md)、[anchor-discipline.md](references/anchor-discipline.md)、[retrospective.md](references/retrospective.md) |
+| 批量改稿 | [batch-revision.md](references/batch-revision.md)、[anchor-discipline.md](references/anchor-discipline.md)、[retrospective.md](references/retrospective.md) |
 | 导出与平台交付 | [publishing-exports.md](references/publishing-exports.md)、[platform-delivery-quality.md](references/platform-delivery-quality.md)、[anchor-discipline.md](references/anchor-discipline.md) |
 | 番茄线上操作 | [fanqie-live-publishing.md](references/fanqie-live-publishing.md)；仅在获得当次明确授权后执行 |
 | 发布后复盘/数据回流 | [publication-feedback.md](references/publication-feedback.md)、[market-research.md](references/market-research.md)、[periodic-review.md](references/periodic-review.md) |
@@ -108,4 +108,4 @@ python -X utf8 .\scripts\novel_review.py status "<project-root>"
 
 ## 完成时必须说明
 
-交付时报告实际修改的文件/正典、运行过的验证、当前连续性和质量门禁状态、尚未解决的线索或作者裁决项。不得把“脚本通过”表述为“故事没有矛盾”，也不得把本地自然度审阅表述为检测规避能力。
+交付时报告实际修改的文件/正典、运行过的验证、当前连续性和质量门禁状态、尚未解决的线索或作者裁决项。不得把“脚本通过”表述为“故事没有矛盾”，也不得把本地自然度审阅表述为检测规避能力。大轮次与周期审核完成后按 [retrospective.md](references/retrospective.md) 执行一次复盘蒸馏（发现按四桶分类回写）；待作者裁决项在 workspace 根 `adjudication-queue.md` 挂账并在裁决后销账。

@@ -105,6 +105,10 @@ python -X utf8 .\scripts\novel_review.py prepare "<project-root>" --output "<wor
 
 短故事使用相同命令，但建议把工作目录目标设为 `reviews\completion\review-packet.json`；生成的 `packet_kind` 与 `report_kind` 分别为 `short_story_completion_review_packet` 和 `short_story_completion_review`。报告中的 `chapters: [1]` 指唯一完整正文单元，位置字段应进一步注明场景、标题或段落锚点。
 
+## 审核后复盘
+
+审核裁决完成后，按 [retrospective.md](retrospective.md) 执行一次复盘蒸馏：本报告的 findings 连同执行教训按四桶分类（法则缺口/书级变通/正典裁决/管线坑），B、D 类当场回写，A、C 类进 workspace 根 `adjudication-queue.md` 等作者裁决；裁决后销账。
+
 严重度与结论严格映射。脚本字段使用英文枚举；中文审核记录中的“阻断/重要/一般/建议”分别对应 `blocker`/`important`/`minor`/`note`：
 
 | 发现严重度 | 含义 | 报告结论 |
